@@ -11,6 +11,10 @@
 param([Parameter(Mandatory = $true)][string]$RequestFile)
 
 $ErrorActionPreference = 'Stop'
+# PowerShell defaults to the console's OEM codepage; window titles then arrive as
+# undecodable bytes on the WSL side. Force UTF-8 on the way out.
+$OutputEncoding = New-Object System.Text.UTF8Encoding $false
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 
 Add-Type @"

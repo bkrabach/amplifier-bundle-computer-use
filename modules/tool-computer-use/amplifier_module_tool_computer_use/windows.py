@@ -56,7 +56,13 @@ def _which_powershell(configured: str | None) -> str:
 
 def _translate(path: str, flag: str) -> str:
     proc = subprocess.run(
-        ["wslpath", flag, str(path)], capture_output=True, text=True, timeout=15
+        ["wslpath", flag, str(path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+        check=False,
     )
     if proc.returncode != 0:
         raise BridgeError(f"wslpath {flag} failed for {path!r}: {proc.stderr.strip()}")
@@ -154,6 +160,8 @@ class WindowsBridge:
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout or self._timeout,
                 check=False,
             )

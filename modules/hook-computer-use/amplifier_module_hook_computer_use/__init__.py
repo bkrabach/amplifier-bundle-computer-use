@@ -209,7 +209,7 @@ def _promote_tools(coordinator: Any, tools: list[Any]) -> tuple[list[Any], list[
         tool = None
         try:
             tool = coordinator.get("tools", getattr(spec, "name", ""))
-        except Exception:  # lookup is best-effort
+        except Exception:  # noqa: BLE001 - tool lookup is best-effort
             tool = None
         if tool is not None and hasattr(tool, "native_tool_spec"):
             try:
@@ -297,7 +297,7 @@ def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
                 )
                 if before:
                     _trace(f"complete: markers={before} messages_with_blocks={inlined}")
-        except Exception:  # noqa: BLE001 - provider lookup is best-effort
+        except Exception:
             logger.exception(
                 "computer-use: request rewrite failed; sending request unchanged"
             )
@@ -338,7 +338,7 @@ async def mount(
                 mounted = coordinator.get("providers")
                 if isinstance(mounted, dict) and mounted:
                     provider = next(iter(mounted.values()))
-        except Exception:  # noqa: BLE001 - provider lookup is best-effort
+        except Exception:
             logger.debug("computer-use: provider lookup failed", exc_info=True)
         if provider is None:
             _trace(f"handler: NO PROVIDER FOUND (name={name!r})")
