@@ -35,8 +35,8 @@ public static class CU {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
-    [DllImport("user32.dll")] public static extern int  GetWindowTextLength(IntPtr h);
-    [DllImport("user32.dll")] public static extern int  GetWindowText(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int  GetWindowTextLength(IntPtr h);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int  GetWindowText(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
