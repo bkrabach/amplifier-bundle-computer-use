@@ -1,0 +1,531 @@
+"""Local Linux desktop backend, via X11 (Xlib + XTEST).
+
+In-process: every action below talks straight to the X server over a persistent
+Xlib connection - no subprocess anywhere on the hot path. This is the opposite
+constraint from `WindowsBackend`, which must cross the WSL2/Win32 boundary through
+`powershell.exe` for every single action. That asymmetry is exactly what forced the
+`Backend` protocol (see `backend.py`) to be shaped around *capabilities*, not around
+either implementation's plumbing.
+
+Screen capture uses `Display.get_image()` (an in-process X `GetImage` request)
+rather than shelling out to ImageMagick's `import` - see `capture()`.
+
+Clipboard is the one place this backend shells out (to `xclip`): implementing the
+ICCCM/ CLIPBOARD selection-owner protocol correctly (answering `SelectionRequest`
+from other clients, persisting after this process exits) is a well-solved problem
+`xclip` already gets right; reimplementing it in-process would trade a battle-tested
+dependency for a large amount of fragile protocol code with no capability upside.
+Its absence is a normal, loud `BackendError` on the specific clipboard action, not a
+capability the whole backend probe depends on (the `computer` tool works fine
+without it; only `desktop.get_clipboard`/`set_clipboard` need it).
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
+from typing import Any
+
+from Xlib import XK, X
+from Xlib import display as xlib_display
+from Xlib.ext import xtest
+from Xlib.protocol import event as xevent
+
+from .backend import BackendError, ProbeResult, ScreenGeometry, WindowInfo, WindowList
+
+logger = logging.getLogger(__name__)
+
+_BUTTON_NUMBERS = {"left": 1, "middle": 2, "right": 3}
+_SCROLL_BUTTONS = {"up": 4, "down": 5, "left": 6, "right": 7}
+
+#: xdotool-style aliases for the modifier and named keys people actually type in
+#: combos (e.g. "ctrl+shift+s"). Anything not listed here is passed through as-is
+#: to `Xlib.XK.string_to_keysym`, which already understands real X11 keysym names
+#: ("Return", "F5", "Page_Down", single characters, ...).
+_MODIFIER_ALIASES = {
+    "ctrl": "Control_L",
+    "control": "Control_L",
+    "alt": "Alt_L",
+    "option": "Alt_L",
+    "shift": "Shift_L",
+    "super": "Super_L",
+    "cmd": "Super_L",
+    "win": "Super_L",
+    "windows": "Super_L",
+    "meta": "Super_L",
+}
+_KEY_ALIASES = {
+    "enter": "Return",
+    "return": "Return",
+    "esc": "Escape",
+    "escape": "Escape",
+    "tab": "Tab",
+    "space": "space",
+    "backspace": "BackSpace",
+    "delete": "Delete",
+    "del": "Delete",
+    "home": "Home",
+    "end": "End",
+    "pageup": "Page_Up",
+    "page_up": "Page_Up",
+    "pagedown": "Page_Down",
+    "page_down": "Page_Down",
+    "up": "Up",
+    "down": "Down",
+    "left": "Left",
+    "right": "Right",
+    "insert": "Insert",
+}
+
+
+def _resolve_xauthority() -> str | None:
+    """Find the Xauthority cookie file without assuming `~/.Xauthority`.
+
+    python-xlib's own `Xauthority()` already reads the `XAUTHORITY` env var first
+    (see `Xlib/xauth.py`), so if it is already set correctly - as it is under a
+    gdm-managed session, `/run/user/<uid>/gdm/Xauthority`, which has no
+    `~/.Xauthority` at all - this function changes nothing. It only fills the gap
+    when `XAUTHORITY` is unset or points at a missing file, and even then it tries
+    more than one plausible location rather than hardcoding a single path.
+    """
+    existing = os.environ.get("XAUTHORITY")
+    if existing and Path(existing).exists():
+        return existing
+    uid = os.getuid()
+    for candidate in (
+        Path.home() / ".Xauthority",
+        Path(f"/run/user/{uid}/gdm/Xauthority"),
+        Path(f"/run/user/{uid}/.mutter-Xwaylandauth"),
+    ):
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _keysym_for_name(name: str) -> int:
+    keysym = XK.string_to_keysym(name)
+    if keysym:
+        return keysym
+    if len(name) == 1:
+        # Unicode private range XKB uses for keysyms with no named X11 constant -
+        # the same trick `xdotool type` uses for characters outside Latin-1.
+        return 0x01000000 + ord(name)
+    raise BackendError(f"unknown key name {name!r}")
+
+
+class LinuxX11Backend:
+    """Executes computer-use actions against the local X11 desktop, in-process."""
+
+    name = "linux-x11"
+
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        cfg = config or {}
+        self._display_name: str | None = cfg.get("display") or os.environ.get("DISPLAY")
+        self._display: Any = None  # Xlib.display.Display, set once probe() succeeds
+        self._root: Any = None
+        # Cached result of `_check_discrete_input_available()` - see that method for
+        # why this is a lazy, per-connection check rather than folded into `probe()`.
+        self._discrete_input_blocked_reason: str | None = None
+        self._discrete_input_checked = False
+
+    # -- capability probe (D1) ---------------------------------------------------
+    def probe(self) -> ProbeResult:
+        """Connect and confirm XTEST is present. Cheap: one local socket connection,
+        no subprocess, no network. Never raises - failure is reported, not thrown."""
+        if not self._display_name:
+            return ProbeResult(False, "no DISPLAY set; no local X11 session to talk to")
+        xauth = _resolve_xauthority()
+        if xauth and not os.environ.get("XAUTHORITY"):
+            os.environ["XAUTHORITY"] = xauth
+        try:
+            display = xlib_display.Display(self._display_name)
+        except Exception as exc:  # noqa: BLE001 - any connection failure -> unavailable
+            return ProbeResult(
+                False, f"cannot connect to X server {self._display_name!r}: {exc}"
+            )
+        try:
+            ext = display.query_extension("XTEST")
+            if not ext or not ext.present:
+                display.close()
+                return ProbeResult(
+                    False, "X server does not support the XTEST extension"
+                )
+        except Exception as exc:  # noqa: BLE001
+            display.close()
+            return ProbeResult(False, f"XTEST query failed: {exc}")
+        # Keep the connection open for real use - this instance (not a fresh one) is
+        # what the registry hands to ComputerTool/DesktopTool.
+        self._display = display
+        self._root = display.screen().root
+        return ProbeResult(True)
+
+    def _ensure_connected(self) -> None:
+        if self._display is None:
+            result = self.probe()
+            if not result.available:
+                raise BackendError(f"linux-x11 backend not available: {result.reason}")
+
+    def _check_discrete_input_available(self) -> None:
+        """XTEST discrete input (buttons/keys) requires that no other client on
+        this X session holds an exclusive core-protocol grab on the pointer or
+        keyboard. When one does, XTEST still *generates* real, indistinguishable-
+        from-hardware button/key events - `fake_input` never raises and the X
+        server never returns a protocol error - but the exclusive grab consumes
+        those events before normal window-hierarchy delivery happens: clicks land
+        on no window, keystrokes are never seen by the focused app, and nothing
+        in the observable API surface signals that anything went wrong. Confirmed
+        on this backend's reference environment (a GNOME headless remote-desktop
+        session): `XGrabPointer`/`XGrabKeyboard` on the root window both return
+        `AlreadyGrabbed` continuously - independent of whether an RDP client is
+        actually connected - while `move()`/`capture()` remain fully functional
+        (pointer position is DIX-global state, not gated by this kind of grab).
+
+        This is checked lazily (only when a discrete-input method is first
+        called) rather than folded into `probe()`, because `probe()` gates
+        *mounting the whole backend* and pointer motion / screen capture
+        genuinely work regardless of this condition - failing the entire
+        backend at mount time would discard real, working capability. Cached
+        per-connection: this is an environmental condition, not per-action
+        state, so re-probing on every click would double round trips for a
+        result that will not change mid-session.
+        """
+        if self._discrete_input_checked:
+            if self._discrete_input_blocked_reason:
+                raise BackendError(self._discrete_input_blocked_reason)
+            return
+        self._discrete_input_checked = True
+        root = self._root
+        pointer_grab = root.grab_pointer(
+            True,
+            X.ButtonPressMask,
+            X.GrabModeAsync,
+            X.GrabModeAsync,
+            X.NONE,
+            X.NONE,
+            X.CurrentTime,
+        )
+        if pointer_grab == 0:  # 0 == GrabSuccess: nothing was holding it - release ours
+            self._display.ungrab_pointer(X.CurrentTime)
+        keyboard_grab = root.grab_keyboard(
+            True, X.GrabModeAsync, X.GrabModeAsync, X.CurrentTime
+        )
+        if keyboard_grab == 0:
+            self._display.ungrab_keyboard(X.CurrentTime)
+        self._display.sync()
+        if pointer_grab != 0 or keyboard_grab != 0:
+            self._discrete_input_blocked_reason = (
+                "discrete input (click/key/type_text/scroll/drag) cannot reach "
+                "application windows on this X11 session: the root window's "
+                f"pointer and/or keyboard is already exclusively grabbed by "
+                f"another client (XGrabPointer={pointer_grab}, "
+                f"XGrabKeyboard={keyboard_grab}; 0 means available, nonzero means "
+                "already held elsewhere). This is not a defect in this backend's "
+                "use of XTEST - fake_input still generates real events, but the "
+                "existing exclusive grab consumes them before window-hierarchy "
+                "delivery. Commonly caused by a GNOME headless remote-desktop "
+                "session (gnome-remote-desktop / mutter) holding an exclusive "
+                "input grab for its virtual seat, independent of whether an RDP "
+                "client is currently connected. move()/cursor_position()/capture() "
+                "are unaffected by this condition and remain usable."
+            )
+            raise BackendError(self._discrete_input_blocked_reason)
+
+    # -- Backend protocol: geometry + capture -------------------------------------
+    def screen_geometry(self) -> ScreenGeometry:
+        self._ensure_connected()
+        geom = self._root.get_geometry()
+        return ScreenGeometry(geom.width, geom.height, 0, 0)
+
+    def capture(self, region: tuple[int, int, int, int] | None = None) -> bytes:
+        """In-process `GetImage` - no `import`/ImageMagick subprocess."""
+        self._ensure_connected()
+        from PIL import Image
+
+        if region:
+            x1, y1, x2, y2 = region
+            x, y, w, h = x1, y1, max(1, x2 - x1), max(1, y2 - y1)
+        else:
+            geom = self._root.get_geometry()
+            x, y, w, h = 0, 0, geom.width, geom.height
+        raw = self._root.get_image(x, y, w, h, X.ZPixmap, 0xFFFFFFFF)
+        # Depth-24 TrueColor X servers pack pixels as B, G, R, padding - "BGRX" in
+        # PIL's raw decoder table. Verified against this box: a solid-color region
+        # round-trips through this path with the correct channel order.
+        img = Image.frombuffer("RGB", (w, h), raw.data, "raw", "BGRX", 0, 1)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    # -- pointer -------------------------------------------------------------------
+    def cursor_position(self) -> tuple[int, int]:
+        self._ensure_connected()
+        pointer = self._root.query_pointer()
+        return int(pointer.root_x), int(pointer.root_y)
+
+    def move(self, x: int, y: int) -> None:
+        self._ensure_connected()
+        xtest.fake_input(self._display, X.MotionNotify, x=x, y=y)
+        self._display.sync()
+
+    def _button_event(self, event_type: int, button: int) -> None:
+        xtest.fake_input(self._display, event_type, button)
+
+    def click(
+        self, x: int | None, y: int | None, button: str = "left", count: int = 1
+    ) -> None:
+        self._ensure_connected()
+        self._check_discrete_input_available()
+        num = _BUTTON_NUMBERS.get(button)
+        if num is None:
+            raise BackendError(f"unsupported click button {button!r}")
+        if x is not None and y is not None:
+            self.move(x, y)
+        for i in range(max(1, count)):
+            self._button_event(X.ButtonPress, num)
+            self._button_event(X.ButtonRelease, num)
+            self._display.sync()
+            if i < count - 1:
+                time.sleep(0.05)  # let the app register discrete clicks, not a drag
+
+    def mouse_down(self, x: int | None, y: int | None, button: str = "left") -> None:
+        self._ensure_connected()
+        self._check_discrete_input_available()
+        num = _BUTTON_NUMBERS.get(button)
+        if num is None:
+            raise BackendError(f"unsupported button {button!r}")
+        if x is not None and y is not None:
+            self.move(x, y)
+        self._button_event(X.ButtonPress, num)
+        self._display.sync()
+
+    def mouse_up(self, x: int | None, y: int | None, button: str = "left") -> None:
+        self._ensure_connected()
+        self._check_discrete_input_available()
+        num = _BUTTON_NUMBERS.get(button)
+        if num is None:
+            raise BackendError(f"unsupported button {button!r}")
+        if x is not None and y is not None:
+            self.move(x, y)
+        self._button_event(X.ButtonRelease, num)
+        self._display.sync()
+
+    def drag(self, start: tuple[int, int] | None, end: tuple[int, int]) -> None:
+        self._ensure_connected()
+        self._check_discrete_input_available()
+        if start is not None:
+            self.move(*start)
+        self.mouse_down(None, None, "left")
+        time.sleep(0.05)
+        self.move(*end)
+        time.sleep(0.05)
+        self.mouse_up(None, None, "left")
+
+    def scroll(self, x: int | None, y: int | None, direction: str, amount: int) -> None:
+        self._ensure_connected()
+        self._check_discrete_input_available()
+        num = _SCROLL_BUTTONS.get(direction)
+        if num is None:
+            raise BackendError(f"unsupported scroll direction {direction!r}")
+        if x is not None and y is not None:
+            self.move(x, y)
+        for _ in range(max(1, amount)):
+            self._button_event(X.ButtonPress, num)
+            self._button_event(X.ButtonRelease, num)
+        self._display.sync()
+
+    # -- keyboard --------------------------------------------------------------
+    def _map_scratch(self, keysym: int) -> int:
+        """Dynamically bind `keysym` onto the highest keycode as a scratch slot -
+        the same technique `xdotool type`/`key` use for characters or symbols with
+        no keycode in the current keyboard layout."""
+        scratch = self._display.display.info.max_keycode
+        self._display.change_keyboard_mapping(
+            scratch, [(keysym, keysym, keysym, keysym)]
+        )
+        self._display.sync()
+        self._display.get_keyboard_mapping(scratch, 1)  # refresh cached keymap
+        return scratch
+
+    def _keycode_for_keysym(self, keysym: int) -> int:
+        """Keycode for a keysym at level 0. For combos (`key`/`hold_key`): the caller
+        already names its own modifiers (e.g. "ctrl+s"), so the base key is sent
+        unshifted and does not need level detection."""
+        keycode = self._display.keysym_to_keycode(keysym)
+        return keycode or self._map_scratch(keysym)
+
+    def _keycode_and_level(self, keysym: int) -> tuple[int, int]:
+        """Keycode plus the shift level it lives at, for typing raw text where the
+        caller names no modifiers of its own (e.g. an uppercase letter or `!`
+        implicitly needs Shift synthesized alongside it)."""
+        try:
+            pairs = list(self._display.keysym_to_keycodes(keysym))
+        except Exception:  # noqa: BLE001 - unknown keysym, fall through to scratch-map
+            pairs = []
+        if pairs:
+            return min(pairs, key=lambda p: p[1])
+        return self._map_scratch(keysym), 0
+
+    def _parse_combo(self, combo: str) -> list[int]:
+        parts = [p for p in combo.split("+") if p]
+        if not parts:
+            raise BackendError("empty key combo")
+        keysyms = []
+        for part in parts:
+            lowered = part.lower()
+            name = _MODIFIER_ALIASES.get(lowered) or _KEY_ALIASES.get(lowered) or part
+            keysyms.append(_keysym_for_name(name))
+        return keysyms
+
+    def _press_combo(self, keysyms: list[int], hold_seconds: float = 0.0) -> None:
+        keycodes = [self._keycode_for_keysym(ks) for ks in keysyms]
+        for kc in keycodes:
+            xtest.fake_input(self._display, X.KeyPress, kc)
+        self._display.sync()
+        if hold_seconds:
+            time.sleep(hold_seconds)
+        for kc in reversed(keycodes):
+            xtest.fake_input(self._display, X.KeyRelease, kc)
+        self._display.sync()
+
+    def key(self, combo: str) -> None:
+        self._ensure_connected()
+        self._check_discrete_input_available()
+        self._press_combo(self._parse_combo(combo))
+
+    def hold_key(self, combo: str, duration: float) -> None:
+        self._ensure_connected()
+        self._check_discrete_input_available()
+        self._press_combo(self._parse_combo(combo), hold_seconds=max(0.0, duration))
+
+    def type_text(self, text: str) -> None:
+        self._ensure_connected()
+        self._check_discrete_input_available()
+        shift_kc: int | None = None
+        for ch in text:
+            name = {"\n": "Return", "\t": "Tab"}.get(ch, ch)
+            keysym = _keysym_for_name(name)
+            keycode, level = self._keycode_and_level(keysym)
+            need_shift = level == 1
+            if need_shift and shift_kc is None:
+                shift_kc = self._display.keysym_to_keycode(_keysym_for_name("Shift_L"))
+            if need_shift and shift_kc:
+                xtest.fake_input(self._display, X.KeyPress, shift_kc)
+            xtest.fake_input(self._display, X.KeyPress, keycode)
+            xtest.fake_input(self._display, X.KeyRelease, keycode)
+            if need_shift and shift_kc:
+                xtest.fake_input(self._display, X.KeyRelease, shift_kc)
+        self._display.sync()
+
+    # -- windows (EWMH) ----------------------------------------------------------
+    def _atom(self, name: str) -> int:
+        return self._display.intern_atom(name)
+
+    def list_windows(self) -> WindowList:
+        self._ensure_connected()
+        client_list = self._root.get_full_property(self._atom("_NET_CLIENT_LIST"), 0)
+        if client_list is None:
+            raise BackendError(
+                "window manager does not expose _NET_CLIENT_LIST (EWMH); "
+                "list_windows is unsupported on this desktop"
+            )
+        active = self._root.get_full_property(self._atom("_NET_ACTIVE_WINDOW"), 0)
+        foreground = str(int(active.value[0])) if active and active.value else None
+
+        name_atom = self._atom("_NET_WM_NAME")
+        utf8_atom = self._atom("UTF8_STRING")
+        state_atom = self._atom("_NET_WM_STATE")
+        hidden_atom = self._atom("_NET_WM_STATE_HIDDEN")
+
+        windows: list[WindowInfo] = []
+        for wid in client_list.value:
+            win = self._display.create_resource_object("window", wid)
+            title = ""
+            name_prop = win.get_full_property(name_atom, utf8_atom)
+            if name_prop and name_prop.value:
+                raw = name_prop.value
+                title = (
+                    raw.decode("utf-8", "replace")
+                    if isinstance(raw, bytes)
+                    else str(raw)
+                )
+            if not title:
+                try:
+                    title = win.get_wm_name() or ""
+                except Exception:  # noqa: BLE001 - best-effort title fallback
+                    title = ""
+            minimized = False
+            state_prop = win.get_full_property(state_atom, 0)
+            if state_prop and state_prop.value:
+                minimized = hidden_atom in list(state_prop.value)
+            windows.append(WindowInfo(str(int(wid)), title, minimized))
+        return WindowList(windows, foreground)
+
+    def focus_window(self, handle: str) -> None:
+        self._ensure_connected()
+        try:
+            wid = int(handle)
+        except ValueError as exc:
+            raise BackendError(f"invalid window handle {handle!r}") from exc
+        win = self._display.create_resource_object("window", wid)
+        ev = xevent.ClientMessage(
+            window=win,
+            client_type=self._atom("_NET_ACTIVE_WINDOW"),
+            data=(32, [1, X.CurrentTime, 0, 0, 0]),
+        )
+        mask = X.SubstructureRedirectMask | X.SubstructureNotifyMask
+        self._root.send_event(ev, event_mask=mask)
+        self._display.flush()
+
+    # -- clipboard (shells out to xclip - see module docstring) -------------------
+    def get_clipboard(self) -> str:
+        exe = shutil.which("xclip")
+        if not exe:
+            raise BackendError("xclip not found on PATH; required for clipboard access")
+        proc = subprocess.run(
+            [exe, "-selection", "clipboard", "-o"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise BackendError(
+                f"xclip -o failed: {proc.stderr.strip() or proc.returncode}"
+            )
+        return proc.stdout
+
+    def set_clipboard(self, text: str) -> None:
+        exe = shutil.which("xclip")
+        if not exe:
+            raise BackendError("xclip not found on PATH; required for clipboard access")
+        proc = subprocess.run(
+            [exe, "-selection", "clipboard"],
+            input=text,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise BackendError(
+                f"xclip set failed: {proc.stderr.strip() or proc.returncode}"
+            )
+
+    def close(self) -> None:
+        if self._display is not None:
+            try:
+                self._display.close()
+            except Exception:
+                logger.debug(
+                    "linux-x11: error closing display connection", exc_info=True
+                )
+            self._display = None

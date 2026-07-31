@@ -211,7 +211,20 @@ def _promote_tools(coordinator: Any, tools: list[Any]) -> tuple[list[Any], list[
             tool = coordinator.get("tools", getattr(spec, "name", ""))
         except Exception:  # noqa: BLE001 - tool lookup is best-effort
             tool = None
-        if tool is not None and hasattr(tool, "native_tool_spec"):
+        # D3 fix: `native_tool_spec` is a property, and on some tools it can raise
+        # (e.g. a backend I/O failure). `hasattr(tool, "native_tool_spec")` used to
+        # gate this block - but Python 3's `hasattr` swallows *only* `AttributeError`;
+        # any other exception raised by the property escapes `hasattr` itself, before
+        # the `try/except` below even starts, and takes down the whole provider
+        # request. Checking the *class* for the descriptor (never invokes the
+        # getter - a property accessed via the class returns the descriptor object
+        # itself) tells us whether the attribute exists at all, without ever calling
+        # into a tool's code. Reading the actual value happens only inside the
+        # `try/except` that already handles a broken tool.
+        if (
+            tool is not None
+            and getattr(type(tool), "native_tool_spec", None) is not None
+        ):
             try:
                 payload = dict(tool.native_tool_spec)
             except Exception:  # a broken tool must not break the request
