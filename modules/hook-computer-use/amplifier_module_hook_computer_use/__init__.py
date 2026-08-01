@@ -126,6 +126,36 @@ def _fail_if_stream_incompatible(provider: Any) -> None:
         )
 
 
+#: Reused decoder for `_loads_leading` - `json.JSONDecoder` is stateless/reentrant
+#: across `raw_decode` calls, so one module-level instance is safe to share.
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _loads_leading(text: str) -> Any:
+    """Parse the JSON value at the *start* of `text`, ignoring anything after it.
+
+    Tool-result content is not necessarily JSON-and-only-JSON by the time this hook
+    sees it: the kernel's `HookResult.append_to_last_tool_result` mechanism (see
+    HOOKS_API.md - "Injection placement control") lets OTHER hooks glue their own
+    text onto the tail of the *same* last-tool-result content string ours occupies.
+    Session-start reminders (`hooks-status-context`, `hooks-todo-reminder`,
+    `mode-status`, `hooks-skills-visibility`, ...) do exactly this on the very
+    first tool call of a session - the common case a screenshot is taken in.
+
+    That mechanism is legitimate, general kernel policy we neither own nor control
+    the timing of (per KERNEL_PHILOSOPHY.md, "policy lives at the edges" - other
+    hooks are free to append). What we own is not assuming we're the only thing
+    that will ever write to that string. `json.loads` requires the *entire* input
+    to be consumed and raises `JSONDecodeError: Extra data` the moment anything
+    trails the closing brace - so a session-start reminder appended after our
+    marker silently made every first-screenshot expansion fail, having nothing to
+    do with local vs. remote. `raw_decode` parses one JSON value from the start of
+    the string and simply reports where it stopped, so trailing text - ours or
+    anyone else's - no longer breaks marker detection.
+    """
+    return _JSON_DECODER.raw_decode(text.lstrip())[0]
+
+
 def _parse_marker(content: Any) -> dict[str, Any] | None:
     """Return the computer-use payload if this tool content carries one.
 
@@ -136,15 +166,16 @@ def _parse_marker(content: Any) -> dict[str, Any] | None:
         {"error": null, "output": "{\\"__amplifier_computer_use__\\": 1, ...}"}
 
     Unwrap whatever shape shows up rather than assuming one: envelope, bare payload,
-    or already-decoded dict.
+    or already-decoded dict. The content string may also carry trailing text
+    appended by another hook (see `_loads_leading`) - tolerate that too.
     """
     if isinstance(content, dict):
         return content if MARKER in content else _parse_marker(content.get("output"))
     if not isinstance(content, str) or MARKER not in content:
         return None
     try:
-        data = json.loads(content)
-    except (json.JSONDecodeError, TypeError):
+        data = _loads_leading(content)
+    except (json.JSONDecodeError, TypeError, ValueError):
         return None
     if isinstance(data, dict):
         if MARKER in data:

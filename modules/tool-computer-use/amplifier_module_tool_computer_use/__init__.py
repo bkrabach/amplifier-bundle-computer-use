@@ -912,6 +912,26 @@ async def mount(
             "provides": [],
             "description": f"computer-use not mounted: {exc}",
         }
+    except (ValueError, TypeError) as exc:
+        # A malformed config (e.g. `target: user@host` instead of
+        # `target: ssh://user@host`) raises out of `select_backend`, NOT as
+        # `NoBackendAvailable`. Before this branch existed it escaped the handler
+        # above entirely and the tool simply never appeared - no traceback, no
+        # log line, nothing in the session to explain the absence. Observed for
+        # real: a session was asked to drive a remote desktop, found no tool, and
+        # silently improvised its own ssh+screencapture workaround instead.
+        #
+        # Deliberately ERROR, not WARNING: an unavailable backend is a fact about
+        # the machine, but a malformed target is a mistake someone made and can
+        # fix, and they cannot fix what they cannot see. Still non-fatal - a bad
+        # config for one tool must not take down the whole bundle load.
+        logger.error("tool-computer-use: NOT MOUNTING - invalid configuration: %s", exc)
+        return {
+            "name": "tool-computer-use",
+            "version": __version__,
+            "provides": [],
+            "description": f"computer-use not mounted (invalid config): {exc}",
+        }
 
     computer = ComputerTool(backend, cfg)
     # D2: resolve display once, here, before the tool ever answers a provider

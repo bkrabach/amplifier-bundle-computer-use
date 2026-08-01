@@ -70,20 +70,46 @@ BACKEND_FACTORIES: tuple[type[Backend], ...] = (
 
 
 def _build_ssh_transport(host: str, package_dir: Any, config: dict[str, Any]) -> Any:
-    """Construct the `SshTransport` for a remote target from mount config.
+    """Return a per-target SHARED transport handle for a remote target.
+
+    Singleton fix: this used to construct a brand-new `SshTransport` (hence a
+    brand-new SSH subprocess, hence a brand-new remote agent process on the
+    target) on EVERY call - so a parent session's own `computer`/`desktop`
+    tools and a delegated `computer-operator` child session's `mount()` each
+    built their OWN transport for the SAME target. Two concurrent agent
+    processes against the same macOS target corrupt each other's Screen
+    Recording TCC grant: `CGDisplayCreateImage` then returns `None` for BOTH
+    agents - including the one that was capturing successfully a moment
+    earlier - with no exception raised on either side (see `macos.py`).
+
+    `shared_transport.acquire_shared_transport` makes every consumer in this
+    process that resolves to the SAME `(ssh_path, host)` key share ONE
+    underlying `SshTransport`/agent process, refcounted so the last consumer
+    to release it is the one that actually tears it down.
 
     Kept separate from `select_backend` so tests can monkeypatch this one
-    function to inject a fake transport without touching real SSH at all.
+    function to inject a fake transport without touching real SSH at all -
+    that seam is unchanged; only what it returns (a shared handle instead of
+    a bare `SshTransport`) is different, and `RemoteBackend` needs no changes
+    since the handle duck-types the same `connect()`/`send()`/`close()`
+    surface.
     """
+    from .shared_transport import acquire_shared_transport
     from .ssh_transport import SshTransport
 
-    return SshTransport(
-        host,
-        package_dir=package_dir,
-        deadman_seconds=float(config.get("deadman_seconds", 5.0)),
-        read_only=bool(config.get("read_only", True)),
-        with_pillow=bool(config.get("with_pillow", True)),
-    )
+    ssh_path = str(config.get("ssh_path", "ssh"))
+
+    def _factory() -> SshTransport:
+        return SshTransport(
+            host,
+            package_dir=package_dir,
+            ssh_path=ssh_path,
+            deadman_seconds=float(config.get("deadman_seconds", 5.0)),
+            read_only=bool(config.get("read_only", True)),
+            with_pillow=bool(config.get("with_pillow", True)),
+        )
+
+    return acquire_shared_transport((ssh_path, host), _factory)
 
 
 def select_backend(
