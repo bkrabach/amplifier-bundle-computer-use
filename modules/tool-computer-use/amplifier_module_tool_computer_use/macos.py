@@ -861,7 +861,7 @@ class MacOSBackend:
         Quartz.CGEventSetFlags(up, flags)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
 
-    def type_text(self, text: str) -> None:
+    def type_text(self, text: str, guard: Any = None) -> None:
         """Type literal Unicode text via `CGEventKeyboardSetUnicodeString`.
 
         Unlike `key()`/`hold_key()`, this needs no keycode/layout table at all: the
@@ -870,7 +870,14 @@ class MacOSBackend:
         including characters with no key on the current physical keyboard. This is
         the macOS-native equivalent of `LinuxX11Backend.type_text`'s dynamic scratch-
         keysym mapping, but built into the platform rather than improvised.
+
+        `guard` (see `Backend.type_text`) is accepted for protocol conformance
+        but not yet used here: macOS's presence-detector `GUARD` band is an
+        unmeasured placeholder pending O4 (`presence.GUARD_MEASURED["macos"]`
+        is `False`), so this bundle does not yet claim intra-`type_text`
+        detection on this platform - see `docs/designs/coexistence.md` \u00a75.5.
         """
+        del guard
         self._ensure_input_trusted()
         event = Quartz.CGEventCreateKeyboardEvent(None, 0, True)
         Quartz.CGEventKeyboardSetUnicodeString(event, len(text), text)

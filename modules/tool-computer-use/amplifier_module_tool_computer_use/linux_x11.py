@@ -284,6 +284,38 @@ class LinuxX11Backend:
         geom = self._root.get_geometry()
         return ScreenGeometry(geom.width, geom.height, 0, 0)
 
+    # -- coexistence: presence + target binding (docs/designs/coexistence.md) ----
+    def presence_idle_ms(self) -> float:
+        """Milliseconds since the last input event (real OR synthetic)
+        reached this X server, via the `MIT-SCREEN-SAVER` extension's
+        `idle` field - the `idle_source` the presence detector
+        (`presence.PresenceMonitor`) reconciles against its own injection
+        timestamps (\u00a75 of the coexistence design). Cheap: one in-process X
+        round trip, no subprocess - safe to call once per elementary event.
+
+        Not part of the `Backend` protocol (`backend.py`) - it is coexistence
+        infrastructure specific to platforms with a proven `GUARD` band (\u00a75.5),
+        looked up via `getattr` by whatever constructs the
+        `coexistence_guard.CoexistenceGuard` for this backend.
+        """
+        self._ensure_connected()
+        info = self._root.screensaver_query_info()
+        return float(info.idle)
+
+    def current_target(self) -> str | None:
+        """The foreground window handle, for target binding (\u00a78.6) - `None`
+        if this desktop's window manager does not expose `_NET_ACTIVE_WINDOW`
+        (binding then reports `\"unverified\"` rather than silently pretending
+        to enforce something it cannot check, per \u00a78.6)."""
+        self._ensure_connected()
+        try:
+            active = self._root.get_full_property(self._atom("_NET_ACTIVE_WINDOW"), 0)
+        except Exception:  # noqa: BLE001 - a read failure here must never crash
+            return None
+        if not active or not active.value:
+            return None
+        return str(int(active.value[0]))
+
     def list_monitors(self) -> list[MonitorInfo]:
         """Enumerate real monitors via RandR 1.5's `GetMonitors` request.
 
@@ -501,11 +533,25 @@ class LinuxX11Backend:
         self._check_discrete_input_available()
         self._press_combo(self._parse_combo(combo), hold_seconds=max(0.0, duration))
 
-    def type_text(self, text: str) -> None:
+    def type_text(self, text: str, guard: Any = None) -> None:
+        """Type literal text, one character at a time.
+
+        `guard` is an optional `coexistence_guard.CoexistenceGuard`
+        (\u00a75.2/\u00a78.6 of `docs/designs/coexistence.md`). When supplied, every
+        keystroke is individually checked (halt/pause/target-binding, via
+        `guard.before_event()`) and individually timestamped for presence
+        detection (`guard.after_event()`) - this is the mechanism that lets a
+        human keystroke landing MID-`type_text` be detected, rather than
+        only between whole operations (\u00a75.2, proven by O5). Omitting `guard`
+        (the default) reproduces the exact prior behavior byte-for-byte -
+        every existing caller of this method is unaffected.
+        """
         self._ensure_connected()
         self._check_discrete_input_available()
         shift_kc: int | None = None
         for ch in text:
+            if guard is not None:
+                guard.before_event()
             name = {"\n": "Return", "\t": "Tab"}.get(ch, ch)
             keysym = _keysym_for_name(name)
             keycode, level = self._keycode_and_level(keysym)
@@ -518,6 +564,9 @@ class LinuxX11Backend:
             xtest.fake_input(self._display, X.KeyRelease, keycode)
             if need_shift and shift_kc:
                 xtest.fake_input(self._display, X.KeyRelease, shift_kc)
+            self._display.sync()
+            if guard is not None:
+                guard.after_event()
         self._display.sync()
 
     # -- windows (EWMH) ----------------------------------------------------------

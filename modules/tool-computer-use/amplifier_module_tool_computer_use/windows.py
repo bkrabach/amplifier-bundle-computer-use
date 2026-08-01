@@ -385,7 +385,16 @@ class WindowsBackend:
         if not res.get("ok"):
             raise BackendError(res.get("error", "hold_key failed"))
 
-    def type_text(self, text: str) -> None:
+    def type_text(self, text: str, guard: Any = None) -> None:
+        """See `Backend.type_text` for the `guard` parameter's contract.
+        Accepted for protocol conformance but not yet used: \u00a75.5 of
+        `docs/designs/coexistence.md` explains why intra-`type_text` human
+        detection is not viable on Windows today (`GetLastInputInfo`
+        quantisation exceeds any usable guard band) - Windows presence
+        detection ships at op granularity only, one layer up
+        (`ComputerTool._run`), not inside this loop.
+        """
+        del guard
         res = self.raw(
             "type", text=text, timeout=max(self._timeout, 10 + len(text) * 0.05)
         )

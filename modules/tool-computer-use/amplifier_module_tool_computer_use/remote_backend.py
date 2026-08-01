@@ -206,7 +206,13 @@ class RemoteBackend:
     def hold_key(self, combo: str, duration: float) -> None:
         raise BackendError("hold_key over the wire is Phase 2 - see design doc")
 
-    def type_text(self, text: str) -> None:
+    def type_text(self, text: str, guard: Any = None) -> None:
+        """See `Backend.type_text` for the `guard` parameter's contract.
+        Accepted for protocol conformance but not used: the remote agent
+        runs its own copy of a platform backend on the target (\u00a75 of
+        `docs/designs/remote-transport.md`), so any intra-op presence
+        detection belongs on that side, not here."""
+        del guard
         self._call("type_text", text=text)
 
     def list_windows(self) -> WindowList:
