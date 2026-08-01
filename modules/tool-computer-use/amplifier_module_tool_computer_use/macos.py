@@ -232,6 +232,44 @@ _MODIFIER_FLAG_NAMES = {
 }
 
 
+def _cg_preflight_screen_capture_access() -> bool | None:
+    """Best-effort, cheap, PROMPT-FREE probe of the Screen Recording TCC grant,
+    via ctypes against CoreGraphics directly - the same "independent of
+    pyobjc version" reasoning as `_ax_is_process_trusted()`'s Accessibility
+    probe just above.
+
+    `CGPreflightScreenCaptureAccess` (macOS 10.15+) reports the grant WITHOUT
+    capturing anything and WITHOUT prompting the user, unlike attempting a
+    real capture and inferring the reason from its failure. Returns `None`
+    (not a guess) when the symbol cannot be resolved at all - too old an OS,
+    or a stripped/exotic CoreGraphics - so `capture()`'s error message can
+    fall back to naming BOTH known causes honestly instead of asserting one
+    this probe was not actually able to check.
+    """
+    try:
+        lib_path = ctypes.util.find_library("CoreGraphics")
+        if not lib_path:
+            lib_path = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        lib = ctypes.cdll.LoadLibrary(lib_path)
+        fn = lib.CGPreflightScreenCaptureAccess
+        fn.restype = ctypes.c_bool
+        return bool(fn())
+    except (OSError, AttributeError):
+        return None
+
+
+#: Named once so `capture()`'s three branches below and any test asserting on
+#: this text stay in sync with a single source of truth.
+_CONCURRENT_AGENT_CAUSE = (
+    "a SECOND concurrent computer-use agent process launched against this "
+    "same machine, which revokes/corrupts this one's Screen Recording grant "
+    "too (macOS denies the permission to a second concurrent process in the "
+    "same launch chain, silently, with no exception on either side) - check "
+    "for one with `ps aux | grep amplifier_cu_agent` before assuming a "
+    "one-time permission problem"
+)
+
+
 def _ax_is_process_trusted() -> bool:
     """Query `AXIsProcessTrusted()` directly via ctypes - deliberately independent of
     pyobjc/Quartz. This is a single, argument-free C boolean function in
@@ -559,6 +597,54 @@ class MacOSBackend:
             )
         return monitors
 
+    def _capture_none_error(self, display_id: int | None) -> str:
+        """Compose the error for `CGDisplayCreateImage` returning `None`.
+
+        This used to be a single guessed message ("display may have gone to
+        sleep or been disconnected") for every cause. That guess cost hours
+        of investigation the one time it actually mattered: the real cause
+        was a denied Screen Recording grant (poisoned by a second concurrent
+        agent process against this same target), and `CGDisplayCreateImage`
+        raises no exception for that either - it just returns `None`, exactly
+        like it does for a sleeping/disconnected display. The two causes are
+        distinguishable with one cheap, prompt-free preflight call
+        (`_cg_preflight_screen_capture_access`), so this asks rather than
+        guesses, and only reaches for "the display is asleep" once the
+        permission itself is confirmed granted.
+        """
+        granted = _cg_preflight_screen_capture_access()
+        base = f"CGDisplayCreateImage({display_id}) returned no image"
+        if granted is False:
+            return (
+                f"{base}: Screen Recording permission is NOT granted to this "
+                "process (CGPreflightScreenCaptureAccess() == False). macOS "
+                "raises no exception for this - it just hands back nothing. "
+                "Two known causes: (1) the grant was never made - open "
+                "System Settings -> Privacy & Security -> Screen Recording "
+                "and enable the process actually running this code; (2) "
+                f"{_CONCURRENT_AGENT_CAUSE}."
+            )
+        if granted is True:
+            # Permission genuinely is granted - a permissions guess would be
+            # wrong here, so this is the one branch that mentions sleep.
+            return (
+                f"{base} even though Screen Recording permission is granted "
+                "(CGPreflightScreenCaptureAccess() == True) - the display "
+                "itself is the likely cause: it may have gone to sleep or "
+                "been disconnected."
+            )
+        # Could not check (older macOS/pyobjc without the preflight symbol) -
+        # name every known cause honestly rather than asserting one as fact.
+        return (
+            f"{base}, and this process could not determine Screen Recording "
+            "permission status to narrow down why "
+            "(CGPreflightScreenCaptureAccess unavailable on this system). "
+            "Known causes, in likely order: a revoked or never-granted "
+            "Screen Recording permission (macOS raises no exception for "
+            f"this); {_CONCURRENT_AGENT_CAUSE}; or the display having gone "
+            "to sleep or been disconnected."
+        )
+
     def capture(self, region: tuple[int, int, int, int] | None = None) -> bytes:
         """Return PNG bytes at native (physical-pixel) resolution.
 
@@ -607,10 +693,7 @@ class MacOSBackend:
 
         full_image = Quartz.CGDisplayCreateImage(display_id)
         if full_image is None:
-            raise BackendError(
-                f"CGDisplayCreateImage({display_id}) returned no image "
-                "(display may have gone to sleep or been disconnected)"
-            )
+            raise BackendError(self._capture_none_error(display_id))
         if (local_x, local_y, w, h) == (
             0,
             0,

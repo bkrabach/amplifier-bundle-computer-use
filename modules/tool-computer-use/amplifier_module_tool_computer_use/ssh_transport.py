@@ -305,10 +305,20 @@ class SshTransport:
                 ) from exc
             resp_line = self._read_line_with_timeout(proc.stdout, timeout)
             if resp_line is None:
+                self._drain_stderr_on_failure()
                 raise SshConnectError(
                     f"no response from {self.user_host} within {timeout}s "
                     "(connection likely lost)"
                 )
+            # Surface the agent's own stderr whenever it reports an error.
+            # Previously stderr was drained ONLY on connect failure, so a
+            # request-level error arrived as a bare message with the agent's
+            # side of the story discarded - which is exactly the case where it
+            # matters most. A platform API that fails by returning nothing
+            # (macOS `CGDisplayCreateImage` under a denied TCC grant is the
+            # example that motivated this) leaves no other trace at all.
+            if b'"error' in resp_line or b'"ok": false' in resp_line:
+                self._drain_stderr_on_failure()
             return resp_line
 
     def _read_line_with_timeout(self, stream: Any, timeout: float) -> bytes | None:
