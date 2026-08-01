@@ -2,7 +2,7 @@
 bundle:
   name: computer-use
   version: 0.1.0
-  description: See and control the real Windows desktop with Claude's native computer-use tool
+  description: See and control a real desktop - Windows, macOS, or Linux, local or across your network - with the LLM's native computer-use tool
 
 includes:
   - bundle: computer-use:behaviors/computer-use
@@ -10,8 +10,9 @@ includes:
 
 # Computer Use
 
-This session can see the user's screen and control their mouse and keyboard on the real
-Windows desktop, using Claude's built-in computer-use tool.
+This session can see a real desktop and control its mouse and keyboard, using the LLM
+provider's built-in computer-use tool. The desktop may be Windows, macOS, or Linux, and
+it may be this machine or another one reachable over your private network.
 
 Reach for it whenever a task has no API, no CLI, and no extension — a legacy desktop
 program, a proprietary UI, a dialog box, an installer, a settings panel. If a human could

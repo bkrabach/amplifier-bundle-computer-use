@@ -1,11 +1,11 @@
 bundle:
   name: computer-use-behavior
   version: 0.1.0
-  description: Real control of the Windows desktop using Claude's native computer-use tool
+  description: Real control of a Windows, macOS, or Linux desktop - local or remote - using the LLM provider's native computer-use tool
 
 tools:
   - module: tool-computer-use
-    source: git+https://github.com/ckrabach617/amplifier-bundle-computer-use.git@main#subdirectory=modules/tool-computer-use
+    source: git+https://github.com/bkrabach/amplifier-bundle-computer-use.git@main#subdirectory=modules/tool-computer-use
     config:
       # Screenshots are downscaled to this long edge before Claude sees them.
       # Anthropic's guidance: at or below WXGA. Bigger is slower AND less accurate.
@@ -16,7 +16,7 @@ tools:
 
 hooks:
   - module: hook-computer-use
-    source: git+https://github.com/ckrabach617/amplifier-bundle-computer-use.git@main#subdirectory=modules/hook-computer-use
+    source: git+https://github.com/bkrabach/amplifier-bundle-computer-use.git@main#subdirectory=modules/hook-computer-use
     config:
       # How many of the most recent screenshots stay inline in the request.
       # Older ones collapse to text so a long session does not blow up cost.
