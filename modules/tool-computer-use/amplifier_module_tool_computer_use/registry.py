@@ -15,6 +15,7 @@ from typing import Any
 
 from .backend import Backend
 from .linux_x11 import LinuxX11Backend
+from .macos import MacOSBackend
 from .windows import WindowsBackend
 
 logger = logging.getLogger(__name__)
@@ -35,8 +36,16 @@ class NoBackendAvailable(RuntimeError):
 
 #: Probe order. Windows-over-WSL2 first preserves today's default behavior; Linux X11
 #: is only tried if the Windows bridge is not reachable (e.g. a bare Linux box with no
-#: `powershell.exe`, such as this bundle's original test box).
-BACKEND_FACTORIES: tuple[type[Backend], ...] = (WindowsBackend, LinuxX11Backend)
+#: `powershell.exe`, such as this bundle's original test box). macOS is only tried if
+#: neither of those is reachable (e.g. a bare macOS box) - its `probe()` returns
+#: unavailable immediately on any non-Darwin platform, so trying it earlier would cost
+#: nothing functionally, but this order keeps the two previously-verified platforms'
+#: behavior completely undisturbed by this addition.
+BACKEND_FACTORIES: tuple[type[Backend], ...] = (
+    WindowsBackend,
+    LinuxX11Backend,
+    MacOSBackend,
+)
 
 
 def select_backend(

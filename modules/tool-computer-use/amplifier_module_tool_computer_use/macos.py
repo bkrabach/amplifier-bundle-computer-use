@@ -1,0 +1,949 @@
+"""Local macOS desktop backend, via Core Graphics (Quartz) + Accessibility (AX).
+
+In-process, like `LinuxX11Backend`: every action below talks straight to WindowServer
+through pyobjc's `Quartz` bindings around CoreGraphics's Display Services and Event
+Services APIs. There is no subprocess anywhere on the hot path for the core action set
+(capture, geometry, monitors, cursor, move/click/drag/scroll/key/type) - the opposite
+constraint from `WindowsBackend`, which must cross the WSL2/Win32 boundary through
+`powershell.exe` for every single action. macOS needs neither of those crossings: the
+console session this process runs in *is* the GUI session (confirmed: this backend was
+built and verified over SSH into the same user account that owns the desktop), so a
+plain in-process Core Graphics connection reaches the real screen directly, the same
+way `LinuxX11Backend`'s Xlib connection reaches the real X server directly.
+
+Two capabilities shell out anyway, for the same reason `LinuxX11Backend` shells out to
+`xclip` for clipboard: a well-solved, battle-tested surface already exists, and
+reimplementing it in-process would trade a working dependency for fragile code with no
+capability upside.
+
+* Clipboard -> `pbcopy`/`pbpaste`. Apple's own, always present, gets NSPasteboard's
+  UTI/type negotiation right for free.
+* `focus_window` -> `osascript` driving System Events. Raising a *specific* window (not
+  just activating its owning app) through the public Accessibility API in-process means
+  matching a `CGWindowID` to an `AXUIElement` - there is no public API that hands you
+  that mapping directly, only a private `_AXUIElementGetWindow` call Apple could break
+  or reject from notarization without notice. System Events' AppleScript dictionary
+  already exposes "raise window N of process P" as a first-class, publicly documented
+  operation; shelling out to it is the honest choice, not a shortcut.
+
+Two coordinate-space traps this module cannot get wrong (see `_display_scale` and the
+module-level docstring in `geometry.py` for the SCREEN/MODEL split this sits under):
+
+1. **Retina backing scale.** `CGDisplayCreateImage` (capture) and `CGDisplayPixelsWide`/
+   `CGDisplayPixelsHigh` (monitor dimensions) all report *physical* pixels - on a Retina
+   display, 2x (sometimes more) the *logical points* that `CGDisplayBounds` (monitor
+   origin) and every `CGEvent` mouse-location parameter use. This backend's canonical
+   `Backend` "SCREEN space" is physical pixels (matching `capture()`'s own output and
+   every other backend's convention), so every point in/out of a `CGEvent` is converted
+   through `_display_scale()`, computed empirically per display as
+   `CGDisplayPixelsWide(id) / CGDisplayBounds(id).size.width` - not assumed to be 2.0,
+   since some external displays and 1x-configured Retina displays are not.
+2. **Coordinate origin convention.** Quartz's "global display coordinate space" (what
+   `CGDisplayBounds`, `CGEventCreateMouseEvent`, and `CGWarpMouseCursorPosition` all
+   share) has its origin at the *top-left* of the main display, y increasing downward -
+   the opposite of AppKit/Cocoa's `NSScreen.frame`, which is bottom-left-origin,
+   y increasing upward. This module never imports AppKit/Cocoa and never touches an
+   `NSScreen`; every coordinate here comes from a `CG*` call, so there is exactly one
+   coordinate convention in play throughout, not two silently disagreeing ones.
+
+Accessibility (input injection) is a distinct, separately-granted TCC permission from
+Screen Recording (capture): a process can capture the screen perfectly while every
+`CGEventPost` call it makes is silently swallowed - delivered to no window, producing no
+exception, no error return, nothing. `_ensure_input_trusted()` probes this explicitly
+(via `AXIsProcessTrusted`, over ctypes so the check works even if pyobjc is partially
+broken) before the *first* discrete-input action each session, exactly the same lazy,
+cached-per-instance shape as `LinuxX11Backend._check_discrete_input_available()` - for
+the same reason: capture/geometry/monitors/cursor_position genuinely work regardless of
+this permission, so gating the whole backend on it at `probe()` time would discard real,
+working capability. See that method's docstring for the exact remediation text surfaced
+to the caller.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import ctypes.util
+import logging
+import shutil
+import subprocess
+import sys
+from typing import Any
+
+from .backend import (
+    BackendError,
+    MonitorInfo,
+    ProbeResult,
+    ScreenGeometry,
+    WindowInfo,
+    WindowList,
+)
+
+logger = logging.getLogger(__name__)
+
+# pyobjc-framework-Quartz is a macOS-only dependency (see pyproject.toml's
+# `sys_platform == 'darwin'` marker) - it is simply not installed on Linux/Windows.
+# Importing it unconditionally at module top would crash `registry.py`'s
+# `from .macos import MacOSBackend` on every non-Mac machine, exactly the trap this
+# bundle's `python-xlib` dependency already risks for non-Linux hosts (see D1 in
+# `backend.py`: a backend that cannot possibly work must never take down `mount()`,
+# and that guarantee starts at *import*, not just at `probe()`). Caught here, once,
+# and reported through `probe()` as an ordinary unavailability reason.
+_IMPORT_ERROR: str | None = None
+try:
+    import Quartz as _quartz_module  # type: ignore[import-not-found]
+except Exception as exc:  # noqa: BLE001 - any import failure -> unavailable, not fatal
+    _quartz_module = None
+    _IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+#: Typed `Any` (not `ModuleType | None`) so every `Quartz.CG*`/`kCG*` reference below
+#: type-checks cleanly - the real, load-bearing `None` guard is `probe()`, which
+#: refuses to make this backend available at all when the import failed.
+Quartz: Any = _quartz_module
+
+_BUTTON_CONST = {
+    "left": 0,  # kCGMouseButtonLeft
+    "right": 1,  # kCGMouseButtonRight
+    "middle": 2,  # kCGMouseButtonCenter
+}
+
+#: Apple's virtual keycode table (HIToolbox `Events.h`'s `kVK_*` constants). These are
+#: physical-key identifiers, not characters - there is no public API to look one up by
+#: name, so this table is the standard, widely-published mapping every mac automation
+#: tool (pyautogui, robotgo, pynput, ...) hardcodes. US ANSI layout only: this covers
+#: what a "key combo" (e.g. "cmd+s") needs - a literal keycode for a named key - not
+#: arbitrary Unicode text, which `type_text` sends through `CGEventKeyboardSetUnicodeString`
+#: instead (see `type_text`) and therefore needs no keycode/layout mapping at all.
+_KEYCODE = {
+    "a": 0x00,
+    "s": 0x01,
+    "d": 0x02,
+    "f": 0x03,
+    "h": 0x04,
+    "g": 0x05,
+    "z": 0x06,
+    "x": 0x07,
+    "c": 0x08,
+    "v": 0x09,
+    "b": 0x0B,
+    "q": 0x0C,
+    "w": 0x0D,
+    "e": 0x0E,
+    "r": 0x0F,
+    "y": 0x10,
+    "t": 0x11,
+    "1": 0x12,
+    "2": 0x13,
+    "3": 0x14,
+    "4": 0x15,
+    "6": 0x16,
+    "5": 0x17,
+    "=": 0x18,
+    "9": 0x19,
+    "7": 0x1A,
+    "-": 0x1B,
+    "8": 0x1C,
+    "0": 0x1D,
+    "]": 0x1E,
+    "o": 0x1F,
+    "u": 0x20,
+    "[": 0x21,
+    "i": 0x22,
+    "p": 0x23,
+    "return": 0x24,
+    "enter": 0x24,
+    "l": 0x25,
+    "j": 0x26,
+    "'": 0x27,
+    "k": 0x28,
+    ";": 0x29,
+    "\\": 0x2A,
+    ",": 0x2B,
+    "/": 0x2C,
+    "n": 0x2D,
+    "m": 0x2E,
+    ".": 0x2F,
+    "tab": 0x30,
+    "space": 0x31,
+    "`": 0x32,
+    "backspace": 0x33,
+    "delete": 0x33,
+    "escape": 0x35,
+    "esc": 0x35,
+    "cmd": 0x37,
+    "command": 0x37,
+    "super": 0x37,
+    "win": 0x37,
+    "windows": 0x37,
+    "meta": 0x37,
+    "shift": 0x38,
+    "capslock": 0x39,
+    "alt": 0x3A,
+    "option": 0x3A,
+    "ctrl": 0x3B,
+    "control": 0x3B,
+    "f17": 0x40,
+    "f18": 0x4F,
+    "f19": 0x50,
+    "f20": 0x5A,
+    "f5": 0x60,
+    "f6": 0x61,
+    "f7": 0x62,
+    "f3": 0x63,
+    "f8": 0x64,
+    "f9": 0x65,
+    "f11": 0x67,
+    "f13": 0x69,
+    "f16": 0x6A,
+    "f14": 0x6B,
+    "f10": 0x6D,
+    "f12": 0x6F,
+    "f15": 0x71,
+    "help": 0x72,
+    "home": 0x73,
+    "pageup": 0x74,
+    "page_up": 0x74,
+    "forwarddelete": 0x75,
+    "del": 0x75,
+    "f4": 0x76,
+    "end": 0x77,
+    "f2": 0x78,
+    "pagedown": 0x79,
+    "page_down": 0x79,
+    "f1": 0x7A,
+    "left": 0x7B,
+    "right": 0x7C,
+    "down": 0x7D,
+    "up": 0x7E,
+}
+
+#: Combo tokens that name a modifier rather than a "real" key - these set an event
+#: flag (`CGEventSetFlags`) instead of contributing the combo's actual keycode.
+_MODIFIER_FLAG_NAMES = {
+    "cmd",
+    "command",
+    "super",
+    "win",
+    "windows",
+    "meta",
+    "shift",
+    "alt",
+    "option",
+    "ctrl",
+    "control",
+}
+
+
+def _ax_is_process_trusted() -> bool:
+    """Query `AXIsProcessTrusted()` directly via ctypes - deliberately independent of
+    pyobjc/Quartz. This is a single, argument-free C boolean function in
+    ApplicationServices; loading it through ctypes means the Accessibility check still
+    works even in a partially-broken pyobjc install, and adds zero package
+    dependencies for a single yes/no probe.
+    """
+    lib_path = ctypes.util.find_library("ApplicationServices")
+    if not lib_path:
+        lib_path = (
+            "/System/Library/Frameworks/ApplicationServices.framework/"
+            "ApplicationServices"
+        )
+    lib = ctypes.cdll.LoadLibrary(lib_path)
+    lib.AXIsProcessTrusted.restype = ctypes.c_bool
+    return bool(lib.AXIsProcessTrusted())
+
+
+#: `CGEventFlags` bit masks (from CoreGraphics's public `CGEventTypes.h`), hardcoded as
+#: plain ints rather than read off `Quartz.kCGEventFlagMask*`. This is a deliberate,
+#: pure-logic seam: `_combo_flags_and_keycode` below does real work (combo parsing,
+#: alias resolution, error messages for typos) that deserves the same zero-Quartz unit
+#: test coverage `geometry.py`'s pure math gets - and these four values are public,
+#: stable Apple constants, not something this module is guessing at.
+_CG_FLAG_COMMAND = 1 << 20  # kCGEventFlagMaskCommand
+_CG_FLAG_SHIFT = 1 << 17  # kCGEventFlagMaskShift
+_CG_FLAG_CONTROL = 1 << 18  # kCGEventFlagMaskControl
+_CG_FLAG_ALTERNATE = 1 << 19  # kCGEventFlagMaskAlternate
+
+_MODIFIER_FLAG_BY_NAME = {
+    "cmd": _CG_FLAG_COMMAND,
+    "command": _CG_FLAG_COMMAND,
+    "super": _CG_FLAG_COMMAND,
+    "win": _CG_FLAG_COMMAND,
+    "windows": _CG_FLAG_COMMAND,
+    "meta": _CG_FLAG_COMMAND,
+    "shift": _CG_FLAG_SHIFT,
+    "alt": _CG_FLAG_ALTERNATE,
+    "option": _CG_FLAG_ALTERNATE,
+    "ctrl": _CG_FLAG_CONTROL,
+    "control": _CG_FLAG_CONTROL,
+}
+
+
+def _combo_flags_and_keycode(combo: str) -> tuple[int, int]:
+    """Parse a combo string (e.g. `"cmd+shift+s"`) into `(CGEventFlags, keycode)`.
+
+    Pure logic, no Quartz dependency - runs and is tested on any platform.
+    """
+    parts = [p for p in combo.split("+") if p]
+    if not parts:
+        raise BackendError("empty key combo")
+    flags = 0
+    keycode: int | None = None
+    for part in parts:
+        lowered = part.lower()
+        if lowered in _MODIFIER_FLAG_NAMES:
+            flags |= _MODIFIER_FLAG_BY_NAME[lowered]
+            continue
+        code = _KEYCODE.get(lowered)
+        if code is None and len(part) == 1:
+            code = _KEYCODE.get(part.lower())
+        if code is None:
+            raise BackendError(f"unknown key name {part!r} in combo {combo!r}")
+        keycode = code
+    if keycode is None:
+        raise BackendError(f"combo {combo!r} names only modifiers, no real key")
+    return flags, keycode
+
+
+class MacOSBackend:
+    """Executes computer-use actions against the local macOS desktop, in-process."""
+
+    name = "macos"
+
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        cfg = config or {}
+        self._osascript_timeout = float(cfg.get("timeout", 15.0))
+        self._input_trusted_checked = False
+        self._input_blocked_reason: str | None = None
+
+    # -- capability probe (D1) ---------------------------------------------------
+    def probe(self) -> ProbeResult:
+        """Cheap, in-process checks only. Never raises - failure is reported."""
+        if sys.platform != "darwin":
+            return ProbeResult(False, f"not macOS (sys.platform={sys.platform!r})")
+        if Quartz is None:
+            return ProbeResult(
+                False,
+                "pyobjc-framework-Quartz is not importable "
+                f"({_IMPORT_ERROR}); install it to enable the macOS backend",
+            )
+        try:
+            err, _displays, count = Quartz.CGGetActiveDisplayList(32, None, None)
+        except Exception as exc:  # noqa: BLE001 - any Quartz call failure -> unavailable
+            return ProbeResult(False, f"CGGetActiveDisplayList failed: {exc}")
+        if err != 0:
+            return ProbeResult(False, f"CGGetActiveDisplayList returned error {err}")
+        if not count:
+            return ProbeResult(
+                False,
+                "zero active displays (screen may be asleep, or this is a "
+                "clamshell-closed Mac with no external display attached)",
+            )
+        return ProbeResult(True)
+
+    # -- lazy Accessibility (input) gate ------------------------------------------
+    def _ensure_input_trusted(self) -> None:
+        """Gate discrete input (move/click/drag/scroll/key/type) on Accessibility TCC.
+
+        Checked lazily, once per instance, exactly like `LinuxX11Backend`'s exclusive-
+        grab check: `probe()` only has to prove capture/geometry work (they do, without
+        this permission), so it must not fail the whole backend for an input-only
+        restriction. Without this explicit check, an untrusted process's `CGEventPost`
+        calls are silently swallowed - the cursor may even appear to move (warping the
+        raw HID position is not always gated the same way clicks/keys are) while clicks
+        and keystrokes reach no window and no exception is ever raised. That silent-
+        no-op is exactly the failure mode this bundle must never ship, so it is
+        converted here into a loud, actionable `BackendError` naming the exact fix.
+        """
+        if self._input_trusted_checked:
+            if self._input_blocked_reason:
+                raise BackendError(self._input_blocked_reason)
+            return
+        self._input_trusted_checked = True
+        if not _ax_is_process_trusted():
+            self._input_blocked_reason = (
+                "Accessibility permission not granted: this process is not trusted "
+                "to control the computer (AXIsProcessTrusted() == False). Mouse/"
+                "keyboard input (move, click, drag, scroll, key, type) will be "
+                "silently swallowed by WindowServer until this is granted - macOS "
+                "raises no exception for this, which is exactly why this check "
+                "exists. Fix: open System Settings -> Privacy & Security -> "
+                "Accessibility, and enable the process actually running this code "
+                "(e.g. Terminal, sshd-launched login shell, or the python "
+                "interpreter binary itself - whichever the Privacy pane lists after "
+                "the first attempted action). Screenshots, monitor listing, and "
+                "cursor position are unaffected by this permission and remain usable."
+            )
+            raise BackendError(self._input_blocked_reason)
+
+    # -- geometry helpers ----------------------------------------------------------
+    def _active_display_ids(self) -> list[int]:
+        err, displays, count = Quartz.CGGetActiveDisplayList(32, None, None)
+        if err != 0:
+            raise BackendError(f"CGGetActiveDisplayList returned error {err}")
+        return [int(d) for d in (displays or [])[:count]]
+
+    @staticmethod
+    def _physical_pixel_size(display_id: int) -> tuple[int, int]:
+        """True physical framebuffer resolution for one display.
+
+        Deliberately NOT `CGDisplayPixelsWide`/`CGDisplayPixelsHigh`: verified live on
+        the real Retina machine this backend was built against (macOS 26.6), those two
+        calls return the *logical point* resolution - identical to `CGDisplayBounds`'s
+        width/height, NOT the 2x physical pixel count. That is exactly the kind of
+        silent, wrong-by-a-scale-factor bug this module's docstring warns about, caught
+        here empirically before being trusted: `CGDisplayCopyDisplayMode` +
+        `CGDisplayModeGetPixelWidth/Height` is the API that actually reports the
+        framebuffer's physical pixel dimensions - confirmed to match
+        `CGImageGetWidth/Height` on a real `CGDisplayCreateImage` capture (3456x2234 on
+        the verification machine, vs. 1728x1117 from `CGDisplayPixelsWide`/
+        `CGDisplayBounds` - exactly 2x, the display's real Retina backing scale).
+        """
+        mode = Quartz.CGDisplayCopyDisplayMode(display_id)
+        if mode is None:
+            raise BackendError(
+                f"CGDisplayCopyDisplayMode({display_id}) returned no mode "
+                "(display may have gone to sleep or been disconnected)"
+            )
+        return (
+            int(Quartz.CGDisplayModeGetPixelWidth(mode)),
+            int(Quartz.CGDisplayModeGetPixelHeight(mode)),
+        )
+
+    @classmethod
+    def _display_scale(cls, display_id: int) -> float:
+        """Physical pixels per logical point for one display, measured empirically -
+        never assumed to be 2.0 (some external/1x-configured displays are 1.0, and
+        Apple has shipped 3x-class devices in other product lines)."""
+        bounds = Quartz.CGDisplayBounds(display_id)
+        point_w = bounds.size.width
+        pixel_w, _pixel_h = cls._physical_pixel_size(display_id)
+        if not point_w:
+            return 1.0
+        return float(pixel_w) / float(point_w)
+
+    def _monitor_infos(self) -> list[MonitorInfo]:
+        """One `MonitorInfo` per active display, in physical-pixel SCREEN space.
+
+        `x`/`y`/`width`/`height` are each computed using *that display's own* backing
+        scale - self-consistent for coordinate math confined to a single monitor
+        (exactly how `ComputerTool` uses `Display`: scoped to one monitor's own
+        bounds). Known, documented limitation: on a genuinely mixed-DPI multi-monitor
+        setup, stitching these into one shared virtual-desktop pixel space (only used
+        in `monitors.VIRTUAL_DESKTOP` mode, not the default) is not perfectly exact,
+        because there is no single physical-pixel unit that is simultaneously correct
+        for two displays with different scale factors. Not exercised by the real
+        verification for this backend, which ran against a single-display Mac.
+        """
+        display_ids = self._active_display_ids()
+        if not display_ids:
+            return []
+        main_id = Quartz.CGMainDisplayID()
+        infos: list[MonitorInfo] = []
+        for display_id in display_ids:
+            scale = self._display_scale(display_id)
+            bounds = Quartz.CGDisplayBounds(display_id)
+            x = round(bounds.origin.x * scale)
+            y = round(bounds.origin.y * scale)
+            w, h = self._physical_pixel_size(display_id)
+            infos.append(
+                MonitorInfo(
+                    id=str(display_id),
+                    x=x,
+                    y=y,
+                    width=w,
+                    height=h,
+                    primary=(display_id == main_id),
+                    name="",  # no public API for a human-readable display name
+                )
+            )
+        return infos
+
+    def _covering_monitor_for_pixel(self, x: int, y: int) -> MonitorInfo:
+        """Which monitor's physical-pixel bounds contain `(x, y)`.
+
+        Falls back to the primary monitor (clamped, not raised) if none contains the
+        point - defensive only: real callers always pass coordinates already clamped
+        to one monitor's bounds by `geometry.Display.to_screen`, so this path is not
+        expected to fire in normal operation.
+        """
+        monitors = self._monitor_infos()
+        if not monitors:
+            raise BackendError("no active displays; cannot resolve a screen position")
+        for m in monitors:
+            if m.x <= x < m.x + m.width and m.y <= y < m.y + m.height:
+                return m
+        primary = next((m for m in monitors if m.primary), monitors[0])
+        logger.warning(
+            "macos: pixel (%d, %d) is outside every enumerated monitor; "
+            "falling back to primary monitor %r for coordinate conversion",
+            x,
+            y,
+            primary.id,
+        )
+        return primary
+
+    def _pixel_to_point(self, x: int, y: int) -> Any:
+        """Physical-pixel SCREEN coordinate -> Quartz global point (for `CGEvent*`)."""
+        m = self._covering_monitor_for_pixel(x, y)
+        scale = self._display_scale(int(m.id))
+        bounds = Quartz.CGDisplayBounds(int(m.id))
+        local_px_x = x - m.x
+        local_px_y = y - m.y
+        point_x = bounds.origin.x + local_px_x / scale
+        point_y = bounds.origin.y + local_px_y / scale
+        return Quartz.CGPointMake(point_x, point_y)
+
+    def _point_to_pixel(self, point_x: float, point_y: float) -> tuple[int, int]:
+        """Quartz global point (from `CGEventGetLocation`) -> physical-pixel SCREEN
+        coordinate - the inverse of `_pixel_to_point`."""
+        for m in self._monitor_infos():
+            scale = self._display_scale(int(m.id))
+            bounds = Quartz.CGDisplayBounds(int(m.id))
+            bx, by, bw, bh = (
+                bounds.origin.x,
+                bounds.origin.y,
+                bounds.size.width,
+                bounds.size.height,
+            )
+            if bx <= point_x < bx + bw and by <= point_y < by + bh:
+                local_pt_x = point_x - bx
+                local_pt_y = point_y - by
+                return (
+                    m.x + round(local_pt_x * scale),
+                    m.y + round(local_pt_y * scale),
+                )
+        # Outside every display's point-bounds (e.g. a stale cursor report during a
+        # display reconfiguration) - fall back to the primary monitor's own scale
+        # rather than raising, mirroring `_covering_monitor_for_pixel`'s fallback.
+        monitors = self._monitor_infos()
+        if not monitors:
+            raise BackendError("no active displays; cannot resolve cursor position")
+        primary = next((m for m in monitors if m.primary), monitors[0])
+        scale = self._display_scale(int(primary.id))
+        return (round(point_x * scale), round(point_y * scale))
+
+    # -- Backend protocol: geometry + capture -------------------------------------
+    def screen_geometry(self) -> ScreenGeometry:
+        """Bounding box across every active display, in physical pixels.
+
+        Origin is normalized using the *main* display's scale factor (documented
+        limitation for mixed-DPI setups - see `_monitor_infos`). This is only reached
+        in `monitors.VIRTUAL_DESKTOP` mode; the default (`PRIMARY`) targeting scopes to
+        a single real monitor's own, exactly-correct bounds instead.
+        """
+        main_id = Quartz.CGMainDisplayID()
+        main_scale = self._display_scale(main_id)
+        ids = self._active_display_ids()
+        if not ids:
+            raise BackendError("no active displays; cannot report screen geometry")
+        min_x = min_y = float("inf")
+        max_x = max_y = float("-inf")
+        for display_id in ids:
+            b = Quartz.CGDisplayBounds(display_id)
+            min_x = min(min_x, b.origin.x)
+            min_y = min(min_y, b.origin.y)
+            max_x = max(max_x, b.origin.x + b.size.width)
+            max_y = max(max_y, b.origin.y + b.size.height)
+        return ScreenGeometry(
+            width=round((max_x - min_x) * main_scale),
+            height=round((max_y - min_y) * main_scale),
+            origin_x=round(min_x * main_scale),
+            origin_y=round(min_y * main_scale),
+        )
+
+    def list_monitors(self) -> list[MonitorInfo]:
+        monitors = self._monitor_infos()
+        if not monitors:
+            raise BackendError(
+                "CGGetActiveDisplayList reported zero active displays; cannot "
+                "select a per-monitor target on this Mac (screen asleep or "
+                "clamshell-closed with no external display?)"
+            )
+        return monitors
+
+    def capture(self, region: tuple[int, int, int, int] | None = None) -> bytes:
+        """Return PNG bytes at native (physical-pixel) resolution.
+
+        Single-display or region-within-one-display path (the common case, and the
+        only one exercised on the real verification machine): `CGDisplayCreateImage`
+        already returns pixels at that display's own physical resolution, so a region
+        is applied with a plain pixel-space crop (`CGImageCreateWithImageInRect`) - no
+        point/pixel conversion needed here, because both the captured image and the
+        region (SCREEN space, physical pixels per the `Backend` protocol) are already
+        in the same unit.
+
+        Whole-virtual-desktop path (`region=None` with more than one active display,
+        i.e. `monitors.VIRTUAL_DESKTOP` mode): falls back to
+        `CGWindowListCreateImage(CGRectInfinite, ...)`, which spans every display but
+        - per Apple's own documented behavior - renders at a resolution keyed off one
+        reference display's scale factor when displays disagree, an approximation for
+        genuinely mixed-DPI setups (not exercised on this backend's single-display
+        verification machine).
+        """
+        ids = self._active_display_ids()
+        if not ids:
+            raise BackendError("no active displays; cannot capture the screen")
+
+        if region is None and len(ids) > 1:
+            cg_image = Quartz.CGWindowListCreateImage(
+                Quartz.CGRectInfinite,
+                Quartz.kCGWindowListOptionOnScreenOnly,
+                Quartz.kCGNullWindowID,
+                Quartz.kCGWindowImageDefault,
+            )
+            if cg_image is None:
+                raise BackendError("CGWindowListCreateImage returned no image")
+            return self._encode_png(cg_image)
+
+        display_id = ids[0] if region is None else None
+        if region is not None:
+            x1, y1, x2, y2 = region
+            m = self._covering_monitor_for_pixel(x1, y1)
+            display_id = int(m.id)
+            local_x, local_y = x1 - m.x, y1 - m.y
+            w, h = max(1, x2 - x1), max(1, y2 - y1)
+        else:
+            local_x = local_y = 0
+            m = next(mi for mi in self._monitor_infos() if int(mi.id) == display_id)
+            w, h = m.width, m.height
+
+        full_image = Quartz.CGDisplayCreateImage(display_id)
+        if full_image is None:
+            raise BackendError(
+                f"CGDisplayCreateImage({display_id}) returned no image "
+                "(display may have gone to sleep or been disconnected)"
+            )
+        if (local_x, local_y, w, h) == (
+            0,
+            0,
+            Quartz.CGImageGetWidth(full_image),
+            Quartz.CGImageGetHeight(full_image),
+        ):
+            cg_image = full_image
+        else:
+            crop_rect = Quartz.CGRectMake(local_x, local_y, w, h)
+            cg_image = Quartz.CGImageCreateWithImageInRect(full_image, crop_rect)
+            if cg_image is None:
+                raise BackendError(f"failed to crop capture to region {region!r}")
+        return self._encode_png(cg_image)
+
+    @staticmethod
+    def _encode_png(cg_image: Any) -> bytes:
+        """Encode a `CGImageRef` to PNG bytes via ImageIO - delegates all pixel-format
+        handling (byte order, alpha channel placement, ...) to Apple's own encoder
+        rather than guessing `CGDisplayCreateImage`'s raw buffer layout, the same
+        "let the platform's own tooling do this" reasoning `bridge.ps1` follows on
+        Windows (`Bitmap.Save` writes real PNG/JPEG files; this backend never parses
+        raw Win32 pixel buffers either)."""
+        from CoreFoundation import (  # type: ignore[import-not-found]
+            CFDataCreateMutable,
+        )
+
+        data = CFDataCreateMutable(None, 0)
+        dest = Quartz.CGImageDestinationCreateWithData(data, "public.png", 1, None)
+        if dest is None:
+            raise BackendError("CGImageDestinationCreateWithData failed")
+        Quartz.CGImageDestinationAddImage(dest, cg_image, None)
+        if not Quartz.CGImageDestinationFinalize(dest):
+            raise BackendError("CGImageDestinationFinalize failed to encode PNG")
+        return bytes(data)
+
+    # -- pointer -------------------------------------------------------------------
+    def cursor_position(self) -> tuple[int, int]:
+        event = Quartz.CGEventCreate(None)
+        loc = Quartz.CGEventGetLocation(event)
+        return self._point_to_pixel(loc.x, loc.y)
+
+    def move(self, x: int, y: int) -> None:
+        self._ensure_input_trusted()
+        point = self._pixel_to_point(x, y)
+        event = Quartz.CGEventCreateMouseEvent(
+            None, Quartz.kCGEventMouseMoved, point, Quartz.kCGMouseButtonLeft
+        )
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+
+    def _mouse_event_types(self, button: str) -> tuple[int, int]:
+        if button == "left":
+            return Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp
+        if button == "right":
+            return Quartz.kCGEventRightMouseDown, Quartz.kCGEventRightMouseUp
+        if button == "middle":
+            return Quartz.kCGEventOtherMouseDown, Quartz.kCGEventOtherMouseUp
+        raise BackendError(f"unsupported button {button!r}")
+
+    def click(
+        self, x: int | None, y: int | None, button: str = "left", count: int = 1
+    ) -> None:
+        self._ensure_input_trusted()
+        btn_const = _BUTTON_CONST.get(button)
+        if btn_const is None:
+            raise BackendError(f"unsupported click button {button!r}")
+        down_type, up_type = self._mouse_event_types(button)
+        if x is not None and y is not None:
+            self.move(x, y)
+            point = self._pixel_to_point(x, y)
+        else:
+            loc = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
+            point = loc
+        import time as _time
+
+        for i in range(1, max(1, count) + 1):
+            down = Quartz.CGEventCreateMouseEvent(None, down_type, point, btn_const)
+            Quartz.CGEventSetIntegerValueField(down, Quartz.kCGMouseEventClickState, i)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+            up = Quartz.CGEventCreateMouseEvent(None, up_type, point, btn_const)
+            Quartz.CGEventSetIntegerValueField(up, Quartz.kCGMouseEventClickState, i)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+            if i < count:
+                _time.sleep(0.05)
+
+    def mouse_down(self, x: int | None, y: int | None, button: str = "left") -> None:
+        self._ensure_input_trusted()
+        btn_const = _BUTTON_CONST.get(button)
+        if btn_const is None:
+            raise BackendError(f"unsupported button {button!r}")
+        down_type, _ = self._mouse_event_types(button)
+        if x is not None and y is not None:
+            self.move(x, y)
+            point = self._pixel_to_point(x, y)
+        else:
+            point = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
+        event = Quartz.CGEventCreateMouseEvent(None, down_type, point, btn_const)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+
+    def mouse_up(self, x: int | None, y: int | None, button: str = "left") -> None:
+        self._ensure_input_trusted()
+        btn_const = _BUTTON_CONST.get(button)
+        if btn_const is None:
+            raise BackendError(f"unsupported button {button!r}")
+        _, up_type = self._mouse_event_types(button)
+        if x is not None and y is not None:
+            self.move(x, y)
+            point = self._pixel_to_point(x, y)
+        else:
+            point = Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
+        event = Quartz.CGEventCreateMouseEvent(None, up_type, point, btn_const)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+
+    def drag(self, start: tuple[int, int] | None, end: tuple[int, int]) -> None:
+        self._ensure_input_trusted()
+        import time as _time
+
+        if start is not None:
+            self.move(*start)
+        self.mouse_down(None, None, "left")
+        _time.sleep(0.05)
+        end_point = self._pixel_to_point(*end)
+        dragged = Quartz.CGEventCreateMouseEvent(
+            None, Quartz.kCGEventLeftMouseDragged, end_point, Quartz.kCGMouseButtonLeft
+        )
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, dragged)
+        _time.sleep(0.05)
+        self.mouse_up(*end, "left")
+
+    def scroll(self, x: int | None, y: int | None, direction: str, amount: int) -> None:
+        self._ensure_input_trusted()
+        if x is not None and y is not None:
+            self.move(x, y)
+        vertical = {"up": 1, "down": -1}.get(direction)
+        horizontal = {"left": -1, "right": 1}.get(direction)
+        if vertical is None and horizontal is None:
+            raise BackendError(f"unsupported scroll direction {direction!r}")
+        wheel1 = vertical * max(1, amount) if vertical is not None else 0
+        wheel2 = horizontal * max(1, amount) if horizontal is not None else 0
+        event = Quartz.CGEventCreateScrollWheelEvent(
+            None, Quartz.kCGScrollEventUnitLine, 2, wheel1, wheel2
+        )
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+
+    # -- keyboard --------------------------------------------------------------
+    def key(self, combo: str) -> None:
+        self._ensure_input_trusted()
+        flags, keycode = _combo_flags_and_keycode(combo)
+        down = Quartz.CGEventCreateKeyboardEvent(None, keycode, True)
+        Quartz.CGEventSetFlags(down, flags)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+        up = Quartz.CGEventCreateKeyboardEvent(None, keycode, False)
+        Quartz.CGEventSetFlags(up, flags)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+
+    def hold_key(self, combo: str, duration: float) -> None:
+        self._ensure_input_trusted()
+        import time as _time
+
+        flags, keycode = _combo_flags_and_keycode(combo)
+        down = Quartz.CGEventCreateKeyboardEvent(None, keycode, True)
+        Quartz.CGEventSetFlags(down, flags)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+        _time.sleep(max(0.0, duration))
+        up = Quartz.CGEventCreateKeyboardEvent(None, keycode, False)
+        Quartz.CGEventSetFlags(up, flags)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+
+    def type_text(self, text: str) -> None:
+        """Type literal Unicode text via `CGEventKeyboardSetUnicodeString`.
+
+        Unlike `key()`/`hold_key()`, this needs no keycode/layout table at all: the
+        Unicode string is attached directly to a keyboard event and WindowServer
+        synthesizes whatever keystrokes are needed, correctly, for any layout -
+        including characters with no key on the current physical keyboard. This is
+        the macOS-native equivalent of `LinuxX11Backend.type_text`'s dynamic scratch-
+        keysym mapping, but built into the platform rather than improvised.
+        """
+        self._ensure_input_trusted()
+        event = Quartz.CGEventCreateKeyboardEvent(None, 0, True)
+        Quartz.CGEventKeyboardSetUnicodeString(event, len(text), text)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+        up = Quartz.CGEventCreateKeyboardEvent(None, 0, False)
+        Quartz.CGEventKeyboardSetUnicodeString(up, len(text), text)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+
+    # -- windows (CGWindowList) ----------------------------------------------------
+    def list_windows(self) -> WindowList:
+        """Enumerate on-screen windows via `CGWindowListCopyWindowInfo`.
+
+        Requires Screen Recording permission for other apps' window *titles* to be
+        populated (macOS 10.15+); confirmed granted for this process (see top-level
+        report). Does NOT require Accessibility - this is a read query, not injection.
+
+        `kCGWindowListOptionOnScreenOnly` returns windows in front-to-back z-order
+        (Apple's documented behavior), so the first normal-layer window in the list
+        is the true foreground window - no separate "active window" lookup needed,
+        unlike the EWMH `_NET_ACTIVE_WINDOW` atom `LinuxX11Backend` reads explicitly.
+        """
+        info_list = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly
+            | Quartz.kCGWindowListExcludeDesktopElements,
+            Quartz.kCGNullWindowID,
+        )
+        if not info_list:
+            raise BackendError(
+                "CGWindowListCopyWindowInfo returned no windows; list_windows is "
+                "unsupported in this session (no windows on screen, or Screen "
+                "Recording permission missing)"
+            )
+        windows: list[WindowInfo] = []
+        foreground: str | None = None
+        for entry in info_list:
+            layer = int(entry.get("kCGWindowLayer", 0))
+            if layer != 0:
+                continue  # menu bar, dock, overlays, ... - not a normal app window
+            wid = entry.get("kCGWindowNumber")
+            if wid is None:
+                continue
+            title = str(
+                entry.get("kCGWindowName") or entry.get("kCGWindowOwnerName") or ""
+            )
+            handle = str(int(wid))
+            if foreground is None:
+                foreground = handle
+            windows.append(WindowInfo(handle, title, minimized=False))
+        return WindowList(windows, foreground)
+
+    def focus_window(self, handle: str) -> None:
+        """Raise and activate window `handle` via `osascript` + System Events.
+
+        See the module docstring for why this shells out rather than bridging the
+        Accessibility API in-process: matching a `CGWindowID` to an `AXUIElement`
+        publicly requires re-deriving (owner pid, title) and searching that process's
+        AX window list by title, which is exactly what System Events' own AppleScript
+        dictionary already does correctly as "window N whose ...". This also shares
+        the same Accessibility TCC gate as direct `CGEventPost` input, gated the same
+        way here.
+        """
+        self._ensure_input_trusted()
+        try:
+            wid = int(handle)
+        except ValueError as exc:
+            raise BackendError(f"invalid window handle {handle!r}") from exc
+
+        info_list = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionAll, Quartz.kCGNullWindowID
+        )
+        match = next(
+            (e for e in (info_list or []) if int(e.get("kCGWindowNumber", -1)) == wid),
+            None,
+        )
+        if match is None:
+            raise BackendError(
+                f"window handle {handle!r} not found (window may have closed)"
+            )
+        pid = int(match.get("kCGWindowOwnerPID", -1))
+        title = str(match.get("kCGWindowName") or "")
+        if pid < 0:
+            raise BackendError(f"window {handle!r} has no owning process")
+
+        script = (
+            f'tell application "System Events"\n'
+            f"  set theProc to first process whose unix id is {pid}\n"
+            f"  set frontmost of theProc to true\n"
+        )
+        if title:
+            escaped = title.replace("\\", "\\\\").replace('"', '\\"')
+            script += (
+                f'  perform action "AXRaise" of '
+                f'(first window of theProc whose name is "{escaped}")\n'
+            )
+        script += "end tell"
+
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=self._osascript_timeout,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise BackendError(
+                f"focus_window failed for pid={pid} title={title!r}: "
+                f"{proc.stderr.strip() or proc.returncode}"
+            )
+
+    # -- clipboard (shells out to pbcopy/pbpaste - see module docstring) ----------
+    def get_clipboard(self) -> str:
+        exe = shutil.which("pbpaste")
+        if not exe:
+            raise BackendError(
+                "pbpaste not found on PATH; required for clipboard access"
+            )
+        proc = subprocess.run(
+            [exe],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise BackendError(
+                f"pbpaste failed: {proc.stderr.strip() or proc.returncode}"
+            )
+        return proc.stdout
+
+    def set_clipboard(self, text: str) -> None:
+        exe = shutil.which("pbcopy")
+        if not exe:
+            raise BackendError(
+                "pbcopy not found on PATH; required for clipboard access"
+            )
+        proc = subprocess.run(
+            [exe],
+            input=text,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise BackendError(
+                f"pbcopy failed: {proc.stderr.strip() or proc.returncode}"
+            )
+
+    def close(self) -> None:
+        """No persistent resources held: every Core Graphics/AX call above is a
+        stateless, connectionless system call - there is nothing to release, the
+        same shape as `WindowsBackend.close()` (each action is its own round trip)
+        rather than `LinuxX11Backend.close()` (a persistent Xlib socket)."""

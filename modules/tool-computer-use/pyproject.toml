@@ -8,6 +8,7 @@ license = { text = "MIT" }
 dependencies = [
     "pillow>=10.0",
     "python-xlib>=0.33; sys_platform == 'linux'",
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
 ]
 
 [project.entry-points."amplifier.modules"]
