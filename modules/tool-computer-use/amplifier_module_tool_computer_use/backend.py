@@ -206,8 +206,20 @@ class Backend(Protocol):
         """Hold a key combo down for `duration` seconds, then release it."""
         ...
 
-    def type_text(self, text: str) -> None:
-        """Type literal text, one character at a time."""
+    def type_text(self, text: str, guard: Any = None) -> None:
+        """Type literal text, one character at a time.
+
+        `guard` is optional coexistence infrastructure
+        (`coexistence_guard.CoexistenceGuard`, see that module and
+        `docs/designs/coexistence.md` \u00a75.2/\u00a78.6) - a backend that supports
+        per-keystroke intra-operation presence/pause/target-binding checks
+        accepts it and calls `guard.before_event()`/`guard.after_event()`
+        around each character (see `linux_x11.LinuxX11Backend.type_text`).
+        A backend with no proven per-platform `GUARD` band (\u00a75.5) may accept
+        and ignore it - the caller only ever passes a non-`None` guard when
+        `presence.GUARD_MEASURED` (or an explicit override) supports it for
+        this platform.
+        """
         ...
 
     def list_windows(self) -> WindowList: ...

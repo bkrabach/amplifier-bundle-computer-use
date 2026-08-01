@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import time
@@ -36,9 +37,12 @@ from typing import Any
 from amplifier_core.models import ToolResult
 
 from .backend import Backend, BackendError, MonitorInfo
+from .coexistence_guard import CoexistenceGuard
 from .geometry import Display, compute_display
 from .imaging import capture_scaled_b64
+from .ledger import HeldInputLedger
 from .monitors import PRIMARY, VIRTUAL_DESKTOP, select_monitor
+from .presence import GUARD_MS, PresenceMonitor
 from .registry import NoBackendAvailable, select_backend
 from .tool_versions import (
     beta_header_for,
@@ -194,6 +198,25 @@ class ComputerTool:
         # D2: resolved once (by mount(), right after backend selection) and cached -
         # never touched on the request hot path. See `resolve_display`.
         self._display: Display | None = None
+
+        # -- human/agent coexistence (docs/designs/coexistence.md) -----------
+        # Built by `mount()` (`_build_coexistence_guard`), never constructed
+        # here directly - it needs the concrete backend instance, which does
+        # not exist yet at `__init__` time (`ComputerTool.__init__` receives
+        # an already-constructed `backend`, so in practice this only matters
+        # for readability: the guard is assigned right after construction).
+        # `None` on any platform where a proven per-platform GUARD band does
+        # not (yet) exist - see `presence.GUARD_MEASURED` - so this feature
+        # never claims detection it cannot back with evidence.
+        self._coexistence_guard: CoexistenceGuard | None = None
+        # Cached once so the hot path (`_run`, the `type` action) never pays
+        # an `inspect.signature` call per keystroke - only backends that
+        # accept `type_text(text, guard=...)` (Linux X11 today) get
+        # per-keystroke intra-op detection; others fall back to plain
+        # `type_text(text)`, unaffected.
+        self._backend_type_text_supports_guard: bool = (
+            "guard" in inspect.signature(backend.type_text).parameters
+        )
 
     # -- display resolution (D2) -------------------------------------------------
     def resolve_display(self, refresh: bool = False) -> Display:
@@ -659,7 +682,22 @@ class ComputerTool:
             if not text:
                 raise ValueError("action 'type' requires 'text'")
             body = str(text)
-            backend.type_text(body)
+            guard = self._coexistence_guard
+            if guard is not None and self._backend_type_text_supports_guard:
+                # \u00a75.2/\u00a78.6: bind the delivery target once at operation
+                # start; `backend.type_text` re-checks it (via the guard)
+                # before EVERY keystroke, and records a fresh injection
+                # timestamp after each one - this is what lets a human
+                # keystroke landing mid-`type_text` be detected (O5), not
+                # just between whole operations.
+                guard.check_start_permission()
+                guard.bind_target()
+                try:
+                    backend.type_text(body, guard=guard)
+                finally:
+                    guard.release_target()
+            else:
+                backend.type_text(body)
             return f"typed {len(body)} characters", None
 
         if action == "wait":
@@ -890,6 +928,65 @@ class DesktopTool:
             )
 
 
+def _build_coexistence_guard(
+    backend: Backend, cfg: dict[str, Any]
+) -> CoexistenceGuard | None:
+    """Build the `CoexistenceGuard` for `backend`, or `None` if this backend
+    has no proven presence-detector wiring yet (`docs/designs/coexistence.md`).
+
+    Deliberately conservative: a guard is only ever constructed for a backend
+    that exposes `presence_idle_ms()` (today: `LinuxX11Backend` only - see
+    that method's docstring). A backend with no such method gets no
+    coexistence layer at all, rather than one built on a guessed/unmeasured
+    `GUARD` band - the same "do not claim a guarantee you do not have"
+    principle \u00a75.5 applies to Windows `type_text`.
+
+    `cfg["coexistence"]` (all keys optional):
+      - `enabled` (default `True` when the backend supports it): set `False`
+        to opt out of building the layer entirely for this session. This is
+        NOT the \u00a76.0 halt-invariant opt-out - once a guard exists, nothing
+        in its config can disable the halt (see `coexistence_guard.py`
+        module docstring). This key only controls whether one exists.
+      - `drive_anyway` (default `False`, \u00a77.6/D5): permits *beginning* to
+        drive when a human is already detected present at guard-construction
+        time. Logged when it fires. Never affects the halt invariant.
+    """
+    coexistence_cfg = dict(cfg.get("coexistence") or {})
+    idle_source = getattr(backend, "presence_idle_ms", None)
+    if idle_source is None:
+        return None
+    if not bool(coexistence_cfg.get("enabled", True)):
+        logger.info(
+            "coexistence: disabled by config for backend %r - no presence "
+            "detector, halt invariant, or target binding this session",
+            backend.name,
+        )
+        return None
+    if backend.name not in GUARD_MS:
+        logger.warning(
+            "coexistence: backend %r exposes presence_idle_ms() but has no "
+            "GUARD_MS entry; not building a guard",
+            backend.name,
+        )
+        return None
+    presence = PresenceMonitor(idle_source=idle_source, platform=backend.name)
+    ledger = HeldInputLedger()
+    target_source = getattr(backend, "current_target", None)
+    guard = CoexistenceGuard(
+        presence=presence,
+        release_all=lambda reason: ledger.release_all(reason=reason),
+        drive_anyway=bool(coexistence_cfg.get("drive_anyway", False)),
+        target_source=target_source,
+    )
+    logger.info(
+        "coexistence: guard built for backend %r (guard_ms=%.1f, measured=%s)",
+        backend.name,
+        presence.guard_ms,
+        presence.guard_measured,
+    )
+    return guard
+
+
 async def mount(
     coordinator: Any, config: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -937,6 +1034,11 @@ async def mount(
     # D2: resolve display once, here, before the tool ever answers a provider
     # request - not lazily on the first `native_tool_spec` read.
     computer.resolve_display()
+    # Human/agent coexistence (docs/designs/coexistence.md) - only built for
+    # backends with a proven presence-detector wiring (see
+    # `_build_coexistence_guard`). `None` on every other backend, unchanged
+    # from before this feature existed.
+    computer._coexistence_guard = _build_coexistence_guard(backend, cfg)
 
     await coordinator.mount("tools", computer, name=computer.name)
     desktop = DesktopTool(computer)

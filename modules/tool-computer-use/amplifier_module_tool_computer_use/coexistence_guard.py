@@ -1,0 +1,235 @@
+"""The single guard - `docs/designs/coexistence.md` \u00a78.6's combined check,
+composing presence detection, the halt invariant, pause, target binding, and
+geometric exclusion into the one call site every elementary injected event
+passes through:
+
+    before each elementary event:
+        if halted or paused:                 -> stop, release_all, report
+        if coords in any excluded rect:       -> refuse, report
+        if current_target != bound_target:    -> stop, release_all, report
+        else emit
+    [event emitted by the caller]
+    after each elementary event:
+        record our own injection timestamp
+        sample presence -> latch human_active if detected
+
+THE HALT INVARIANT (\u00a76.0) - the load-bearing property of this whole module
+---------------------------------------------------------------------------
+> A detected human halts writes before the next one - every platform, every
+> mode, and no configuration key disables it.
+
+`CoexistenceGuard.__init__` takes exactly one policy knob relevant to
+"whether to keep going": `drive_anyway` (\u00a77.6/D5), and it governs ONLY
+`check_start_permission()` - whether *this session may begin driving at all*
+when a human is already detected at construction time. It has no effect on
+`before_event()`'s halt check. There is no parameter, config key, or method on
+this class that disables `before_event()` raising `HaltedError` once
+`_halted` is set - `test_halt_invariant.py` verifies this by construction
+(inspecting `__init__`'s signature) and functionally (setting `drive_anyway`,
+detecting a human mid-session, and confirming the very next `before_event()`
+still raises).
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+from .exclusion import ExclusionZone
+from .pause import DragState, PauseController, PausedError
+from .presence import PresenceMonitor, PresenceSnapshot, PresenceState
+from .target_binding import TargetBinding, TargetChangedError
+
+logger = logging.getLogger(__name__)
+
+#: Sentinel distinguishing "caller passed no current_target" (read fresh from
+#: `target_source`) from "caller explicitly passed `current_target=None`"
+#: (platform genuinely cannot determine a target - use that, don't re-read).
+_UNSET = object()
+
+
+class HaltedError(RuntimeError):
+    """Raised by `before_event()` once a human has been detected (\u00a76.0).
+
+    Unconditional: no config key, constructor argument, or opt-out reaches
+    this raise. The only way past it is a human clearing the halt through the
+    one channel that requires nothing of the controller at all - restarting a
+    fresh driving session after they choose to (\u00a713, D3: resume is manual
+    when a console user is present).
+    """
+
+    def __init__(self, snapshot: PresenceSnapshot) -> None:
+        self.snapshot = snapshot
+        super().__init__(
+            "halted: a human at this machine produced input "
+            f"{snapshot.last_human_input_ago_ms:.1f}ms ago that this agent did "
+            f"not generate (margin={snapshot.margin_ms}, "
+            f"guard={snapshot.guard_ms}ms). Halting before the next write."
+        )
+
+
+class ExcludedCoordinateError(RuntimeError):
+    """The requested coordinate falls inside a registered exclusion rect
+    (e.g. the overlay's own Pause/Cancel buttons, \u00a77.5) - refused, not
+    forwarded to the backend."""
+
+    def __init__(self, name: str, x: int, y: int) -> None:
+        self.name = name
+        self.x = x
+        self.y = y
+        super().__init__(
+            f"refused: coordinate ({x}, {y}) falls inside excluded rect "
+            f"{name!r} - the agent cannot target its own overlay controls"
+        )
+
+
+@dataclass
+class CoexistenceGuard:
+    """One guard object per driving session, threaded through every
+    elementary injected event.
+
+    `presence` is the `PresenceMonitor` for this platform (constructed by the
+    caller with the correct `idle_source`/`platform`, \u00a75). `release_all` is
+    called (with `reason=`) whenever the guard aborts an in-flight operation
+    for any reason that requires releasing held input - halt, pause, or a
+    target change - matching \u00a76.0/\u00a78.4's "held inputs released immediately,
+    via the existing ledger."
+    """
+
+    presence: PresenceMonitor
+    release_all: Callable[[str], list[str]]
+    drive_anyway: bool = False
+    #: Optional callable returning the current delivery target id (e.g. the
+    #: foreground window handle), or `None` if the platform cannot determine
+    #: one right now. Reading this is the caller's only target-binding
+    #: responsibility - `bind_target()`/`before_event()` do the rest, so a
+    #: `type_text` implementation does not need to know target binding exists
+    #: at all (\u00a78.6).
+    target_source: Callable[[], str | None] | None = None
+    pause: PauseController = field(default_factory=PauseController)
+    exclusion: ExclusionZone = field(default_factory=ExclusionZone)
+    binding: TargetBinding = field(default_factory=TargetBinding)
+    drag: DragState = field(default_factory=DragState)
+    _halted: bool = field(default=False, init=False)
+    _halt_snapshot: PresenceSnapshot | None = field(default=None, init=False)
+
+    # -- target binding convenience (\u00a78.6) -----------------------------------
+    def bind_target(self) -> None:
+        """Bind to the current target at the start of a multi-event
+        operation, via `target_source` (or unbound/unverified if no
+        `target_source` was supplied - `TargetBinding.check()` is then a
+        no-op, matching \u00a78.6's "where binding cannot be enforced, it must
+        be declared" rather than silently pretending to enforce it)."""
+        if self.target_source is not None:
+            self.binding.bind(self.target_source())
+
+    def release_target(self) -> None:
+        self.binding.release()
+
+    # -- start permission (D5, \u00a77.6) - governs BEGINNING to drive only ------
+    def check_start_permission(self) -> None:
+        """Call once, before the first write of a session. Raises
+        `HaltedError` if a human is already detected AND `drive_anyway` is
+        False. This is the ONLY method `drive_anyway` affects - it never
+        reaches `before_event()`'s halt check (\u00a76.0 is unconditional)."""
+        if self.presence.state is PresenceState.HUMAN_ACTIVE and not self.drive_anyway:
+            assert self.presence.last_snapshot is not None
+            raise HaltedError(self.presence.last_snapshot)
+        if self.presence.state is PresenceState.HUMAN_ACTIVE and self.drive_anyway:
+            logger.warning(
+                "coexistence: drive_anyway=True - beginning to drive with a "
+                "human detected present (logged per \u00a77.6, not silent)"
+            )
+
+    # -- the combined per-event guard (\u00a78.6's pseudocode, verbatim) ---------
+    def before_event(
+        self,
+        *,
+        coord: tuple[int, int] | None = None,
+        current_target: str | None | object = _UNSET,
+        progress: str = "",
+    ) -> None:
+        """Call before every elementary injected event (keystroke, click,
+        motion sample). Raises (never silently skips) on any of: halted,
+        paused, an excluded coordinate, or a target change. On halt/pause/
+        target-change, `release_all()` has already been called by the time
+        this raises.
+
+        `current_target` is normally left unset - it is then read fresh from
+        `target_source` (\u00a78.6: "re-reads the current target" before every
+        elementary event), so a caller looping over keystrokes never needs to
+        know target binding exists. Pass it explicitly only when the caller
+        already has a fresher/cheaper read than another `target_source()`
+        call would provide.
+
+        Presence is sampled HERE, not in `after_event()` (\u00a75.2: "the detector
+        samples once in every inter-injection interval"). Concretely: this
+        sample compares idle against the injection timestamp recorded by the
+        PREVIOUS `after_event()` call - the gap between them is exactly the
+        window a human keystroke could land in undetected otherwise.
+        Sampling and recording the injection back-to-back in the same call
+        (no elapsed time between them) would make every margin read
+        approximately zero and detect nothing - this ordering is load-bearing,
+        not stylistic.
+
+        \u00a79.6: idle-unreadable is a hard error for any mode that depends on
+        it - `presence.sample()` raises `IdleUnreadableError` rather than
+        guessing, and this method does not catch it: an existing halt is
+        never cleared just because a later sample "couldn't tell".
+        """
+        snap = self.presence.sample()
+        if snap.state is PresenceState.HUMAN_ACTIVE:
+            self._halted = True
+            self._halt_snapshot = snap
+        if self._halted:
+            assert self._halt_snapshot is not None
+            self.release_all("halted")
+            raise HaltedError(self._halt_snapshot)
+        try:
+            self.pause.check(progress=progress)
+        except PausedError:
+            self.release_all("paused")
+            raise
+        if coord is not None:
+            excluded = self.exclusion.contains(coord[0], coord[1])
+            if excluded is not None:
+                raise ExcludedCoordinateError(excluded, coord[0], coord[1])
+        resolved_target = (
+            self.target_source()
+            if current_target is _UNSET and self.target_source is not None
+            else (None if current_target is _UNSET else current_target)
+        )
+        try:
+            self.binding.check(resolved_target)  # type: ignore[arg-type]
+        except TargetChangedError:
+            self.release_all("target_changed")
+            raise
+
+    def after_event(self) -> None:
+        """Call immediately after every elementary injected event (right
+        around the injection syscall, \u00a75.2): record our own injection
+        timestamp. This is what the NEXT `before_event()` call's presence
+        sample compares against - the two are deliberately split across two
+        methods, with the caller's actual injection happening in between,
+        so a real elapsed gap exists for a human event to land in.
+        """
+        self.presence.record_inject()
+
+    @property
+    def halted(self) -> bool:
+        return self._halted
+
+    def as_dict(self) -> dict[str, Any]:
+        """The `presence` block for a tool result envelope (\u00a75.3), plus the
+        guard-level facts (\u00a710.3) that ride alongside it."""
+        snap = self.presence.last_snapshot
+        out: dict[str, Any] = {
+            "halted": self._halted,
+            "paused": self.pause.is_paused,
+            "target_binding": self.binding.status,
+        }
+        if snap is not None:
+            out["presence"] = snap.to_dict()
+        return out
