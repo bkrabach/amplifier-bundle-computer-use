@@ -1,7 +1,8 @@
 # amplifier-bundle-computer-use
 
-Give an Amplifier session real control of a **Windows desktop from WSL2**, using
-**Claude's native computer-use tool** — not a homegrown imitation of it.
+Give an Amplifier session real control of a **desktop** — Windows, macOS, or Linux,
+on this machine or another one across your private network — using the LLM provider's
+**native computer-use tool**, not a homegrown imitation of it.
 
 If a human could do it by looking at the screen and clicking, this can do it. No API, no
 CLI, no browser extension required.
@@ -163,3 +164,16 @@ Asserts the real bytes: native tool type present, no `parameters` key on the wir
 header set, screenshot markers expanded to image blocks that survive `model_dump()`
 without an API-rejected `visibility` key, recency window enforced, and graceful
 degradation when a screenshot file is gone.
+
+---
+
+## Credits
+
+Originally created by [@ckrabach617](https://github.com/ckrabach617) as a
+Windows-from-WSL2 bundle. That original work is preserved in this repository's
+git history and its copyright is retained in `LICENSE`.
+
+This fork extends it to a platform-backend architecture (Windows, macOS, Linux
+X11), per-monitor targeting, and remote operation over a private network. See
+`BACKLOG.md` for what is known and not yet done, and `docs/designs/` for the
+design record.
