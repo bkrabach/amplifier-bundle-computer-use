@@ -11,6 +11,7 @@ machine, `select_backend` raises `NoBackendAvailable` with every attempt's reaso
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from .backend import Backend
@@ -34,6 +35,26 @@ class NoBackendAvailable(RuntimeError):
         super().__init__(message)
 
 
+#: `ssh://user@host` (or `ssh://host` - user optional, taken from the local
+#: SSH config/default in that case).
+_SSH_TARGET_RE = re.compile(r"^ssh://(?:(?P<user>[^@]+)@)?(?P<host>[^/]+)$")
+
+
+def _parse_target(target: str) -> str:
+    """Return the `[user@]host` string `ssh` itself expects, or raise
+    `ValueError` for anything that isn't a well-formed `ssh://` target - a
+    malformed config value should fail loud with a clear parse error, not
+    silently be handed to `ssh` as a garbage argument."""
+    match = _SSH_TARGET_RE.match(target.strip())
+    if not match:
+        raise ValueError(
+            f"config.target={target!r} is not a valid ssh:// target "
+            "(expected 'ssh://user@host' or 'ssh://host')"
+        )
+    user, host = match.group("user"), match.group("host")
+    return f"{user}@{host}" if user else host
+
+
 #: Probe order. Windows-over-WSL2 first preserves today's default behavior; Linux X11
 #: is only tried if the Windows bridge is not reachable (e.g. a bare Linux box with no
 #: `powershell.exe`, such as this bundle's original test box). macOS is only tried if
@@ -48,15 +69,65 @@ BACKEND_FACTORIES: tuple[type[Backend], ...] = (
 )
 
 
+def _build_ssh_transport(host: str, package_dir: Any, config: dict[str, Any]) -> Any:
+    """Construct the `SshTransport` for a remote target from mount config.
+
+    Kept separate from `select_backend` so tests can monkeypatch this one
+    function to inject a fake transport without touching real SSH at all.
+    """
+    from .ssh_transport import SshTransport
+
+    return SshTransport(
+        host,
+        package_dir=package_dir,
+        deadman_seconds=float(config.get("deadman_seconds", 5.0)),
+        read_only=bool(config.get("read_only", True)),
+        with_pillow=bool(config.get("with_pillow", True)),
+    )
+
+
 def select_backend(
     config: dict[str, Any], factories: tuple[type[Backend], ...] = BACKEND_FACTORIES
 ) -> Backend:
     """Probe each candidate backend in order; return the first that is available.
 
-    Raises `NoBackendAvailable` if none can serve this machine. A backend whose
-    `probe()` itself raises is treated as unavailable, not as a fatal error - probing
-    must never be able to take down mount().
+    C3: `config["target"]` absent -> exactly today's behavior, unchanged
+    (probe local backends in order, `NoBackendAvailable` degrades to a silent
+    skip in `mount()`). `config["target"]` present (`ssh://user@host`) ->
+    `RemoteBackend` is the ONLY candidate - no probe-fallthrough to a local
+    backend. An unreachable explicit target raises `RemoteTargetUnavailable`,
+    which `mount()` does NOT catch (unlike `NoBackendAvailable`): the agent
+    must never silently fall back to driving the controller's own local
+    desktop when a specific remote machine was asked for and could not be
+    reached (\u00a79 / acceptance item 7).
     """
+    target = config.get("target")
+    if target:
+        # Import here, not at module top: remote_backend.py pulls in
+        # ssh_transport.py (subprocess/tarfile) which local-only callers
+        # (including remote_agent.py itself, which never uses `target`)
+        # have no reason to load.
+        from pathlib import Path
+
+        from .remote_backend import RemoteBackend
+
+        host = _parse_target(str(target))
+        package_dir = Path(__file__).parent
+        backend = RemoteBackend(
+            {
+                "_host": host,
+                "_transport": _build_ssh_transport(host, package_dir, config),
+            }
+        )
+        backend.connect(
+            required_permissions=tuple(config.get("required_permissions") or ()),
+            connect_timeout=float(config.get("connect_timeout", 30.0)),
+        )
+        logger.info(
+            "computer-use: selected remote backend %r (target=%r)", backend.name, target
+        )
+        return backend
+
     attempts: list[tuple[str, str]] = []
     for factory in factories:
         backend = factory(config)  # construction is cheap; probing is the real check

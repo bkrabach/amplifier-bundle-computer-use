@@ -24,6 +24,7 @@ reads a plain in-memory value and can never block.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -39,6 +40,11 @@ from .geometry import Display, compute_display
 from .imaging import capture_scaled_b64
 from .monitors import PRIMARY, VIRTUAL_DESKTOP, select_monitor
 from .registry import NoBackendAvailable, select_backend
+from .tool_versions import (
+    beta_header_for,
+    require_static_pairing,
+    resolve_tool_version,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -116,12 +122,59 @@ class ComputerTool:
 
     def __init__(self, backend: Backend, config: dict[str, Any] | None = None) -> None:
         cfg = config or {}
-        self._read_only = bool(cfg.get("read_only", False))
         self._backend = backend
         self._max_edge = int(cfg.get("max_edge", 1280))
         self._max_pixels = int(cfg.get("max_pixels", 1_150_000))
-        self._tool_version = str(cfg.get("tool_version", "computer_20251124"))
         self._enable_zoom = bool(cfg.get("enable_zoom", True))
+
+        # -- model <-> tool_version coupling fix -----------------------------
+        # `_configured_tool_version`/`_model_hint` are the raw config values;
+        # `_tool_version` is the live, resolved value `native_tool_spec` reads.
+        # Resolved once here (may raise ToolVersionError - see tool_versions.py
+        # module docstring for why mount time is allowed to fail loud) and then
+        # kept current by `note_model()`, called by hook-computer-use on every
+        # `provider:request` with the model actually about to be used.
+        self._configured_tool_version: str | None = cfg.get("tool_version")
+        self._model_hint: str | None = cfg.get("model")
+        self._tool_version: str = require_static_pairing(
+            self._model_hint, self._configured_tool_version
+        )
+
+        # -- remote-target safety posture ------------------------------------
+        # `is_remote` is a plain attribute (not an isinstance/import check) so
+        # any Backend can opt in without this module depending on
+        # RemoteBackend's concrete type - only RemoteBackend sets it True
+        # today (see remote_backend.py).
+        self._is_remote = bool(getattr(backend, "is_remote", False))
+        read_only_cfg = cfg.get("read_only")
+        if read_only_cfg is None:
+            # Unconfigured default: ON for remote (a machine you are, by
+            # definition, not looking at - see docs/designs/remote-transport.md
+            # \u00a714), unchanged (OFF) for local - preserves every existing
+            # local-mode caller's behavior exactly.
+            self._read_only = self._is_remote
+        else:
+            self._read_only = bool(read_only_cfg)
+        gate_cfg = cfg.get("gate_writes")
+        if gate_cfg is None:
+            # "Destructive" is undecidable from a click (Delete looks like any
+            # other click) - the only two honest options are gate-every-write
+            # or gate-none (\u00a710.4). Default is gate-every-write, but only
+            # matters when read_only is off (read_only already blocks every
+            # write outright) and only for remote targets - local behavior is
+            # unaffected. Flipping read_only off on a remote target therefore
+            # can never silently produce "full write access + no gate": the
+            # gate turns on in the same step, unless explicitly disabled below.
+            self._gate_writes = self._is_remote and not self._read_only
+        else:
+            self._gate_writes = bool(gate_cfg)
+            if self._is_remote and not self._gate_writes and not self._read_only:
+                logger.warning(
+                    "computer-use: gate_writes explicitly disabled for a remote, "
+                    "non-read_only target - every write action will execute with "
+                    "no confirmation gate. This is a deliberate, logged opt-out, "
+                    "not a default."
+                )
         # Per-monitor targeting (see monitors.py): default is "primary", i.e. one
         # real monitor, not the virtual-desktop bounding box around all of them.
         # Set to monitors.VIRTUAL_DESKTOP to opt into the old whole-desktop
@@ -403,11 +456,30 @@ class ComputerTool:
 
     @property
     def native_beta_header(self) -> str:
-        return {
-            "computer_20251124": "computer-use-2025-11-24",
-            "computer_20250124": "computer-use-2025-01-24",
-            "computer_20241022": "computer-use-2024-10-22",
-        }.get(self._tool_version, "computer-use-2025-11-24")
+        return beta_header_for(self._tool_version)
+
+    def note_model(self, model: str | None) -> None:
+        """Re-resolve `tool_version` for the model about to receive THIS request.
+
+        Called by hook-computer-use on every `provider:request`, before it reads
+        `native_tool_spec`/`native_beta_header` - see `tool_versions.py` module
+        docstring. Never raises: a mid-session exception here would take down
+        the whole request, the exact class of bug D3 already fixed once for
+        `native_tool_spec` itself.
+        """
+        resolved, corrected = resolve_tool_version(
+            model, self._configured_tool_version, previous=self._tool_version
+        )
+        if corrected:
+            logger.warning(
+                "computer-use: model %r requires tool_version %r; correcting "
+                "from %r to avoid the API rejecting every request with this "
+                "pairing (see tool_versions.py)",
+                model,
+                resolved,
+                self._tool_version,
+            )
+        self._tool_version = resolved
 
     # -- execution --------------------------------------------------------------
     def _run(self, action: str, params: dict[str, Any]) -> tuple[str, str | None]:
@@ -615,7 +687,14 @@ class ComputerTool:
             )
 
         try:
-            summary, image_b64 = self._run(action, input)
+            # C4: `Backend` stays synchronous (local paths and all existing tests
+            # untouched), but a remote action can block on a network round trip
+            # for hundreds of milliseconds. Running it in a thread keeps the
+            # event loop live so cancellation can actually be serviced during
+            # that wait, instead of stalling behind a screenshot transfer.
+            # Cheap locally too - `asyncio.to_thread` on a microsecond-scale
+            # X11/Quartz call costs a thread-pool round trip, not a network one.
+            summary, image_b64 = await asyncio.to_thread(self._run, action, input)
         except (BackendError, ValueError) as exc:
             return ToolResult(
                 success=False, error={"message": str(exc), "type": type(exc).__name__}
@@ -669,6 +748,12 @@ DESKTOP_ACTIONS = [
 #: accordingly - this is a deliberate behavior change from the original ungated
 #: `get_clipboard`, not an oversight.
 _READ_ONLY_BLOCKED = {"focus_window", "set_clipboard", "get_clipboard"}
+
+#: Desktop actions that change target state - gated by `gate_writes` the same
+#: way `MUTATING` gates `computer` actions (see `ComputerTool.__init__`).
+#: `get_clipboard` is a read (already covered by `_READ_ONLY_BLOCKED` above for
+#: its exfiltration risk, not because it changes anything).
+MUTATING_DESKTOP = {"focus_window", "set_clipboard"}
 
 
 class DesktopTool:
@@ -741,13 +826,19 @@ class DesktopTool:
             )
         backend = self._computer._backend
         try:
+            # C4, same reasoning as ComputerTool.execute: keep the sync Backend
+            # protocol, move the (possibly-remote) blocking call off the event
+            # loop at this boundary instead.
             if action == "get_clipboard":
-                return ToolResult(success=True, output=backend.get_clipboard())
+                output = await asyncio.to_thread(backend.get_clipboard)
+                return ToolResult(success=True, output=output)
             if action == "set_clipboard":
-                backend.set_clipboard(str(input.get("text") or ""))
+                await asyncio.to_thread(
+                    backend.set_clipboard, str(input.get("text") or "")
+                )
                 return ToolResult(success=True, output="clipboard set")
             if action == "list_monitors":
-                monitors = self._computer.list_monitors()
+                monitors = await asyncio.to_thread(self._computer.list_monitors)
                 current = self._computer.current_monitor
                 lines = [
                     f"  [{m.id}] {m.width}x{m.height} at ({m.x},{m.y})"
@@ -764,7 +855,7 @@ class DesktopTool:
                 target = str(input.get("monitor") or "").strip()
                 if not target:
                     raise ValueError("action 'select_monitor' requires 'monitor'")
-                disp = self._computer.select_monitor(target)
+                disp = await asyncio.to_thread(self._computer.select_monitor, target)
                 return ToolResult(
                     success=True,
                     output=(
@@ -774,7 +865,19 @@ class DesktopTool:
                         f"{disp.model_width}x{disp.model_height}"
                     ),
                 )
-            summary, _ = self._computer._run(action, input)
+            if self._computer._gate_writes and action in MUTATING_DESKTOP:
+                return ToolResult(
+                    success=False,
+                    error={
+                        "message": (
+                            f"action {action!r} requires confirmation "
+                            "(gate_writes) but no gate hook is registered to "
+                            "grant it - see docs/designs/remote-transport.md "
+                            "\u00a710.4"
+                        )
+                    },
+                )
+            summary, _ = await asyncio.to_thread(self._computer._run, action, input)
             return ToolResult(success=True, output=summary)
         except (BackendError, ValueError) as exc:
             return ToolResult(

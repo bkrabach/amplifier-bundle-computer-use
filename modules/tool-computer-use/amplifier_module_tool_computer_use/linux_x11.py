@@ -31,10 +31,34 @@ import time
 from pathlib import Path
 from typing import Any
 
-from Xlib import XK, X
-from Xlib import display as xlib_display
-from Xlib.ext import xtest
-from Xlib.protocol import event as xevent
+# python-xlib is a Linux-only dependency (see pyproject.toml's
+# `sys_platform == 'linux'` marker) - not installed on macOS/Windows, and now
+# also not installed on a remote-transport target that only provisioned
+# Pillow via `uv run --with pillow` (see ssh_transport.py). Importing it
+# unconditionally at module level would crash `registry.py`'s
+# `from .linux_x11 import LinuxX11Backend` on every non-Linux machine -
+# exactly the trap this bundle's `macos.py` already guards against for
+# pyobjc-framework-Quartz (see that module's own `_IMPORT_ERROR` handling and
+# `backend.py`'s D1 docstring: a backend that cannot possibly work must never
+# take down `mount()`, starting at *import*, not just at `probe()`).
+_IMPORT_ERROR: str | None = None
+try:
+    from Xlib import XK as _XK
+    from Xlib import X as _X
+    from Xlib import display as _xlib_display
+    from Xlib.ext import xtest as _xtest
+    from Xlib.protocol import event as _xevent
+except Exception as exc:  # noqa: BLE001 - any import failure -> unavailable, not fatal
+    _XK = _X = _xlib_display = _xtest = _xevent = None  # type: ignore[assignment]
+    _IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+#: Typed `Any` (not the real Xlib module types) so every reference below
+#: type-checks cleanly - the real, load-bearing `None` guard is `probe()`,
+#: which refuses to make this backend available at all when the import failed.
+XK: Any = _XK
+X: Any = _X
+xlib_display: Any = _xlib_display
+xtest: Any = _xtest
+xevent: Any = _xevent
 
 from .backend import (
     BackendError,
