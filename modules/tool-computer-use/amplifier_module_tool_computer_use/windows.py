@@ -40,18 +40,6 @@ _CLICK_ACTIONS = {
 }
 
 
-def _which_powershell(configured: str | None) -> str | None:
-    if configured:
-        return configured
-    found = shutil.which("powershell.exe")
-    if found:
-        return found
-    fallback = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
-    if Path(fallback).exists():
-        return fallback
-    return None
-
-
 def _translate(path: str, flag: str) -> str:
     proc = subprocess.run(
         ["wslpath", flag, str(path)],
@@ -65,6 +53,87 @@ def _translate(path: str, flag: str) -> str:
     if proc.returncode != 0:
         raise BackendError(f"wslpath {flag} failed for {path!r}: {proc.stderr.strip()}")
     return proc.stdout.strip()
+
+
+def _windows_mount_root() -> str | None:
+    r"""Ask `wslpath` for WSL's actual automount root, instead of assuming `/mnt/c`.
+
+    WSL's automount root is configurable (`/etc/wsl.conf`, `[automount] root = ...`),
+    so `/mnt/c` is a default, not a guarantee. `wslpath` already knows the real
+    answer - it is the same interop machinery that resolves the setting - so ask it
+    directly rather than re-implementing wsl.conf parsing: converting the Windows
+    path `C:\` back to a WSL path returns exactly the current mount root for the
+    `C:` drive on this host.
+
+    Returns `None` (never raises) if `wslpath` is missing or fails; callers treat
+    that as "this candidate is unavailable" and fall through to the next one.
+    """
+    try:
+        root = _translate("C:\\", "-u")
+    except (BackendError, OSError):
+        return None
+    return root.rstrip("/") if root else None
+
+
+def _which_powershell(configured: str | None) -> tuple[str | None, list[str]]:
+    """Resolve the `powershell.exe` to invoke, without depending on PATH.
+
+    Returns `(path, attempts)`: `path` is `None` if nothing usable was found, and
+    `attempts` names every candidate that was tried and why it was rejected - so a
+    caller can fail loudly with a diagnostic instead of silently mounting a backend
+    that cannot work.
+
+    `shutil.which` alone is not sufficient here: interactive WSL shells put the
+    Windows interop directories on `PATH`, but non-login/non-interactive shells -
+    exactly what remote agents, services, and `ssh host -- command` invocations use -
+    typically do not (verified directly: `ssh <host> -- command -v powershell.exe`
+    fails on a real WSL2 host where the full path works fine). The path-derivation
+    fallback below is therefore load-bearing, not a nicety.
+
+    It must not hardcode `/mnt/c`, though: WSL's automount root is configurable
+    (see `_windows_mount_root`). The derived root is tried first; the conventional
+    `/mnt/c` path is kept as a last-resort candidate only for hosts where `wslpath`
+    itself is unavailable but the default mount happens to be correct anyway.
+    """
+    attempts: list[str] = []
+
+    if configured:
+        if Path(configured).exists() or shutil.which(configured):
+            return configured, attempts
+        attempts.append(
+            f"configured powershell_path {configured!r} is not an existing file "
+            "and is not resolvable on PATH"
+        )
+        return None, attempts
+
+    found = shutil.which("powershell.exe")
+    if found:
+        return found, attempts
+    attempts.append("powershell.exe not found via PATH (shutil.which)")
+
+    candidates: list[str] = []
+    root = _windows_mount_root()
+    if root:
+        candidates.append(
+            f"{root}/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+        )
+    else:
+        attempts.append("could not derive the Windows mount root via `wslpath -u C:\\`")
+    # Conventional default, kept ONLY as a last resort for hosts where wslpath
+    # itself is unavailable (e.g. WSL1, or interop disabled) but the mount root
+    # still happens to be the common default.
+    candidates.append("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if Path(candidate).exists():
+            return candidate, attempts
+        attempts.append(f"{candidate} does not exist")
+
+    return None, attempts
 
 
 class WindowsBackend:
@@ -88,12 +157,14 @@ class WindowsBackend:
         """
         if shutil.which("wslpath") is None:
             return ProbeResult(False, "wslpath not on PATH (not running under WSL2?)")
-        ps = _which_powershell(self._ps_config)
+        ps, attempts = _which_powershell(self._ps_config)
         if ps is None:
+            detail = "; ".join(attempts) if attempts else "no candidates found"
             return ProbeResult(
                 False,
-                "powershell.exe not found; WSL<->Windows interop must be enabled "
-                "(on by default in WSL2), or set tool config 'powershell_path'",
+                f"powershell.exe not found (tried: {detail}); WSL<->Windows interop "
+                "must be enabled (on by default in WSL2), or set tool config "
+                "'powershell_path'",
             )
         self._ps = ps
         return ProbeResult(True)
@@ -101,12 +172,13 @@ class WindowsBackend:
     @property
     def powershell(self) -> str:
         if self._ps is None:
-            ps = _which_powershell(self._ps_config)
+            ps, attempts = _which_powershell(self._ps_config)
             if ps is None:
+                detail = "; ".join(attempts) if attempts else "no candidates found"
                 raise BackendError(
-                    "powershell.exe not found. WSL<->Windows interop must be enabled "
-                    "(it is on by default in WSL2). Set the tool config key "
-                    "'powershell_path' to override."
+                    f"powershell.exe not found (tried: {detail}). WSL<->Windows "
+                    "interop must be enabled (it is on by default in WSL2). Set "
+                    "the tool config key 'powershell_path' to override."
                 )
             self._ps = ps
         return self._ps

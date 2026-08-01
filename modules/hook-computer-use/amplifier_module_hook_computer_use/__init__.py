@@ -88,6 +88,39 @@ def _is_anthropic(provider: Any) -> bool:
     )
 
 
+class ComputerUseHookIncompatibleProviderError(RuntimeError):
+    """Raised when the provider we are about to wrap would make this hook a silent no-op.
+
+    This hook only patches `Provider.complete()`. The bundled orchestrator
+    (loop-streaming, `amplifier_module_loop_streaming/__init__.py:827`) branches on
+    `hasattr(provider, "stream")`: whenever a provider exposes `stream()`, the
+    orchestrator calls THAT method instead of `complete()` - our wrap never runs.
+    Today this "works" only because `provider-anthropic` happens not to define
+    `stream()`. There is no exception, no log line, and no event the day that changes:
+    the hook still reports "wrapped provider ... for native computer use", mount()
+    still succeeds, and computer-use silently goes blind while the session otherwise
+    looks completely healthy.
+
+    A computer-use bundle that silently stops driving the computer is worse than one
+    that refuses to load. So: refuse. Loudly, unmissably, the first time a provider
+    with `stream()` is seen - not a warning that scrolls past in a log stream.
+    """
+
+
+def _fail_if_stream_incompatible(provider: Any) -> None:
+    if hasattr(provider, "stream"):
+        raise ComputerUseHookIncompatibleProviderError(
+            f"computer-use: provider {type(provider).__name__} "
+            f"({type(provider).__module__}) now exposes stream() - hook-computer-use "
+            "only wraps complete(), and the orchestrator prefers stream() whenever it "
+            "is present. Wrapping this provider would silently do nothing: no native "
+            "tool promotion, no screenshot inlining, no error, no log line. Refusing "
+            "to operate rather than degrade invisibly. Fix: either wrap complete() AND "
+            "stream() in this hook, or route computer-use through an orchestrator that "
+            "does not prefer stream()."
+        )
+
+
 def _parse_marker(content: Any) -> dict[str, Any] | None:
     """Return the computer-use payload if this tool content carries one.
 
@@ -177,11 +210,20 @@ def _expand_tool_results(messages: list[Any], max_inline: int) -> list[Any]:
         text = str(payload.get("text") or "screenshot")
         images = [p for p in payload.get("images", []) if isinstance(p, str)]
         blocks: list[dict[str, Any]] = []
-        if budget > 0:
+        # Distinguish "budget exhausted before we ever tried this file" (superseded)
+        # from "we tried to read it and it was gone" (missing) - these used to share
+        # one message ("superseded by a newer screenshot"), which was actively
+        # misleading for the missing-file case: the model would be told its
+        # screenshot was dropped for recency reasons when the real reason was the
+        # file being pruned/unreadable.
+        missing = False
+        if budget > 0 and images:
             for path in images:
                 block = _image_block(path)
                 if block is not None:
                     blocks.append(block)
+                else:
+                    missing = True
             if blocks:
                 budget -= 1
         if blocks:
@@ -189,9 +231,12 @@ def _expand_tool_results(messages: list[Any], max_inline: int) -> list[Any]:
                 _with_content(msg, [{"type": "text", "text": text}, *blocks])
             )
         else:
-            note = (
-                " [image dropped: superseded by a newer screenshot]" if images else ""
-            )
+            if not images:
+                note = ""
+            elif missing:
+                note = " [image dropped: screenshot file no longer available]"
+            else:
+                note = " [image dropped: superseded by a newer screenshot]"
             rewritten.append(_with_content(msg, f"{text}{note}"))
     rewritten.reverse()
     return rewritten
@@ -209,7 +254,16 @@ def _promote_tools(coordinator: Any, tools: list[Any]) -> tuple[list[Any], list[
         tool = None
         try:
             tool = coordinator.get("tools", getattr(spec, "name", ""))
-        except Exception:  # noqa: BLE001 - tool lookup is best-effort
+        except Exception:
+            # Best-effort: this loop runs over EVERY tool on the request, not just
+            # `computer`, so a lookup failure for an unrelated tool is expected and
+            # must not break promotion of the others. Logged (not silent) so a
+            # persistent failure to find `computer` specifically is still
+            # diagnosable instead of invisibly meaning "computer-use never
+            # promotes" with zero trace.
+            logger.debug(
+                "computer-use: tool lookup failed for %r", spec.name, exc_info=True
+            )
             tool = None
         # D3 fix: `native_tool_spec` is a property, and on some tools it can raise
         # (e.g. a backend I/O failure). `hasattr(tool, "native_tool_spec")` used to
@@ -253,16 +307,49 @@ def _promote_tools(coordinator: Any, tools: list[Any]) -> tuple[list[Any], list[
 
 
 def _ensure_beta_headers(provider: Any, headers: list[str]) -> None:
+    """Enable the given `anthropic-beta` flags on the already-mounted provider.
+
+    Only `_beta_headers` is written here. `_default_headers` is deliberately NOT
+    touched (it was, until 2026-07-31, and the write was dead code): that dict is
+    baked into the Anthropic SDK client at provider *construction* time
+    (`amplifier_module_provider_anthropic/__init__.py:686`,
+    `AsyncAnthropic(..., default_headers=self._default_headers, ...)`), which runs
+    long before this hook ever gets a chance to mutate the provider instance -
+    `mount()` order guarantees the provider already exists by the time we see it.
+    Writing to `_default_headers` after that point mutates a dict the already-built
+    httpx client copied at init and never rereads; it has zero effect and was
+    silently doing nothing on every single request.
+
+    `_beta_headers` works for the opposite reason: it is RE-READ per request
+    (`amplifier_module_provider_anthropic/__init__.py:1262-1273`,
+    `_build_request_beta_headers`), not baked into a client at construction time.
+
+    KNOWN PRIVATE-ATTRIBUTE DEPENDENCY (dated 2026-07-31): `_beta_headers` is not
+    part of the `Provider` protocol - there is no public API for a hook to request
+    additional beta headers for a request it did not originate. The correct
+    long-term fix lives upstream, on amplifier-module-provider-anthropic: derive the
+    required `anthropic-beta` values from the native tool *types* actually present
+    on `request.tools` (the provider already inspects `request.tools` to build the
+    wire payload), so no external hook needs to reach into a private attribute at
+    all. Until that lands, this dependency is deliberate and documented, not an
+    oversight - if `provider-anthropic` ever renames or removes `_beta_headers`,
+    the `isinstance` guard below degrades this to a no-op again, which is why it is
+    logged rather than left to fail silently a second time.
+    """
     existing = getattr(provider, "_beta_headers", None)
     if existing is None or not isinstance(existing, list):
+        logger.warning(
+            "computer-use: provider %s has no writable _beta_headers list; "
+            "cannot enable %s. Native computer-use tool calls will likely be "
+            "rejected by the Anthropic API for missing the required beta opt-in.",
+            type(provider).__name__,
+            headers,
+        )
         return
     for header in headers:
         if header not in existing:
             existing.append(header)
             logger.info("computer-use: enabled anthropic-beta %s", header)
-    default = getattr(provider, "_default_headers", None)
-    if isinstance(default, dict) and existing:
-        default["anthropic-beta"] = ",".join(existing)
 
 
 def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
@@ -274,6 +361,11 @@ def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
             type(provider).__name__,
         )
         return False
+    # Fail loud (see ComputerUseHookIncompatibleProviderError) BEFORE wrapping, not
+    # after: wrapping a stream()-capable provider would "succeed" and log
+    # "wrapped provider ... for native computer use" while the wrap is never
+    # actually exercised on the request hot path.
+    _fail_if_stream_incompatible(provider)
     if not hasattr(provider, "complete"):
         return False
 
@@ -352,9 +444,22 @@ async def mount(
                 if isinstance(mounted, dict) and mounted:
                     provider = next(iter(mounted.values()))
         except Exception:
-            logger.debug("computer-use: provider lookup failed", exc_info=True)
+            # This determines whether native computer-use ever engages for the
+            # entire session. Previously logged at DEBUG only - invisible at any
+            # normal log level, so a persistently failing lookup meant computer-use
+            # silently never wrapped anything, with nothing in the logs to show it.
+            logger.warning("computer-use: provider lookup failed", exc_info=True)
         if provider is None:
             _trace(f"handler: NO PROVIDER FOUND (name={name!r})")
+            # Same reasoning: without this, "no provider found" was visible ONLY
+            # via AMPLIFIER_COMPUTER_USE_TRACE, which is off by default. A session
+            # that never finds a provider to wrap looks identical - in the normal
+            # logs - to one that is working correctly.
+            logger.warning(
+                "computer-use: no provider found to wrap (requested=%r); "
+                "native computer-use tool promotion will not happen this turn",
+                name,
+            )
         else:
             _wrap_provider(provider, coordinator, max_inline)
         return HookResult(action="continue")
