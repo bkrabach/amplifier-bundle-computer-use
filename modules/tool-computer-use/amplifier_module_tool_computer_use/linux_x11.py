@@ -168,6 +168,18 @@ class LinuxX11Backend:
     def probe(self) -> ProbeResult:
         """Connect and confirm XTEST is present. Cheap: one local socket connection,
         no subprocess, no network. Never raises - failure is reported, not thrown."""
+        # Report a missing dependency AS a missing dependency. Without this the
+        # guarded import above leaves the Xlib names bound to None, and the first
+        # use downstream surfaces as "'NoneType' object has no attribute
+        # 'Display'" - which reads like an X server connection fault and sends
+        # whoever hits it looking at DISPLAY, XAUTHORITY, and xhost instead of at
+        # `pip install python-xlib`. Observed for real in a live session mount.
+        if _IMPORT_ERROR is not None:
+            return ProbeResult(
+                False,
+                "python-xlib is not installed in the running interpreter "
+                f"({_IMPORT_ERROR}); this backend cannot drive X11 without it",
+            )
         if not self._display_name:
             return ProbeResult(False, "no DISPLAY set; no local X11 session to talk to")
         xauth = _resolve_xauthority()
