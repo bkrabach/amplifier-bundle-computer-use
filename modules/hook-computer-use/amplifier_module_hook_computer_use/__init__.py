@@ -40,6 +40,11 @@ try:  # event name is a plain constant, but tolerate kernels that move it
 except ImportError:  # pragma: no cover
     PROVIDER_REQUEST = "provider:request"
 
+try:
+    from amplifier_core.events import TOOL_PRE  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover
+    TOOL_PRE = "tool:pre"
+
 logger = logging.getLogger(__name__)
 
 __version__ = "0.1.0"
@@ -242,8 +247,20 @@ def _expand_tool_results(messages: list[Any], max_inline: int) -> list[Any]:
     return rewritten
 
 
-def _promote_tools(coordinator: Any, tools: list[Any]) -> tuple[list[Any], list[str]]:
-    """Swap function-shaped specs for native ones where the tool asks for it."""
+def _promote_tools(
+    coordinator: Any, tools: list[Any], model: str | None = None
+) -> tuple[list[Any], list[str]]:
+    """Swap function-shaped specs for native ones where the tool asks for it.
+
+    `model` is the model actually about to receive THIS request
+    (`ChatRequest.model`, when the caller can see it) - passed through to any
+    tool exposing `note_model()` so its declared `native_tool_spec`/
+    `native_beta_header` stay correct even when the model changes mid-session
+    (e.g. `provider-anthropic`'s own model-fallback). See
+    `tool_versions.resolve_tool_version` in tool-computer-use for why this
+    fixes a real, reachable 400-every-turn defect rather than a hypothetical
+    one.
+    """
     if not tools:
         return tools, []
     native: list[Any] = []
@@ -279,6 +296,23 @@ def _promote_tools(coordinator: Any, tools: list[Any]) -> tuple[list[Any], list[
             tool is not None
             and getattr(type(tool), "native_tool_spec", None) is not None
         ):
+            # Model/tool_version coupling fix: `note_model` is a plain method
+            # (not a property), so simply reading it via getattr can never
+            # trigger the D3 hazard - only *calling* it can raise, and that is
+            # already inside this function's broader try/except below. A tool
+            # with no `note_model` (or any tool predating this fix) is
+            # unaffected - `getattr(..., None)` degrades to a no-op.
+            note_model = getattr(tool, "note_model", None)
+            if callable(note_model):
+                try:
+                    note_model(model)
+                except Exception:
+                    logger.exception(
+                        "computer-use: note_model(%r) failed for %r; "
+                        "native_tool_spec may be stale this turn",
+                        model,
+                        spec.name,
+                    )
             try:
                 payload = dict(tool.native_tool_spec)
             except Exception:  # a broken tool must not break the request
@@ -375,7 +409,9 @@ def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
         try:
             tools = list(getattr(request, "tools", None) or [])
             if tools:
-                promoted, betas = _promote_tools(coordinator, tools)
+                promoted, betas = _promote_tools(
+                    coordinator, tools, getattr(request, "model", None)
+                )
                 _trace(
                     f"complete: tools={[getattr(t, 'name', '?') for t in tools]} promoted_betas={betas}"
                 )
@@ -418,6 +454,75 @@ def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
         type(provider).__name__,
     )
     return True
+
+
+#: `computer` action names that mutate the target, mirrored from
+#: `tool-computer-use`'s own `MUTATING` set so this hook does not need to
+#: import that module (kept small and duplicated deliberately - see
+#: `_make_gate_handler`'s docstring for why a local copy is safer here than a
+#: cross-module import).
+_GATE_MUTATING_ACTIONS = {
+    "mouse_move",
+    "left_click",
+    "right_click",
+    "middle_click",
+    "double_click",
+    "triple_click",
+    "left_mouse_down",
+    "left_mouse_up",
+    "left_click_drag",
+    "scroll",
+    "key",
+    "hold_key",
+    "type",
+    "focus_window",
+    "set_clipboard",
+}
+
+
+def _make_gate_handler(coordinator: Any):
+    """Build the `tool:pre` handler implementing the write-confirmation gate
+    (`docs/designs/remote-transport.md` \u00a710.4): "Gate every WRITE, or gate
+    none - anything finer is guesswork wearing a confidence costume."
+
+    This hook is pure POLICY sitting on top of a MECHANISM `ComputerTool`
+    already computes and exposes (`gate_writes`, `is_remote` - see
+    tool-computer-use's `__init__.py`): whether to gate is the tool's own,
+    already-resolved decision (defaults to on for a remote target with
+    `read_only=False`, off otherwise - see that module for the exact rule).
+    This function only turns "gate_writes is True and this action mutates"
+    into the kernel's own `ask_user` mechanism (`HOOKS_API.md`) - it invents
+    no new confirmation system of its own, per the design doc's explicit
+    guidance not to.
+    """
+
+    async def handler(event: str, data: dict[str, Any]) -> HookResult:
+        tool_name = (data or {}).get("tool_name")
+        if tool_name not in ("computer", "desktop"):
+            return HookResult(action="continue")
+        try:
+            tool = coordinator.get("tools", tool_name)
+        except Exception:  # noqa: BLE001 - a lookup failure degrades to "no gate", never a crash
+            return HookResult(action="continue")
+        computer = tool if tool_name == "computer" else getattr(tool, "_computer", None)
+        if computer is None or not getattr(computer, "_gate_writes", False):
+            return HookResult(action="continue")
+        action = (data.get("tool_input") or {}).get("action")
+        if action not in _GATE_MUTATING_ACTIONS:
+            return HookResult(action="continue")
+        backend_name = getattr(getattr(computer, "_backend", None), "name", "?")
+        return HookResult(
+            action="ask_user",
+            approval_prompt=(
+                f"Remote computer-use ({backend_name}): allow "
+                f"{tool_name}.{action!r} on the target desktop?"
+            ),
+            approval_options=["Allow", "Deny"],
+            approval_default="deny",
+            reason="gate_writes is enabled for this remote target (\u00a710.4)",
+        )
+
+    return handler
 
 
 async def mount(
@@ -466,6 +571,12 @@ async def mount(
 
     coordinator.hooks.register(
         PROVIDER_REQUEST, handler, priority=priority, name="hook-computer-use"
+    )
+    coordinator.hooks.register(
+        TOOL_PRE,
+        _make_gate_handler(coordinator),
+        priority=priority,
+        name="hook-computer-use-gate",
     )
     _trace(f"MOUNTED max_inline={max_inline}")
     logger.info("hook-computer-use mounted (max_inline_screenshots=%d)", max_inline)
