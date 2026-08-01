@@ -34,9 +34,10 @@ from typing import Any
 
 from amplifier_core.models import ToolResult
 
-from .backend import Backend, BackendError
+from .backend import Backend, BackendError, MonitorInfo
 from .geometry import Display, compute_display
 from .imaging import capture_scaled_b64
+from .monitors import PRIMARY, VIRTUAL_DESKTOP, select_monitor
 from .registry import NoBackendAvailable, select_backend
 
 logger = logging.getLogger(__name__)
@@ -121,35 +122,173 @@ class ComputerTool:
         self._max_pixels = int(cfg.get("max_pixels", 1_150_000))
         self._tool_version = str(cfg.get("tool_version", "computer_20251124"))
         self._enable_zoom = bool(cfg.get("enable_zoom", True))
+        # Per-monitor targeting (see monitors.py): default is "primary", i.e. one
+        # real monitor, not the virtual-desktop bounding box around all of them.
+        # Set to monitors.VIRTUAL_DESKTOP to opt into the old whole-desktop
+        # behavior, or to a specific monitor id from list_monitors().
+        self._target_monitor: str = str(cfg.get("target_monitor") or PRIMARY)
+        # Whether `_target_monitor` was actually asked for (config, or a runtime
+        # `select_monitor()` call) vs. just being the unconfigured default. See
+        # `_resolve_display_for_target` - this is what decides whether monitor
+        # enumeration failing is allowed to fall back to virtual-desktop mode
+        # (default, silent-to-the-user machines) or must fail loud (an explicit
+        # request the caller is entitled to know failed).
+        self._target_monitor_explicit: bool = bool(cfg.get("target_monitor"))
+        self._monitors: list[MonitorInfo] = []
+        # None in virtual-desktop mode; otherwise the MonitorInfo `display` is
+        # currently scoped to. See `_resolve_display_for_target`.
+        self._current_monitor: MonitorInfo | None = None
         # D2: resolved once (by mount(), right after backend selection) and cached -
         # never touched on the request hot path. See `resolve_display`.
         self._display: Display | None = None
 
     # -- display resolution (D2) -------------------------------------------------
     def resolve_display(self, refresh: bool = False) -> Display:
-        """Resolve and cache display geometry.
+        """Resolve and cache display geometry for the current target monitor.
 
-        Called once by `mount()`, right after the backend is selected. The only
-        other caller is the `screen_info` action, which passes `refresh=True` as its
-        explicit, deliberate refresh path (e.g. after a resolution change) - the
-        *only* place this ever talks to the backend again after mount.
+        Called once by `mount()`, right after the backend is selected. The other
+        callers are the `screen_info` action, which passes `refresh=True` as its
+        explicit, deliberate refresh path (e.g. after a resolution change), and
+        `select_monitor()`, which re-resolves for a *different* target. Those are
+        the only places this ever talks to the backend again after mount.
         """
         if self._display is not None and not refresh:
             return self._display
-        geo = self._backend.screen_geometry()
-        mw, mh = compute_display(
-            geo.width, geo.height, self._max_edge, self._max_pixels
+        self._display = self._resolve_display_for_target(
+            self._target_monitor, allow_fallback=not self._target_monitor_explicit
         )
-        self._display = Display(
-            geo.width, geo.height, mw, mh, geo.origin_x, geo.origin_y
-        )
+        return self._display
+
+    def _resolve_display_for_target(
+        self, target: str, allow_fallback: bool = False
+    ) -> Display:
+        """Build a `Display` scoped to `target` and record which monitor (if any)
+        is now active in `self._current_monitor`.
+
+        Single shared implementation for both `resolve_display()` (mount time and
+        the `screen_info` refresh path) and `select_monitor()` (runtime target
+        switch) - one place computes monitor-scoped geometry, so there is no
+        separate "switch monitor" code path that could drift out of sync with how
+        mount-time resolution works.
+
+        `allow_fallback` governs exactly one failure mode: monitor enumeration
+        being genuinely unavailable (`Backend.list_monitors()` raising
+        `BackendError` - no RandR, no RandR Monitor objects, etc.). Verified for
+        real on a headless/virtual single-display X11 session during
+        development (RandR present, `GetMonitors` returns zero - a real,
+        legitimate configuration, not a hypothetical): that machine has exactly
+        one display, so falling back to `screen_geometry()`'s virtual-desktop
+        bounding box - the code path that has ALWAYS been correct for a single
+        display - reports the SAME rectangle enumeration would have, had it
+        worked. That is not "pretending there is one monitor" (no `MonitorInfo`
+        is invented); it is correctly falling back to the one mode that was
+        already right for this machine, loudly logged so it stays diagnosable.
+        This is why `allow_fallback` is only ever `True` when `target` is the
+        unconfigured default (`resolve_display()` with no explicit
+        `target_monitor` config) - an explicit ask (`target_monitor` config, or
+        a runtime `select_monitor()` call) always fails loud instead, and a
+        target id that IS enumerated but does not match a request always fails
+        loud regardless of `allow_fallback` (see `select_monitor()` call below):
+        a config typo must never silently degrade to a different region of the
+        real, multi-monitor desktop it was supposed to protect against.
+        """
+        if target == VIRTUAL_DESKTOP:
+            geo = self._backend.screen_geometry()
+            self._current_monitor = None
+            origin_x, origin_y = geo.origin_x, geo.origin_y
+            width, height = geo.width, geo.height
+        else:
+            try:
+                monitors = self._backend.list_monitors()
+            except BackendError as exc:
+                if not allow_fallback:
+                    raise
+                logger.warning(
+                    "computer-use: monitor enumeration unavailable for target "
+                    "%r (%s); falling back to whole-desktop bounding-box mode "
+                    "for this session. Expected on a headless/virtual "
+                    "single-display X11 session with no RandR monitor objects "
+                    "- on a REAL multi-monitor desktop this is worth "
+                    "investigating rather than trusting the fallback.",
+                    target,
+                    exc,
+                )
+                return self._resolve_display_for_target(VIRTUAL_DESKTOP)
+            self._monitors = monitors
+            # `select_monitor` (the module-level function) always fails loud on
+            # an unmatched explicit id - deliberately NOT gated by
+            # allow_fallback. Enumeration succeeding but not containing the
+            # requested id is a config typo, not an environmental limitation;
+            # silently substituting a different monitor would be exactly the
+            # "silently targets the wrong region" failure mode this feature
+            # exists to eliminate.
+            chosen = select_monitor(monitors, None if target == PRIMARY else target)
+            if target == PRIMARY and not chosen.primary:
+                # Not a synthesized fallback - `chosen` is a real, enumerated
+                # monitor. Logged because picking one among several equally
+                # real candidates, absent a primary flag, is an environmental
+                # fact worth surfacing, not something to bury silently.
+                logger.warning(
+                    "computer-use: no monitor reported as primary; "
+                    "deterministically targeting %r (%dx%d at %d,%d)",
+                    chosen.id,
+                    chosen.width,
+                    chosen.height,
+                    chosen.x,
+                    chosen.y,
+                )
+            self._current_monitor = chosen
+            origin_x, origin_y = chosen.x, chosen.y
+            width, height = chosen.width, chosen.height
+
+        mw, mh = compute_display(width, height, self._max_edge, self._max_pixels)
+        disp = Display(width, height, mw, mh, origin_x, origin_y)
         logger.info(
-            "computer-use display: screen %dx%d -> model %dx%d",
-            geo.width,
-            geo.height,
+            "computer-use display: target=%r screen %dx%d at (%d,%d) -> model %dx%d",
+            target,
+            width,
+            height,
+            origin_x,
+            origin_y,
             mw,
             mh,
         )
+        return disp
+
+    def list_monitors(self) -> list[MonitorInfo]:
+        """Enumerate monitors via the backend, refreshing the cached list.
+
+        Independent of the current target: works the same whether `display` is
+        currently scoped to a monitor or to the whole virtual desktop.
+        """
+        self._monitors = self._backend.list_monitors()
+        return self._monitors
+
+    @property
+    def current_monitor(self) -> MonitorInfo | None:
+        """The monitor `display` is scoped to, or `None` in virtual-desktop mode."""
+        return self._current_monitor
+
+    def select_monitor(self, target: str) -> Display:
+        """Switch the active target (a monitor id, `"primary"`, or
+        `monitors.VIRTUAL_DESKTOP`) and re-resolve `display` for it.
+
+        Safe to call mid-session. `hook-computer-use` reads `native_tool_spec`
+        fresh on *every* provider request (see that property's docstring) - it is
+        never cached at the hook layer - so the very next request after this call
+        returns automatically declares the new `display_width_px`/
+        `display_height_px` with no extra plumbing. The only state this needs to
+        update is `self._display`/`self._current_monitor`, exactly what
+        `_resolve_display_for_target` already does.
+
+        Always fails loud on enumeration failure (`allow_fallback=False`):
+        unlike the unconfigured default, this is an explicit ask - the caller
+        (config or a live `desktop.select_monitor` call) is entitled to know it
+        failed, not have it silently ignored in favor of the previous target.
+        """
+        self._display = self._resolve_display_for_target(target, allow_fallback=False)
+        self._target_monitor = target
+        self._target_monitor_explicit = True
         return self._display
 
     @property
@@ -237,6 +376,19 @@ class ComputerTool:
         transient bridge failure here raised on the hot path. Display is now resolved
         once at mount and cached in-memory; this property does no I/O and cannot
         raise for that reason again.
+
+        Per-monitor targeting tension: `desktop.select_monitor` can change what
+        `self.display` reports *mid-session*, and this property's declared
+        `display_width_px`/`display_height_px` must never drift out of sync with
+        what `computer.screenshot` is actually capturing. That is why this stays a
+        plain property reading `self.display` rather than something cached at
+        construction: `hook-computer-use` re-reads `native_tool_spec` fresh on
+        *every* `provider:request` (see `_promote_tools` in that module - it is
+        never cached at the hook layer; only D2's *I/O* was cached here, not the
+        *value*), so the very next request after a monitor switch automatically
+        declares the new dimensions. The in-memory state this property reads
+        (`self._display`) is exactly what `select_monitor` updates - one piece of
+        state, two readers (this property and `_run`), always in sync.
         """
         disp = self.display
         spec: dict[str, Any] = {
@@ -277,8 +429,18 @@ class ComputerTool:
         text = params.get("text") or params.get("key")
 
         if action == "screenshot":
+            # Scoped to the current monitor, not cropped from a full-desktop grab:
+            # when a monitor is targeted, pass its bounds as an explicit region so
+            # both backends capture that region directly (`Graphics.CopyFromScreen`
+            # on Windows, X `GetImage` on Linux) - never the whole virtual desktop
+            # downscaled and then implicitly "close enough". `None` here (only in
+            # virtual-desktop mode) preserves the original whole-desktop capture.
+            region = None
+            if self._current_monitor is not None:
+                m = self._current_monitor
+                region = (m.x, m.y, m.x + m.width, m.y + m.height)
             b64 = capture_scaled_b64(
-                backend, disp, None, self._max_edge, self._max_pixels
+                backend, disp, region, self._max_edge, self._max_pixels
             )
             return "screenshot captured", b64
 
@@ -308,23 +470,55 @@ class ComputerTool:
         if action == "cursor_position":
             sx, sy = backend.cursor_position()
             mx, my = disp.to_model(sx, sy)
-            return f"cursor at [{mx}, {my}] (model space)", None
+            note = ""
+            if self._current_monitor is not None:
+                m = self._current_monitor
+                if not (m.x <= sx < m.x + m.width and m.y <= sy < m.y + m.height):
+                    # Honest, not synthetic: to_model() above already clamped
+                    # (sx, sy) to the targeted monitor's edge because the real
+                    # cursor is elsewhere. Say so rather than silently reporting
+                    # a clamped position as if it were exact.
+                    note = (
+                        f" [warning: real cursor is outside targeted monitor "
+                        f"{m.id!r} ({m.width}x{m.height} at {m.x},{m.y}); "
+                        "position above is clamped to the nearest edge, not exact]"
+                    )
+            return f"cursor at [{mx}, {my}] (model space){note}", None
 
         if action == "screen_info":
-            # The one deliberate refresh path: re-resolves and re-caches geometry,
-            # so a resolution change is picked up without touching the hot path.
+            # The one deliberate refresh path (alongside select_monitor):
+            # re-resolves and re-caches geometry for the CURRENT target, so a
+            # resolution change is picked up without touching the hot path.
             fresh = self.resolve_display(refresh=True)
-            return (
-                json.dumps(
-                    {
-                        "screen_width": fresh.screen_width,
-                        "screen_height": fresh.screen_height,
-                        "model_width": fresh.model_width,
-                        "model_height": fresh.model_height,
-                    }
-                ),
-                None,
-            )
+            payload: dict[str, Any] = {
+                "screen_width": fresh.screen_width,
+                "screen_height": fresh.screen_height,
+                "model_width": fresh.model_width,
+                "model_height": fresh.model_height,
+                "origin_x": fresh.origin_x,
+                "origin_y": fresh.origin_y,
+                "target_monitor": self._target_monitor,
+            }
+            if self._current_monitor is not None:
+                payload["monitor_id"] = self._current_monitor.id
+                payload["monitor_primary"] = self._current_monitor.primary
+            elif self._target_monitor != VIRTUAL_DESKTOP:
+                # Degraded: a per-monitor target was requested but enumeration
+                # was unavailable, so geometry is the whole virtual-desktop
+                # bounding box. A logger.warning alone is not enough - the model
+                # is the one reasoning about this coordinate space, so it has to
+                # be told. On a multi-monitor desktop the bounding box can span
+                # large regions where no display exists at all, and clicks there
+                # land nowhere.
+                payload["degraded"] = "monitor-enumeration-unavailable"
+                payload["coordinate_space"] = "virtual-desktop-bounding-box"
+                payload["warning"] = (
+                    "Per-monitor targeting is unavailable on this host, so these "
+                    "coordinates span the whole virtual desktop. On a multi-monitor "
+                    "setup this space may contain gaps with no display behind them; "
+                    "clicks there do nothing."
+                )
+            return json.dumps(payload), None
 
         if action == "list_windows":
             result = backend.list_windows()
@@ -462,6 +656,8 @@ DESKTOP_ACTIONS = [
     "screen_info",
     "get_clipboard",
     "set_clipboard",
+    "list_monitors",
+    "select_monitor",
 ]
 
 #: Clipboard *reads* travel to the model provider as tool output (see README Safety
@@ -494,10 +690,14 @@ class DesktopTool:
     def description(self) -> str:
         return (
             "Desktop helpers that complement the `computer` tool: list open windows, "
-            "bring a window to the front before typing into it, read the display geometry, and "
-            "read or write the clipboard. Use `list_windows` then `focus_window` to make "
-            "sure keystrokes land in the right application. Clipboard access is the reliable way "
-            "to pull exact text out of an app (select, copy, then get_clipboard)."
+            "bring a window to the front before typing into it, read the display geometry, "
+            "read or write the clipboard, and list/switch which physical monitor "
+            "`computer` screenshots and clicks are scoped to. Use `list_windows` then "
+            "`focus_window` to make sure keystrokes land in the right application. "
+            "Clipboard access is the reliable way to pull exact text out of an app "
+            "(select, copy, then get_clipboard). On a multi-monitor desktop, use "
+            "`list_monitors` to see what's available and `select_monitor` to target one - "
+            "`computer` is scoped to a single monitor by default so screenshots stay legible."
         )
 
     @property
@@ -513,6 +713,13 @@ class DesktopTool:
                 "text": {
                     "type": "string",
                     "description": "Text to place on the clipboard (set_clipboard).",
+                },
+                "monitor": {
+                    "type": "string",
+                    "description": (
+                        "Monitor id from list_monitors, or 'primary' / "
+                        "'virtual-desktop' (select_monitor)."
+                    ),
                 },
             },
             "required": ["action"],
@@ -539,6 +746,34 @@ class DesktopTool:
             if action == "set_clipboard":
                 backend.set_clipboard(str(input.get("text") or ""))
                 return ToolResult(success=True, output="clipboard set")
+            if action == "list_monitors":
+                monitors = self._computer.list_monitors()
+                current = self._computer.current_monitor
+                lines = [
+                    f"  [{m.id}] {m.width}x{m.height} at ({m.x},{m.y})"
+                    f"{' (primary)' if m.primary else ''}"
+                    f"{' [ACTIVE]' if current is not None and current.id == m.id else ''}"
+                    for m in monitors
+                ]
+                mode = "virtual-desktop" if current is None else f"monitor {current.id}"
+                return ToolResult(
+                    success=True,
+                    output=f"target mode: {mode}\nmonitors:\n" + "\n".join(lines),
+                )
+            if action == "select_monitor":
+                target = str(input.get("monitor") or "").strip()
+                if not target:
+                    raise ValueError("action 'select_monitor' requires 'monitor'")
+                disp = self._computer.select_monitor(target)
+                return ToolResult(
+                    success=True,
+                    output=(
+                        f"target monitor set to {target!r}: screen "
+                        f"{disp.screen_width}x{disp.screen_height} at "
+                        f"({disp.origin_x},{disp.origin_y}) -> model "
+                        f"{disp.model_width}x{disp.model_height}"
+                    ),
+                )
             summary, _ = self._computer._run(action, input)
             return ToolResult(success=True, output=summary)
         except (BackendError, ValueError) as exc:

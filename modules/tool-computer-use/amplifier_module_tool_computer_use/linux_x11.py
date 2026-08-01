@@ -36,7 +36,14 @@ from Xlib import display as xlib_display
 from Xlib.ext import xtest
 from Xlib.protocol import event as xevent
 
-from .backend import BackendError, ProbeResult, ScreenGeometry, WindowInfo, WindowList
+from .backend import (
+    BackendError,
+    MonitorInfo,
+    ProbeResult,
+    ScreenGeometry,
+    WindowInfo,
+    WindowList,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -240,6 +247,62 @@ class LinuxX11Backend:
         self._ensure_connected()
         geom = self._root.get_geometry()
         return ScreenGeometry(geom.width, geom.height, 0, 0)
+
+    def list_monitors(self) -> list[MonitorInfo]:
+        """Enumerate real monitors via RandR 1.5's `GetMonitors` request.
+
+        RandR, not Xinerama: RandR 1.5 (2015) is the maintained multi-monitor
+        extension on every X server this backend otherwise depends on (RandR
+        itself is already required indirectly - `xrandr`/modesetting drivers are
+        how modern Xorg does multi-monitor at all); Xinerama is a legacy
+        compatibility shim RandR superseded and reports strictly less (no stable
+        per-output name, no primary flag). python-xlib only attaches
+        `xrandr_get_monitors` to Window objects when the server negotiates RandR
+        >= 1.5 (see `Xlib.ext.randr.init()`) - on anything older the attribute
+        genuinely does not exist. That is exactly the "cannot enumerate" case the
+        `Backend.list_monitors` contract requires failing loudly for: this method
+        never invents a single synthetic monitor to paper over it.
+        """
+        self._ensure_connected()
+        get_monitors = getattr(self._root, "xrandr_get_monitors", None)
+        if get_monitors is None:
+            raise BackendError(
+                "X server does not negotiate RandR >= 1.5 (no monitor "
+                "enumeration available); cannot select a per-monitor target on "
+                "this X11 session. Set tool config 'target_monitor: "
+                "virtual-desktop' to opt into whole-desktop bounding-box mode "
+                "instead."
+            )
+        try:
+            reply = get_monitors(is_active=True)
+        except Exception as exc:  # any protocol failure -> unavailable
+            raise BackendError(f"RandR monitor enumeration failed: {exc}") from exc
+        if not reply.monitors:
+            raise BackendError(
+                "RandR reported zero active monitors; cannot select a "
+                "per-monitor target on this X11 session"
+            )
+        monitors: list[MonitorInfo] = []
+        for i, m in enumerate(reply.monitors):
+            name = ""
+            if m.name:
+                try:
+                    name = self._display.get_atom_name(m.name)
+                except Exception:  # noqa: BLE001 - best-effort; id still unique below
+                    name = ""
+            monitor_id = name or f"monitor-{i}"
+            monitors.append(
+                MonitorInfo(
+                    id=monitor_id,
+                    x=int(m.x),
+                    y=int(m.y),
+                    width=int(m.width_in_pixels),
+                    height=int(m.height_in_pixels),
+                    primary=bool(m.primary),
+                    name=name,
+                )
+            )
+        return monitors
 
     def capture(self, region: tuple[int, int, int, int] | None = None) -> bytes:
         """In-process `GetImage` - no `import`/ImageMagick subprocess."""

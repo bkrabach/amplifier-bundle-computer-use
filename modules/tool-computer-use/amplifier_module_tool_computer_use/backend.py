@@ -62,6 +62,32 @@ class ScreenGeometry:
 
 
 @dataclass(frozen=True)
+class MonitorInfo:
+    """One REAL physical monitor, in SCREEN space.
+
+    `ScreenGeometry` (above) may describe a virtual-desktop bounding box spanning
+    every monitor on a multi-monitor machine - on the real machine that motivated
+    this, a 9626x4323 box containing four 3840x2160 monitors plus ~20% dead space
+    where no monitor exists. `MonitorInfo` is the antidote: one entry per monitor
+    actually reported by the OS, with its own bounds, so a `geometry.Display` can
+    be built for a *monitor* instead of the bounding box around all of them.
+
+    `id` must be stable across calls within a session (a device name / RandR
+    output name), so `target_monitor` config values and `desktop.select_monitor`
+    requests can name a specific monitor and get the same one back every time.
+    """
+
+    id: str
+    x: int
+    y: int
+    width: int
+    height: int
+    primary: bool = False
+    #: Human-readable label, if the backend has one distinct from `id`.
+    name: str = ""
+
+
+@dataclass(frozen=True)
 class WindowInfo:
     """One entry from `Backend.list_windows()`."""
 
@@ -105,6 +131,24 @@ class Backend(Protocol):
         boundary). Callers must resolve this once and cache the result (see
         `ComputerTool.resolve_display`) rather than calling it on every request - that
         caching, not this method, is what fixes D2.
+        """
+        ...
+
+    def list_monitors(self) -> list[MonitorInfo]:
+        """Enumerate physical monitors, in SCREEN space.
+
+        Unlike `screen_geometry` (which may report a virtual-desktop bounding box
+        spanning every monitor), this returns one entry per REAL physical monitor,
+        each with its own bounds - `Display`'s `origin_x`/`origin_y` need a real
+        monitor's bounds, not the bounding box, for per-monitor targeting to mean
+        anything.
+
+        Must raise `BackendError` if this machine's display server cannot
+        enumerate monitors (e.g. no RandR extension, or an RandR version
+        predating monitor enumeration) - never silently return a single
+        synthetic entry standing in for reality. Whole-desktop operation
+        (`screen_geometry`/`capture` with no region) does not depend on this
+        method at all; only per-monitor targeting does.
         """
         ...
 

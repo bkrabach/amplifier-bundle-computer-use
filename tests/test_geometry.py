@@ -119,3 +119,92 @@ def test_scale_x_and_scale_y_track_independent_axes():
     assert disp.scale_x == 1.0
     assert disp.scale_y == 1.0
     assert disp.scale == disp.scale_x  # documented alias
+
+
+# -- negative origin (real multi-monitor case) ----------------------------------
+#
+# Measured on the real machine this feature was built for: four 3840x2160
+# monitors including DISPLAY1 at (1946, -2160) and DISPLAY4 at (5786, -2163).
+# `Display.origin_x`/`origin_y` used to only ever see a virtual-desktop origin
+# (nonnegative in every environment this bundle was previously tested against);
+# per-monitor targeting hands them a REAL monitor's origin instead, and that can
+# be negative. Nothing here special-cases sign - `to_screen`/`to_model` are
+# already generic arithmetic - but that genericity was never exercised by a test
+# before, and an off-by-one or sign error would have been invisible without one.
+
+
+def test_to_screen_handles_negative_origin_monitor():
+    # DISPLAY1: 3840x2160 at (1946, -2160) - one of two negative-origin monitors
+    # on the real four-monitor layout this feature was built for.
+    disp = Display(
+        screen_width=3840,
+        screen_height=2160,
+        model_width=1280,
+        model_height=720,
+        origin_x=1946,
+        origin_y=-2160,
+    )
+    # Model-space top-left maps to this monitor's real top-left corner.
+    sx, sy = disp.to_screen(0, 0)
+    assert (sx, sy) == (1946, -2160)
+    # Model-space bottom-right maps to this monitor's real bottom-right corner.
+    sx, sy = disp.to_screen(1280, 720)
+    assert sx == 1946 + 3840 - 1
+    assert sy == -2160 + 2160 - 1  # == -1, not 2159 - a sign error would give this
+
+
+def test_to_screen_clamps_within_negative_origin_monitor_bounds():
+    # DISPLAY4: 3840x2160 at (5786, -2163).
+    disp = Display(
+        screen_width=3840,
+        screen_height=2160,
+        model_width=1280,
+        model_height=720,
+        origin_x=5786,
+        origin_y=-2163,
+    )
+    # Wildly out-of-range model coords must clamp to THIS monitor's real bounds,
+    # not to (0, 0) or to the positive quadrant - a naive `max(0, ...)` clamp
+    # (correct for an origin of 0) would be wrong here.
+    sx, sy = disp.to_screen(-999, -999)
+    assert (sx, sy) == (5786, -2163)
+    sx, sy = disp.to_screen(999999, 999999)
+    assert (sx, sy) == (5786 + 3840 - 1, -2163 + 2160 - 1)
+
+
+def test_to_model_round_trips_through_negative_origin():
+    """The inverse must hold exactly (mod rounding) for a negative-origin
+    monitor, not just for the origin=0 case `test_to_model_is_the_inverse_of_to_screen`
+    already covers."""
+    disp = Display(
+        screen_width=3840,
+        screen_height=2160,
+        model_width=1280,
+        model_height=720,
+        origin_x=1946,
+        origin_y=-2160,
+    )
+    for mx, my in [(0, 0), (1, 1), (640, 360), (1279, 719)]:
+        sx, sy = disp.to_screen(mx, my)
+        rx, ry = disp.to_model(sx, sy)
+        assert abs(rx - mx) <= 1
+        assert abs(ry - my) <= 1
+
+
+def test_to_model_clamps_real_screen_coords_from_a_different_negative_monitor():
+    """A real absolute screen coordinate that lies on a DIFFERENT monitor (e.g.
+    the cursor is on DISPLAY3 at the origin while `disp` targets DISPLAY1, whose
+    negative-y bounds do not contain (0, 0) at all) must clamp into `disp`'s own
+    model bounds, not silently produce a negative or out-of-range model
+    coordinate."""
+    disp = Display(
+        screen_width=3840,
+        screen_height=2160,
+        model_width=1280,
+        model_height=720,
+        origin_x=1946,
+        origin_y=-2160,
+    )
+    mx, my = disp.to_model(0, 0)  # (0, 0) is real, but on DISPLAY3, not this one
+    assert 0 <= mx <= disp.model_width - 1
+    assert 0 <= my <= disp.model_height - 1

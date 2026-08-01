@@ -22,7 +22,14 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .backend import BackendError, ProbeResult, ScreenGeometry, WindowInfo, WindowList
+from .backend import (
+    BackendError,
+    MonitorInfo,
+    ProbeResult,
+    ScreenGeometry,
+    WindowInfo,
+    WindowList,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +253,47 @@ class WindowsBackend:
             int(info.get("x", 0)),
             int(info.get("y", 0)),
         )
+
+    def list_monitors(self) -> list[MonitorInfo]:
+        """Enumerate real monitors from `[System.Windows.Forms.Screen]::AllScreens`.
+
+        The same `screen_info` bridge action already fetches this (`bridge.ps1`'s
+        `screen_info` case populates `$out.screens` from `AllScreens` alongside the
+        virtual-desktop bounding box `screen_geometry` uses) - it was simply being
+        discarded by the Python side until now. `DeviceName` (e.g. `\\\\.\\DISPLAY3`)
+        is used as `id`: Windows assigns these deterministically per adapter/output
+        and they are stable across calls within a session, which is exactly what
+        `target_monitor` config and `desktop.select_monitor` need to name a monitor
+        and get the same one back.
+        """
+        info = self.raw("screen_info", timeout=30)
+        if not info.get("ok"):
+            raise BackendError(f"screen_info failed: {info.get('error')}")
+        screens = info.get("screens")
+        if not screens:
+            raise BackendError(
+                "screen_info returned no per-monitor data ('screens' missing or "
+                "empty); cannot enumerate monitors on this Windows host"
+            )
+        monitors: list[MonitorInfo] = []
+        for i, s in enumerate(screens):
+            bounds = s.get("bounds")
+            if not isinstance(bounds, (list, tuple)) or len(bounds) < 4:
+                raise BackendError(f"malformed monitor entry in screen_info: {s!r}")
+            x, y, w, h = (int(v) for v in bounds[:4])
+            name = str(s.get("name") or "") or f"monitor-{i}"
+            monitors.append(
+                MonitorInfo(
+                    id=name,
+                    x=x,
+                    y=y,
+                    width=w,
+                    height=h,
+                    primary=bool(s.get("primary", False)),
+                    name=name,
+                )
+            )
+        return monitors
 
     def capture(self, region: tuple[int, int, int, int] | None = None) -> bytes:
         if region:
