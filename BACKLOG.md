@@ -34,50 +34,71 @@ to build, it doesn't belong on this list.
 ## Human/agent coexistence
 
 Both items below come from the same observation: this tool drives a desktop a
-human may also be sitting at, and today neither party can see the other.
+human may also be sitting at. Both are now **largely built and verified** —
+see `docs/designs/coexistence.md` for the design and evidence base
+(`coexistence-probes.md`: U1b, U1c, U3, U4, U5, U6, U7, O1, O2, O5).
 
-### Visible on-desktop indicator while the agent is driving
+### Human-presence signal to the agent, with a handoff protocol — built and proven
 
-When the tool is operating on a machine, that machine's desktop should show a
-clear, always-on-top indicator so anyone physically present knows the agent is
-active — and can stand back rather than fighting it for the pointer, keyboard,
-clipboard, and window focus.
+The presence detector (`presence.py`, `coexistence_guard.py`) reconciles the
+target's own idle-time counter against the agent's own injection timestamps,
+per elementary event (not per operation), and halts before the next write the
+moment a human is detected — unconditionally, with no configuration key able
+to disable it (`CoexistenceGuard`'s halt invariant, `test_halt_invariant.py`).
 
-The indicator must also be a **control**, not just a light:
+Evidence:
+- **Linux X11** — `GUARD_MS["linux-x11"] = 5.0`ms, proven by the ship gate
+  (`scripts/verify_coexistence.py`): 100 trials, 91% detection, zero false
+  positives, measured masked fraction 9.00% vs. 8.33% predicted
+  (`GUARD/cadence`).
+- **macOS** — `GUARD_MS["macos"] = 10.0`ms, measured on real hardware (a live
+  MacBook, macOS 26.6 arm64) from a 300-sample distribution of
+  inject-to-visible-in-idle latency: p50 0.58ms, max 8.56ms, 0/300 false
+  positives at the 10ms band.
+- **Verified against a real human at the keyboard** — a paced `type_text` run
+  halted correctly at chunk 34 of 40 when a human touched the trackpad:
+  `HaltedError` raised, margin +29.84ms, `release_all` fired exactly once.
+- **Windows** — `GUARD_MEASURED["windows-wsl2"] = False`. Still open, see
+  below.
 
-- **Pause** — agent input suspended, human takes the desktop, agent is told
-  plainly that it is paused rather than left to wonder why its clicks stopped
-  landing.
-- **Cancel** — session ends, held inputs released via the existing ledger.
+What shipped alongside detection: the halt invariant (`docs/designs/
+coexistence.md` §6.0, unconditional — no config key disables it); target
+binding (abort on focus change mid-operation, §8.6); pause/cancel with
+held-input release via the existing ledger; and, as of this pass, `type_text`
+pacing (`type_pacing.py`) — a measured full-speed `type_text` run (202
+characters in 0.07s) produced an inter-character gap 28x narrower than
+`GUARD_MS["macos"]`, masking the detector for the whole operation; pacing now
+keeps the gap wider than the guard band whenever a coexistence guard is
+active.
 
-Design notes / open questions:
-- Must render on all three platforms; each has a different always-on-top and
-  overlay story.
-- Must not itself steal focus — an indicator that grabs focus recreates the
-  problem it exists to solve.
-- Must survive the agent crashing. An indicator that lingers after the agent is
-  gone is bad; one that disappears while the agent is still driving is worse.
-- Pause state belongs to the *target*, not the controller: a compromised or
-  buggy controller must not be able to ignore a local human's pause.
+**Still open:**
+- Windows `GUARD` is unmeasured (`GUARD_MEASURED["windows-wsl2"] = False`) and
+  on hold — no probe has run against a real Windows target; the `32.0`ms
+  figure in `GUARD_MS` is a sound inference from documented `GetLastInputInfo`
+  quantisation, not evidence, and must not be presented as proven.
+- Per-action `request`/auto-takeover consent protocol was deliberately cut
+  from v1 (`docs/designs/coexistence.md` §13, D1) — it never traced back to
+  the incident that motivated this feature; re-open only on a demonstrated
+  need.
 
-### Human-presence signal to the agent, with a handoff protocol
+### Visible on-desktop indicator while the agent is driving — built and proven (Linux, macOS)
 
-The agent should know whether a human is actively using the desktop before it
-starts driving, and be given a deliberate way to acquire control:
+Evidence:
+- **Linux** — the override-redirect overlay (`overlay_linux.py`) renders (198
+  sampled pixels changed on-screen), does not steal focus (identical focus
+  window ID before and after `show()`), `hide()` restores with zero residual,
+  and registers 2 exclusion rects at the injection call site so the agent
+  cannot click its own Pause/Cancel controls (`exclusion.py`,
+  `coexistence_guard.py`).
+- **macOS** — `announce_macos.py`'s `osascript display dialog` session-start
+  announcement: `announce()` returns after 15.3s against a stated 15s
+  timeout with `gave_up=True` correctly distinguished from an actual button
+  press.
 
-- **Take over immediately** — for machines the human has explicitly ceded.
-- **Request access** — prompt on the target, with an auto-take-over after a
-  configurable timeout if nobody answers.
-- **Wait for inactivity** — take over only after an idle threshold is crossed.
-
-Design notes / open questions:
-- Idle detection differs per platform (`XScreenSaver`/idle time on X11,
-  `CGEventSourceSecondsSinceLastEventType` on macOS, `GetLastInputInfo` on
-  Windows) and none is a perfect proxy for "a human is present."
-- Interacts directly with the contention policy in
-  `docs/designs/remote-transport.md` §11 — resolve them together, not separately.
-- Auto-take-over on timeout is a safety-relevant default. It should be opt-in
-  per target, not global, and it must be audited.
+**Still open:**
+- The Windows overlay is not built (folded into transport Phase 4 per the
+  design doc — one persistent PowerShell process serving injection,
+  presence sampling, and the overlay together).
 
 ---
 

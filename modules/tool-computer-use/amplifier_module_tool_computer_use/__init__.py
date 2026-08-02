@@ -52,6 +52,7 @@ from .tool_versions import (
     require_static_pairing,
     resolve_tool_version,
 )
+from .type_pacing import resolve_type_pacing_ms
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +309,30 @@ class ComputerTool:
         self._backend_type_text_supports_guard: bool = (
             "guard" in inspect.signature(backend.type_text).parameters
         )
+
+        # -- type_text pacing (measured safety gap, see type_pacing.py) ------
+        # `None` (default) = auto: `type_pacing.AUTO_PACING_MS` when a
+        # coexistence guard is active for this `type` call, `0` (full speed,
+        # unchanged) when it is not - see `resolve_type_pacing_ms`. An
+        # explicit integer overrides auto in both directions, including `0`
+        # to force full speed even with a guard active (logged once at
+        # WARNING when it fires - see `_run`'s `type` action).
+        pacing_cfg = cfg.get("type_pacing_ms")
+        if pacing_cfg is None:
+            self._type_pacing_ms: int | None = None
+        else:
+            try:
+                parsed_pacing = int(pacing_cfg)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "config 'type_pacing_ms' must be an integer number of "
+                    f"milliseconds, or omitted for auto - got {pacing_cfg!r}"
+                ) from exc
+            if parsed_pacing < 0:
+                raise ValueError(
+                    f"config 'type_pacing_ms' must be >= 0 - got {parsed_pacing!r}"
+                )
+            self._type_pacing_ms = parsed_pacing
 
     # -- display resolution (D2) -------------------------------------------------
     def resolve_display(self, refresh: bool = False) -> Display:
@@ -853,7 +878,35 @@ class ComputerTool:
                 raise ValueError("action 'type' requires 'text'")
             body = str(text)
             guard = self._coexistence_guard
-            if guard is not None and self._backend_type_text_supports_guard:
+            guard_active = guard is not None and self._backend_type_text_supports_guard
+            # Measured safety gap (type_pacing.py): a 202-character string
+            # typed at full speed via a per-character guarded loop can
+            # complete in ~70ms - an inter-character gap far narrower than
+            # any platform's GUARD_MS, making the presence detector
+            # structurally blind for the whole operation. Pacing is applied
+            # HERE, in the one shared call site every backend routes
+            # through, so Linux and macOS both benefit from a single fix
+            # rather than a per-backend patch - and only when a guard is
+            # actually active, per `resolve_type_pacing_ms`'s contract.
+            pacing_ms = resolve_type_pacing_ms(
+                self._type_pacing_ms, guard_active=guard_active
+            )
+            if guard_active and self._type_pacing_ms == 0:
+                assert guard is not None
+                logger.warning(
+                    "computer-use: type_pacing_ms=0 explicitly configured "
+                    "while a coexistence guard is active (backend=%r, "
+                    "guard_ms=%.1f) - this disables the pacing that keeps "
+                    "the inter-character gap wider than the guard band, "
+                    "making the presence detector structurally blind for "
+                    "the duration of this type_text call "
+                    "(docs/designs/coexistence.md \u00a75.2). A deliberate, "
+                    "logged choice, not a default.",
+                    backend.name,
+                    guard.presence.guard_ms,
+                )
+            if guard_active:
+                assert guard is not None
                 # \u00a75.2/\u00a78.6: bind the delivery target once at operation
                 # start; `backend.type_text` re-checks it (via the guard)
                 # before EVERY keystroke, and records a fresh injection
@@ -863,7 +916,13 @@ class ComputerTool:
                 guard.check_start_permission()
                 guard.bind_target()
                 try:
-                    backend.type_text(body, guard=guard)
+                    if pacing_ms > 0:
+                        pacing_seconds = pacing_ms / 1000.0
+                        for ch in body:
+                            backend.type_text(ch, guard=guard)
+                            time.sleep(pacing_seconds)
+                    else:
+                        backend.type_text(body, guard=guard)
                 finally:
                     guard.release_target()
             else:
