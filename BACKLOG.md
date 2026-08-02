@@ -21,13 +21,42 @@ to build, it doesn't belong on this list.
   marker → image-block rewrite, and the write gate have never all executed
   together in one session.
 
-- **Windows capture + input, verified.** Probe, monitor enumeration, geometry,
-  and cursor position are verified against live hardware. Capture and input are
-  not.
+- ~~**Windows capture + input, verified.**~~ **DONE.** Capture proven through a
+  real Amplifier session (1280x720 per-monitor, model described the actual
+  desktop). Input proven end to end: Win key -> `notepad` -> Enter ->
+  `CU-INPUT-PROOF-7741` typed, read back three ways (document text, tab title,
+  and a status bar reading `Ln 1, Col 20 / 19 characters` matching the string
+  length exactly), then closed without saving.
 
-- **macOS click and type into a real application.** Blocked on a macOS
-  Automation TCC prompt that cannot be approved over SSH. The underlying
-  `CGEventPost` primitive is verified; app-targeted input is not.
+- ~~**macOS click and type into a real application.**~~ **DONE, and the TCC
+  premise was wrong.** This was recorded as blocked on an Automation TCC prompt
+  that "cannot be approved over SSH". Checked directly: System Events Automation
+  is *already granted* for the SSH chain (`rc=0`, and a re-check returning in
+  0.1s with no re-prompt proves the grant persisted). `focus_window` is not
+  blocked. The earlier apparent failure was a human dismissing the Spotlight
+  window mid-test, misread as a permissions problem - the same misdiagnosis this
+  bundle's own scenarios exist to catch.
+
+---
+
+## Indicator polish
+
+- **Live countdown in the macOS announce dialog.** The dialog currently states
+  its timeout in plain text ("dismisses itself in 30 seconds") because §7.3
+  requires the timeout be disclosed rather than run as a hidden clock. A *live
+  countdown* would be strictly better: it turns a static claim into visible,
+  verifiable state, so someone who looks up mid-way knows how long they actually
+  have rather than having to remember when it appeared.
+
+  Requested by the owner after the noticeability test, where the static
+  disclosure was judged sufficient to notice and act on but the countdown was
+  named as the obvious improvement.
+
+  Implementation note: `osascript`'s `display dialog ... giving up after N` is
+  a single blocking call and cannot repaint its own text, so this needs a
+  different mechanism than the current one-shot — likely a loop of short-lived
+  dialogs, or a different presentation layer entirely. Cost is real; the
+  disclosure requirement is already satisfied without it. Not urgent.
 
 ---
 
