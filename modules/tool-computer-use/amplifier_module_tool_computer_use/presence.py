@@ -154,7 +154,27 @@ GUARD_MEASURED: dict[str, bool] = {
     # Unresolved. Do not treat the 297ms halt as proof of human detection until
     # this is settled; it is currently only proof that the halt PATH executes.
     #
-    # ROOT CAUSE FOUND 2026-08-02: `SendInput` RETURNS 0 from an SSH `-Command`
+    # CORRECTION 2026-08-02: I previously recorded the root cause below as
+    # "UIPI / session isolation blocks SendInput". THAT WAS WRONG, and it is
+    # corrected here rather than quietly deleted.
+    # The bundle's OWN injection path works fine over the exact same SSH
+    # transport - proven directly:
+    #     cursor before : (2700, 1500)      idle before : 58188ms
+    #     be.move(2640, 1460)  via bridge.ps1
+    #     cursor after  : (2640, 1460)      idle after  : 859ms
+    # Cursor moved AND the idle timer reset. So injection is not blocked by the
+    # OS at all. My six failing attempts used a HAND-WRITTEN Add-Type INPUT
+    # struct that SendInput rejected (ret=0) - almost certainly an x64 struct
+    # layout/alignment bug in MY probe, not a platform restriction. bridge.ps1
+    # has an independently-written, working marshalling that I should have used
+    # from the start instead of re-deriving it.
+    # A follow-up run using be.move() then yielded only 10/120 usable samples
+    # with +/-3px deltas, which points at coordinate de-duplication for small
+    # moves (the 60px single move worked). Still unmeasured, but the blocker is
+    # now a solvable probe-design problem, not an OS wall.
+    #
+    # SUPERSEDED (kept for the record, the conclusion was wrong):
+    # `SendInput` RETURNS 0 from an SSH `-Command`
     # process - zero events inserted, a hard Win32 refusal (UIPI / session
     # isolation), not a timing artifact. Ten consecutive calls, `ret=0` every
     # time, `dwTime` frozen at 1366472281 throughout:
