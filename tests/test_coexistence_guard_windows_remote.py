@@ -15,6 +15,7 @@ no-real-backend approach used against the guard's before/after wiring).
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -97,7 +98,16 @@ def test_windows_backend_guard_still_halts_on_a_detected_human():
     backend = _FakeWindowsBackend(idle_ms=1.0)  # near-zero idle -> human_active
     guard = _build_coexistence_guard(backend, {})
     assert guard is not None
-    guard.presence.record_inject(at=1000.0)  # our own injection, long ago
+    # Anchor the injection to the LIVE monotonic clock, not an absolute literal.
+    # A hardcoded 1000.0 is only "long ago" on a box whose uptime exceeds
+    # 1000s. On a freshly-booted CI runner monotonic() is ~45, so 1000.0 is
+    # the FUTURE - the margin arithmetic inverts, the sample reads as our own
+    # injection, and the halt never fires. That is exactly how this test passed
+    # locally (uptime 9,871,938s) while failing in CI with
+    # "DID NOT RAISE HaltedError" on both 3.11 and 3.12. Reproduced by
+    # monkeypatching monotonic to a 45s base. Test artifact, not a mechanism
+    # defect - but never assume the absolute value of a monotonic clock.
+    guard.presence.record_inject(at=time.monotonic() - 1000.0)
 
     from amplifier_module_tool_computer_use.coexistence_guard import HaltedError
 
