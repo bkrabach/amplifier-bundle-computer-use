@@ -293,6 +293,23 @@ class RemoteAgent:
         x, y = self.backend.cursor_position()
         return {"x": x, "y": y}
 
+    def _op_presence_idle(self, _args: dict[str, Any]) -> dict[str, Any]:
+        """Forward a presence-idle read to whichever real platform backend
+        this agent is running (`docs/designs/coexistence.md` \u00a75) - the
+        controller-side `RemoteBackend.presence_idle_ms()` calls this over
+        the already-open NDJSON channel rather than duplicating any presence
+        logic on the controller. `UnsupportedOpError` (not a guessed value)
+        if this target's own backend has no `presence_idle_ms()` - never
+        silently report a fabricated idle reading (\u00a79.6).
+        """
+        idle_source = getattr(self.backend, "presence_idle_ms", None)
+        if idle_source is None:
+            raise UnsupportedOpError(
+                f"backend {self.backend.name!r} has no presence_idle_ms() - "
+                "coexistence presence detection is not available on this target"
+            )
+        return {"idle_ms": float(idle_source())}
+
     def _op_capture_scaled(self, args: dict[str, Any]) -> dict[str, Any]:
         # C1: downscale HERE, on the target, before any bytes cross the wire -
         # never send the native capture and let the controller resize it.

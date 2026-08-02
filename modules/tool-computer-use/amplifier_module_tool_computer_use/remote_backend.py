@@ -58,6 +58,17 @@ class RemoteBackend:
         self._transport: SshTransport | None = cfg.get("_transport")
         self._ids = itertools.count(1)
         self._connected = False
+        # Coexistence (docs/designs/coexistence.md \u00a75): the bare REMOTE
+        # backend name (e.g. "windows-wsl2", "linux-x11", "macos") from the
+        # handshake, as reported by the agent's own `self.backend.name` on
+        # the target - NOT the composite `self.name` above (which is
+        # "remote-ssh:<that value>" and is deliberately kept as the durable
+        # halt-state / log key, unique per remote target). `_build_coexistence_guard`
+        # (`__init__.py`) resolves the GUARD_MS band from THIS, never from
+        # `self.name` - "remote-ssh:windows-wsl2" is not a `GUARD_MS` key and
+        # never will be; the underlying platform's measured band is. `None`
+        # until `connect()` completes a handshake.
+        self.presence_platform: str | None = None
 
     # -- connection lifecycle (used by registry.select_backend) -------------
 
@@ -78,6 +89,7 @@ class RemoteBackend:
             raise RemoteTargetUnavailable(str(exc)) from exc
         self._connected = True
         self.name = f"remote-ssh:{handshake.get('backend', '?')}"
+        self.presence_platform = handshake.get("backend")
         return handshake
 
     def close(self) -> None:
@@ -109,6 +121,44 @@ class RemoteBackend:
         if not resp.ok:
             raise BackendError(f"{resp.error_type}: {resp.error_message}")
         return resp.result
+
+    # -- coexistence presence source (docs/designs/coexistence.md §5) ---------
+
+    def presence_idle_ms(self) -> float:
+        """Milliseconds since the REMOTE machine last saw any input.
+
+        Without this method `_build_coexistence_guard` (`__init__.py`) builds
+        no guard at all, because it gates on `getattr(backend,
+        "presence_idle_ms", None)`. That is exactly what happened before this
+        existed: every `target: ssh://...` session - on every platform - ran
+        with zero coexistence protection, which is the primary deployment
+        shape (a headless controller driving a desktop over SSH). A live
+        session against remote Windows confirmed it: `guard built: False`, and
+        no halt record was ever written.
+
+        The read is forwarded over the same per-target singleton transport
+        every other op uses - no second connection, no new process. It is
+        classified READ in `wire.py`, so the `_call` docstring's rule that
+        WRITE ops are never retried does not loosen here.
+
+        Deliberately NOT piggybacked onto an existing response: `PresenceMonitor`
+        computes `last_input_at = now - idle_ms`, so a value captured during an
+        earlier round trip yields an arithmetically wrong timestamp, and wrong
+        in the permissive direction (it makes a human look older than they are).
+        A stale presence read is a false negative in a safety gate, which is the
+        one failure mode this whole mechanism exists to prevent. One extra
+        round trip per guarded write, bounded by tailnet RTT, is the honest
+        price.
+        """
+        result = self._call("presence_idle")
+        value = result.get("idle_ms") if isinstance(result, dict) else result
+        if value is None:
+            raise BackendError(
+                "remote agent returned no idle_ms for presence_idle - the "
+                "target's backend has no presence source, so coexistence "
+                "cannot be enforced for it"
+            )
+        return float(value)
 
     # -- Backend protocol -----------------------------------------------------
 

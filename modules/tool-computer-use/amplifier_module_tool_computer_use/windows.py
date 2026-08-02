@@ -243,6 +243,51 @@ class WindowsBackend:
             ) from exc
 
     # -- Backend protocol ---------------------------------------------------------
+    # -- coexistence: presence (docs/designs/coexistence.md) ---------------------
+    def presence_idle_ms(self) -> float:
+        """Milliseconds since the last input event (real OR synthetic) reached
+        this Windows desktop, via `GetLastInputInfo`/`GetTickCount` on the far
+        side of the WSL2 bridge - the `idle_source` the presence detector
+        (`presence.PresenceMonitor`) reconciles against its own injection
+        timestamps (\u00a75 of the coexistence design), the Windows counterpart to
+        `LinuxX11Backend.presence_idle_ms`/`MacOSBackend.presence_idle_ms`.
+
+        Unlike those two (a single in-process syscall, no subprocess), this
+        crosses the WSL2->Win32 boundary via `powershell.exe`, exactly like
+        every other action on this backend (\u00a75.5 - "Windows calls cross the
+        WSL boundary via powershell.exe"). It is deliberately implemented as
+        the CHEAPEST possible action dispatched through the SAME `bridge.ps1`
+        script and the SAME `raw()` call path every other action already
+        uses (`presence_idle` in `bridge.ps1`'s switch) - no new script, no
+        new transport, no new mechanism - rather than inventing a persistent
+        side-channel (that is Phase 4, tracked separately in `BACKLOG.md`).
+
+        Honest cost note (\u00a75.5/\u00a712 "added powershell.exe spawns per action:
+        zero" is a Linux/macOS-in-process property, not a Windows one): a
+        correct presence read must be sampled fresh at call time - `idle_ms`
+        cached from an earlier action's own response would be stale by
+        however long has elapsed since that action completed, and plugging a
+        stale sample into `PresenceMonitor.sample()`'s `now - idle_ms`
+        reconciliation produces a WRONG (not just less-fresh) margin, which
+        is the kind of silent, dangerous miss this whole feature exists to
+        prevent (\u00a79.6 - never guess a fallback value). So this DOES add one
+        additional `powershell.exe` spawn per guarded WRITE action on
+        Windows (not per keystroke - `type_text` below does not accept a
+        per-event guard, so this is capped at op granularity, matching
+        \u00a75.5's \"Windows presence detection at op granularity is fine\").
+        Eliminating that spawn requires either the Phase 4 persistent-
+        PowerShell bridge, or moving the halt DECISION itself into
+        `bridge.ps1` (a materially bigger redesign) - both out of scope here.
+
+        Not part of the `Backend` protocol (`backend.py`) - looked up via
+        `getattr` by whatever constructs the `CoexistenceGuard` for this
+        backend, exactly like the Linux/macOS equivalents.
+        """
+        res = self.raw("presence_idle", timeout=15)
+        if not res.get("ok"):
+            raise BackendError(res.get("error", "presence_idle failed"))
+        return float(res["idle_ms"])
+
     def screen_geometry(self) -> ScreenGeometry:
         info = self.raw("screen_info", timeout=30)
         if not info.get("ok"):

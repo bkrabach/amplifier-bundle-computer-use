@@ -1269,12 +1269,14 @@ def _build_coexistence_guard(
     has no proven presence-detector wiring yet (`docs/designs/coexistence.md`).
 
     Deliberately conservative: a guard is only ever constructed for a backend
-    that exposes `presence_idle_ms()` (today: `LinuxX11Backend` and, since
-    `presence.GUARD_MS["macos"]` was measured by O4, `MacOSBackend` too - see
-    each method's docstring). A backend with no such method gets no
-    coexistence layer at all, rather than one built on a guessed/unmeasured
-    `GUARD` band - the same "do not claim a guarantee you do not have"
-    principle \u00a75.5 applies to Windows `type_text`.
+    that exposes `presence_idle_ms()` (today: `LinuxX11Backend`, `MacOSBackend`
+    since `presence.GUARD_MS["macos"]` was measured by O4, `WindowsBackend`
+    (via `bridge.ps1`'s `presence_idle` action), and `RemoteBackend` (forwards
+    the read to the SAME method on the target's own backend, \u00a75 of
+    `docs/designs/remote-transport.md`) - see each method's docstring). A
+    backend with no such method gets no coexistence layer at all, rather than
+    one built on a guessed/unmeasured `GUARD` band - the same "do not claim a
+    guarantee you do not have" principle \u00a75.5 applies to Windows `type_text`.
 
     `cfg["coexistence"]` (all keys optional):
       - `enabled` (default `True` when the backend supports it): set `False`
@@ -1297,14 +1299,27 @@ def _build_coexistence_guard(
             backend.name,
         )
         return None
-    if backend.name not in GUARD_MS:
+    # Coverage-gap fix: `backend.name` is the right key for LOCAL backends
+    # ("linux-x11", "macos", "windows-wsl2" - each IS its own GUARD_MS
+    # platform), but for `RemoteBackend` it is a COMPOSITE identifier
+    # ("remote-ssh:windows-wsl2", unique per remote target - see that
+    # class's own docstring for why it stays that way for logs/halt-state
+    # keys) that is deliberately never a `GUARD_MS` key. `presence_platform`
+    # (set only on `RemoteBackend`, from its own handshake) resolves to the
+    # REMOTE machine's actual measured platform band instead - network
+    # latency never gets folded into the guard band; the underlying
+    # platform's own measured GUARD_MS is used unchanged, exactly as if
+    # driving that platform locally.
+    platform_for_guard = getattr(backend, "presence_platform", None) or backend.name
+    if platform_for_guard not in GUARD_MS:
         logger.warning(
-            "coexistence: backend %r exposes presence_idle_ms() but has no "
-            "GUARD_MS entry; not building a guard",
+            "coexistence: backend %r exposes presence_idle_ms() but resolves "
+            "to platform %r, which has no GUARD_MS entry; not building a guard",
             backend.name,
+            platform_for_guard,
         )
         return None
-    presence = PresenceMonitor(idle_source=idle_source, platform=backend.name)
+    presence = PresenceMonitor(idle_source=idle_source, platform=platform_for_guard)
     ledger = HeldInputLedger()
     target_source = getattr(backend, "current_target", None)
     guard = CoexistenceGuard(

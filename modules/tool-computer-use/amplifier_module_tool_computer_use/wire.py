@@ -41,6 +41,10 @@ READ_OPS = frozenset(
         "list_windows",
         "get_clipboard",
         "ping",
+        # Coexistence presence read (docs/designs/coexistence.md \u00a75) - forwards
+        # to the remote agent's own backend.presence_idle_ms(). Idempotent by
+        # construction (a query, no side effect), so READ is the correct class.
+        "presence_idle",
     }
 )
 WRITE_OPS = frozenset(
