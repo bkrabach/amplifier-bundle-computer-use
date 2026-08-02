@@ -101,7 +101,18 @@ def _make_halted_computer() -> ComputerTool:
     backend = _FakeBackend()
     computer = ComputerTool(backend, {})
     computer.resolve_display()
-    presence = PresenceMonitor(idle_source=lambda: 0.0, platform="linux-x11")
+    # Long-idle fake, not 0.0: `before_event()` always takes one fresh live
+    # presence sample even when already seeded halted (\u00a76.0), and since
+    # defect 1's fix a first sample with a RECENT idle read is itself
+    # classified HUMAN_ACTIVE (no injection history to reconcile against -
+    # see `presence.py::_classify`). An idle_source stuck at 0.0 would keep
+    # re-triggering that fresh-detection path and overwrite the seeded
+    # snapshot under test with the live one on every call - unrelated to
+    # what this test is verifying (halt-notice surfacing from a SEEDED
+    # halt). A long idle read keeps the guard's own live sampling honestly
+    # quiet, exactly like every other "seeded, not live-detected" fixture
+    # in this suite.
+    presence = PresenceMonitor(idle_source=lambda: 999_999.0, platform="linux-x11")
     guard = CoexistenceGuard(presence=presence, release_all=lambda reason: [])
     guard.seed_halted(_halted_snapshot())
     computer._coexistence_guard = guard  # type: ignore[assignment]

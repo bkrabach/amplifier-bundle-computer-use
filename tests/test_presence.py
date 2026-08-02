@@ -31,6 +31,7 @@ import pytest
 from amplifier_module_tool_computer_use.presence import (
     GUARD_MS,
     LATCH_DECAY_SECONDS,
+    QUIET_FLOOR_SECONDS,
     Confidence,
     IdleUnreadableError,
     PresenceMonitor,
@@ -264,6 +265,57 @@ def test_idle_unreadable_raises_and_never_reports_quiet():
     with pytest.raises(IdleUnreadableError):
         monitor.sample()
     assert monitor.state is PresenceState.UNKNOWN
+
+
+# -- defect 1 regression: first-sample blindness (live safety defect, -----
+# -- fixed 2026-08-02) -------------------------------------------------------
+
+
+def test_first_sample_with_recent_idle_is_human_active_not_quiet():
+    """Reproduces the exact incident scenario verbatim: a guard's very
+    first sample, before it has ever injected anything, reading an idle
+    counter that says someone touched the machine 200ms ago. Pre-fix, this
+    incorrectly reported QUIET (margin_ms is None -> no reconciliation
+    possible -> defaulted to the permissive answer). A guard with no
+    injection history has zero evidence that recent input was its own, so
+    the safe reading is HUMAN_ACTIVE - this is the regression test for that
+    defect."""
+    mon = PresenceMonitor(platform="linux-x11", idle_source=lambda: 200.0)
+    snap = mon.sample()
+    assert snap.state is PresenceState.HUMAN_ACTIVE
+    assert snap.margin_ms is None
+    assert snap.confidence is Confidence.HIGH
+
+
+def test_first_sample_with_zero_idle_is_human_active():
+    """Idle=0 on a first sample is the most extreme case of the same
+    defect - the OS registered *something* right now, and this guard has
+    injected nothing yet, so it cannot possibly be attributed to us."""
+    mon = PresenceMonitor(platform="linux-x11", idle_source=lambda: 0.0)
+    snap = mon.sample()
+    assert snap.state is PresenceState.HUMAN_ACTIVE
+
+
+def test_first_sample_with_long_idle_is_still_honestly_quiet():
+    """The fix only changes the RECENT-idle case. A first sample reading a
+    genuinely long idle time (nothing has touched the machine, by anyone,
+    well past QUIET_FLOOR_SECONDS) remains QUIET, high confidence - not
+    every freshly constructed guard halts immediately."""
+    mon = PresenceMonitor(platform="linux-x11", idle_source=lambda: 5000.0)
+    snap = mon.sample()
+    assert snap.state is PresenceState.QUIET
+    assert snap.confidence is Confidence.HIGH
+
+
+def test_first_sample_at_exactly_quiet_floor_boundary_is_human_active():
+    """idle_ms exactly AT QUIET_FLOOR_SECONDS is not > the floor, so it
+    falls on the safe (HUMAN_ACTIVE) side of the boundary, matching the
+    strict `>` comparison `_classify` already uses."""
+    mon = PresenceMonitor(
+        platform="linux-x11", idle_source=lambda: QUIET_FLOOR_SECONDS * 1000.0
+    )
+    snap = mon.sample()
+    assert snap.state is PresenceState.HUMAN_ACTIVE
 
 
 # -- per-event sampling, not per-operation (\u00a75.2) ----------------------------

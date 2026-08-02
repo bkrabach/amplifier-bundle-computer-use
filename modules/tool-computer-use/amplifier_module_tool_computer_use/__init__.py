@@ -42,7 +42,7 @@ from amplifier_core.models import ToolResult
 from .backend import Backend, BackendError, MonitorInfo
 from .coexistence_guard import CoexistenceGuard, HaltedError
 from .geometry import Display, compute_display
-from .halt_state import load_halt, record_halt
+from .halt_state import load_halt, make_durable_halt_poll, record_halt
 from .imaging import capture_scaled_b64
 from .ledger import HeldInputLedger
 from .monitors import PRIMARY, VIRTUAL_DESKTOP, select_monitor
@@ -1312,6 +1312,13 @@ def _build_coexistence_guard(
         release_all=lambda reason: ledger.release_all(reason=reason),
         drive_anyway=bool(coexistence_cfg.get("drive_anyway", False)),
         target_source=target_source,
+        # Defect 2 fix: consult the durable halt record on every
+        # before_event(), not just once here at mount time - closes the
+        # window where a DIFFERENT session (same backend) detects a human
+        # and persists it AFTER this guard already mounted (see
+        # `halt_state.make_durable_halt_poll`'s docstring for the real
+        # evaluation evidence).
+        durable_halt_poll=make_durable_halt_poll(backend.name),
     )
     logger.info(
         "coexistence: guard built for backend %r (guard_ms=%.1f, measured=%s)",

@@ -32,7 +32,15 @@ from amplifier_module_tool_computer_use.target_binding import TargetChangedError
 class FakeClock:
     def __init__(self) -> None:
         self.now = 1000.0
-        self.last_input_at = self.now
+        # Starts already-quiet (well past QUIET_FLOOR_SECONDS), not "touched
+        # at the exact instant of construction" - a fresh guard's first-ever
+        # sample has no injection history to reconcile against (defect 1,
+        # `presence.py::_classify`), so an idle read this recent would now
+        # correctly be reported HUMAN_ACTIVE. These tests are about pause/
+        # exclusion/target-binding, not first-sample presence classification,
+        # so the fixture models a machine nobody has touched recently rather
+        # than accidentally exercising the defect-1 boundary on every test.
+        self.last_input_at = self.now - 10.0
 
     def advance(self, seconds: float) -> None:
         self.now += seconds
@@ -214,6 +222,86 @@ def test_seed_halted_survives_even_a_long_quiet_idle_read():
     clock.advance(120.0)  # far past LATCH_DECAY_SECONDS; idle_ms() stays huge -> quiet
     with pytest.raises(HaltedError):
         guard.before_event()  # live sample says quiet; seeded halt still wins
+
+
+# -- durable_halt_poll: cross-session halt escalation (defect 2 regression) --
+# -- live safety defect, fixed 2026-08-02 -------------------------------------
+
+
+def test_guard_mounted_before_a_durable_halt_exists_still_halts_on_next_event(
+    tmp_path,
+):
+    """Reproduces the exact incident: a guard (standing in for the root
+    session's `computer` tool) mounts while NO durable halt record exists
+    for its backend yet - its own live presence stays quiet the whole time
+    (`idle_source` always reports a huge idle, exactly like a session that
+    never sees a human directly). A DIFFERENT session (standing in for the
+    sub-agent) then detects a human and persists it via `record_halt` -
+    something this guard's mount-time seed could never have seen, because
+    it happened afterward. Pre-fix, this guard had no way to learn about
+    that: `seed_halted` was consulted only once, at construction. Post-fix,
+    `durable_halt_poll` (wired to `halt_state.make_durable_halt_poll` in
+    production, `__init__.py::_build_coexistence_guard`) must escalate this
+    guard to halted on its very next `before_event()` call - not the 10
+    writes the real incident showed executing over the next ~55s."""
+    from amplifier_module_tool_computer_use.halt_state import (
+        make_durable_halt_poll,
+        record_halt,
+    )
+
+    monitor = PresenceMonitor(idle_source=lambda: 999_999.0, platform="linux-x11")
+    guard = CoexistenceGuard(
+        presence=monitor,
+        release_all=lambda reason: [],
+        durable_halt_poll=make_durable_halt_poll("linux-x11", state_dir=tmp_path),
+    )
+
+    # Mount-time / early session: no durable record yet - writes proceed.
+    guard.before_event()
+    guard.after_event()
+    assert guard.halted is False
+
+    # The OTHER session's guard (not this one) detects a human and persists
+    # the halt - this is the exact write `ComputerTool.execute()` performs
+    # from its `except HaltedError` handler.
+    persisted_snapshot = PresenceSnapshot(
+        state=PresenceState.HUMAN_ACTIVE,
+        confidence=Confidence.HIGH,
+        basis="idle_reconciliation",
+        last_human_input_ago_ms=12.0,
+        margin_ms=30.0,
+        guard_ms=5.0,
+        guard_measured=True,
+        sample_interval_ms=60.0,
+        latched_until_ms=None,
+    )
+    record_halt(
+        "linux-x11", persisted_snapshot, reason="halted: test", state_dir=tmp_path
+    )
+
+    # This guard's NEXT write must halt - no new mount, no new guard, and
+    # its OWN live presence sample is still (falsely) quiet the whole time.
+    with pytest.raises(HaltedError):
+        guard.before_event()
+    assert guard.halted is True
+
+    # Sticky afterward, same as every other halt path.
+    with pytest.raises(HaltedError):
+        guard.before_event()
+
+
+def test_durable_halt_poll_none_is_a_complete_no_op():
+    """Every caller/test that predates defect 2's fix never supplies
+    `durable_halt_poll` - confirm the default leaves behavior byte-for-byte
+    unchanged: a guard with no durable-halt wiring at all never halts from
+    this mechanism, no matter how many events pass."""
+    clock = FakeClock()
+    guard, _released = make_guard(clock)
+    assert guard.durable_halt_poll is None
+    for _ in range(5):
+        guard.before_event()
+        guard.after_event()
+    assert guard.halted is False
 
 
 # -- as_dict / presence envelope ----------------------------------------------

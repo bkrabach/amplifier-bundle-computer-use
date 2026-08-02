@@ -73,6 +73,12 @@ def test_init_signature_has_no_halt_disabling_parameter():
         "release_all",
         "drive_anyway",
         "target_source",
+        # Defect 2 fix: consulted every before_event() call for a durable,
+        # cross-session halt record - can only ever ESCALATE via
+        # seed_halted() (additive-only, never a clear), so it cannot
+        # disable the halt invariant either - see coexistence_guard.py's
+        # `_poll_durable_halt` and the field's own docstring.
+        "durable_halt_poll",
         "pause",
         "exclusion",
         "binding",

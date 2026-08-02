@@ -50,6 +50,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -251,3 +252,51 @@ def list_halted_platforms(*, state_dir: Path = DEFAULT_STATE_DIR) -> list[str]:
     if not state_dir.exists():
         return []
     return sorted(p.stem for p in state_dir.glob("*.json"))
+
+
+def make_durable_halt_poll(
+    platform: str, *, state_dir: Path = DEFAULT_STATE_DIR
+) -> Callable[[], PresenceSnapshot | None]:
+    """Build a cheap, per-event-safe poll for `CoexistenceGuard.before_event()`
+    (defect 2 - live safety defect, fixed 2026-08-02).
+
+    Before this existed, the durable halt record was only ever consulted
+    once, at mount time (`_build_coexistence_guard` in `__init__.py`). A
+    guard mounted BEFORE some other session (e.g. a sub-agent, same backend)
+    wrote a halt record could never learn about it - it kept its own
+    in-memory `_halted=False` for its entire life, and every write it made
+    after that point succeeded, exactly the defect this closes (see the
+    module docstring above for the real evaluation evidence).
+
+    The fix is to poll on every `before_event()` call, not just at
+    construction - but `load_halt()` does a full file read + JSON parse,
+    which is not something to pay on every elementary injected event
+    (`docs/designs/coexistence.md` \u00a75's per-sample cost budget: this
+    mechanism already does an in-process idle read on that same hot path,
+    and is sized in microseconds, not milliseconds). This closure keeps the
+    common case - no halt has ever been recorded for this platform - down
+    to exactly one `Path.stat()` syscall: `FileNotFoundError` short-circuits
+    before any read or parse happens. The heavier `load_halt()` path runs at
+    most ONCE per guard's lifetime: the moment it does run, the caller is
+    expected to call `CoexistenceGuard.seed_halted()` (additive-only, never
+    a clear), which flips `_halted` to `True` permanently - `before_event()`
+    stops calling this poll at all once halted (see its own docstring), so
+    there is nothing left to poll for the rest of that guard's life either
+    way.
+
+    Returns `None` when there is nothing to report (no record, or the
+    caller should keep going) - never raises for the common "no file" case,
+    since that is not a failure, it is the ordinary state of a machine
+    nobody has been detected on.
+    """
+
+    def _poll() -> PresenceSnapshot | None:
+        path = _path_for(platform, state_dir)
+        try:
+            path.stat()
+        except FileNotFoundError:
+            return None
+        persisted = load_halt(platform, state_dir=state_dir)
+        return persisted.to_snapshot() if persisted is not None else None
+
+    return _poll

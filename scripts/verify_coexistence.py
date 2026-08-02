@@ -248,7 +248,10 @@ def _run_one_trial(
 
 def _run_gate(n_trials: int, display_name: str) -> int:
     from amplifier_module_tool_computer_use.linux_x11 import LinuxX11Backend
-    from amplifier_module_tool_computer_use.presence import GUARD_MS
+    from amplifier_module_tool_computer_use.presence import (
+        GUARD_MS,
+        QUIET_FLOOR_SECONDS,
+    )
 
     backend = LinuxX11Backend({"display": display_name})
     probe = backend.probe()
@@ -262,17 +265,50 @@ def _run_gate(n_trials: int, display_name: str) -> int:
     tmp_dir = Path(f"/tmp/verify_coexistence_{os.getpid()}")
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
+    # Settle gap between trials (defect 1's fix, presence.py::_classify):
+    # each trial constructs a brand-new PresenceMonitor with no injection
+    # history of its own, but all trials share ONE live display whose real
+    # idle counter does not reset between them. Back-to-back trials with no
+    # gap would let trial N's own synthetic typing (or its human-inject
+    # subprocess's event) still be "recent" idle when trial N+1's guard
+    # takes its first-ever sample - exactly the ambiguous case defect 1's
+    # fix now correctly refuses to call QUIET, so it reports HUMAN_ACTIVE
+    # for something that was actually this SAME harness's own prior trial,
+    # not a real human. That is a real property of the fix (see this
+    # method's own defect-1 comment above), not a bug in it - but it is
+    # also not what this gate measures (the human-inject subprocess for
+    # THIS trial hasn't even fired yet in that case). A settle gap longer
+    # than QUIET_FLOOR_SECONDS between trials gives each trial a genuinely
+    # quiet baseline before its own timed window starts, matching a real
+    # session boundary (see `halt_state.py`'s own evaluation evidence: a
+    # real handoff between sessions was ~80s apart, not milliseconds).
+    settle_s = QUIET_FLOOR_SECONDS + 0.5
+
     results: list[TrialResult] = []
     t_gate_start = time.monotonic()
     for i in range(n_trials):
+        if i > 0:
+            time.sleep(settle_s)
         result = _run_one_trial(i, backend, display_name, tmp_dir)
         results.append(result)
         status = "DETECTED" if result.detected else "MISSED"
+        # Defect 1's fix (presence.py::_classify) makes a genuine, correct
+        # detection possible with `margin_ms=None`: a human event landing
+        # before this guard's very first `record_inject()` call (e.g. before
+        # the agent has typed even its first character this trial) has no
+        # `our_last_inject` to compute a margin against - the fix reports
+        # HUMAN_ACTIVE anyway (see that method's docstring), but there is no
+        # margin number to print. Report that plainly rather than crashing
+        # the gate on a `None`-format - detected-with-no-margin is a real,
+        # valid outcome now, not a formatting oversight to hide.
+        margin_repr = (
+            f"{result.margin_ms:+.2f}ms" if result.margin_ms is not None else "n/a"
+        )
         print(
             f"trial {i + 1:>3}/{n_trials}: delay={result.human_delay_s:6.3f}s "
             f"chars_typed={result.chars_typed:>4} {status}"
             + (
-                f" margin={result.margin_ms:+.2f}ms latency={result.detection_latency_ms:.2f}ms"
+                f" margin={margin_repr} latency={result.detection_latency_ms:.2f}ms"
                 if result.detected and result.detection_latency_ms is not None
                 else ""
             )

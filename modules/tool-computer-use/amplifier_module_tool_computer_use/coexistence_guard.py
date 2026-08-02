@@ -108,6 +108,20 @@ class CoexistenceGuard:
     #: `type_text` implementation does not need to know target binding exists
     #: at all (\u00a78.6).
     target_source: Callable[[], str | None] | None = None
+    #: Defect 2 fix (live safety defect, fixed 2026-08-02): optional callable
+    #: consulted on every `before_event()` call (while this guard is not yet
+    #: halted) for a durable, cross-session halt record that may have
+    #: appeared SINCE this guard was constructed - e.g. a different session's
+    #: guard, same backend, detected a human and persisted it after this one
+    #: already mounted. `None` (the default, and every existing caller/test
+    #: that predates this fix) makes this a complete no-op, identical to
+    #: before defect 2 was closed - only `_build_coexistence_guard` in
+    #: `__init__.py` supplies a real one
+    #: (`halt_state.make_durable_halt_poll`). Additive only: a non-`None`
+    #: result here can only ever call `seed_halted()`, which can only ever
+    #: escalate `_halted` from `False` to `True`, never the reverse - the
+    #: same one-way-latch property `seed_halted()` already documents.
+    durable_halt_poll: Callable[[], PresenceSnapshot | None] | None = None
     pause: PauseController = field(default_factory=PauseController)
     exclusion: ExclusionZone = field(default_factory=ExclusionZone)
     binding: TargetBinding = field(default_factory=TargetBinding)
@@ -178,7 +192,14 @@ class CoexistenceGuard:
         it - `presence.sample()` raises `IdleUnreadableError` rather than
         guessing, and this method does not catch it: an existing halt is
         never cleared just because a later sample "couldn't tell".
+
+        Defect 2 fix (live safety defect, fixed 2026-08-02): before sampling
+        live presence, poll `durable_halt_poll` (if one was supplied) for a
+        cross-session halt record that may have appeared since this guard
+        was constructed - see `_poll_durable_halt` and the field's own
+        docstring above.
         """
+        self._poll_durable_halt()
         snap = self.presence.sample()
         if snap.state is PresenceState.HUMAN_ACTIVE:
             self._halted = True
@@ -224,6 +245,25 @@ class CoexistenceGuard:
         """
         self._halted = True
         self._halt_snapshot = snapshot
+
+    def _poll_durable_halt(self) -> None:
+        """Defect 2 fix (live safety defect, fixed 2026-08-02): escalate to
+        halted if a durable, cross-session halt record has appeared since
+        this guard was constructed.
+
+        A no-op in three cases, all deliberate: no `durable_halt_poll` was
+        supplied (every caller/test that predates this fix - unchanged
+        behavior); this guard is already halted (nothing further to detect,
+        and it never gets this far again - `before_event()` raises before
+        reaching this call); or the poll itself reports nothing new. Calling
+        `seed_halted()` here is safe by construction - see that method's own
+        docstring for why it can only ever escalate, never clear.
+        """
+        if self._halted or self.durable_halt_poll is None:
+            return
+        persisted = self.durable_halt_poll()
+        if persisted is not None:
+            self.seed_halted(persisted)
 
     def after_event(self) -> None:
         """Call immediately after every elementary injected event (right

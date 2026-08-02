@@ -18,6 +18,7 @@ from amplifier_module_tool_computer_use.halt_state import (
     clear_halt,
     list_halted_platforms,
     load_halt,
+    make_durable_halt_poll,
     record_halt,
 )
 from amplifier_module_tool_computer_use.presence import (
@@ -160,6 +161,43 @@ def test_corrupt_record_fails_safe_not_silent(tmp_path: Path) -> None:
 
     assert loaded is not None  # never silently treated as "no halt occurred"
     assert "corrupt" in loaded.reason.lower()
+
+
+# -- make_durable_halt_poll: the defect 2 per-event poll --------------------
+
+
+def test_durable_halt_poll_returns_none_when_no_record_exists(tmp_path: Path) -> None:
+    """The common case - nobody has ever been detected on this backend -
+    costs one `Path.stat()` (`FileNotFoundError`), never a read or parse."""
+    poll = make_durable_halt_poll("linux-x11", state_dir=tmp_path)
+    assert poll() is None
+    assert poll() is None  # repeatable; still no record
+
+
+def test_durable_halt_poll_returns_a_snapshot_once_a_record_appears(
+    tmp_path: Path,
+) -> None:
+    """Once a record is written (e.g. by a DIFFERENT session's guard, same
+    backend), the poll must report it - honestly labelled `PERSISTED_BASIS`,
+    never as a fresh live sample."""
+    poll = make_durable_halt_poll("linux-x11", state_dir=tmp_path)
+    assert poll() is None
+
+    record_halt("linux-x11", _snapshot(), reason="halted: test", state_dir=tmp_path)
+
+    snap = poll()
+    assert snap is not None
+    assert snap.state == PresenceState.HUMAN_ACTIVE
+    assert snap.basis == PERSISTED_BASIS
+    assert snap.margin_ms == 30.0
+
+
+def test_durable_halt_poll_is_isolated_per_platform(tmp_path: Path) -> None:
+    linux_poll = make_durable_halt_poll("linux-x11", state_dir=tmp_path)
+    macos_poll = make_durable_halt_poll("macos", state_dir=tmp_path)
+    record_halt("linux-x11", _snapshot(), reason="linux halt", state_dir=tmp_path)
+    assert linux_poll() is not None
+    assert macos_poll() is None
 
 
 def test_persisted_halt_round_trip_dict() -> None:

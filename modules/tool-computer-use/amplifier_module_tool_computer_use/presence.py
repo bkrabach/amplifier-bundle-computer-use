@@ -368,11 +368,23 @@ class PresenceMonitor:
         taken".
         """
         if margin_ms is None:
-            # Never injected yet: treat purely as a quiet/idle read, no
-            # reconciliation possible.
+            # Defect 1 (live safety defect, fixed 2026-08-02): never injected
+            # yet means this guard has NO `our_last_inject` to reconcile
+            # `idle_ms` against - it has zero evidence that any recent input
+            # was its own. Reporting `QUIET` here on a small `idle_ms` (the
+            # pre-fix behavior) infers "nobody's there" from "we have no
+            # information either way" - exactly backwards for a safety gate
+            # (absence of evidence is not evidence of absence). Only a
+            # genuinely long idle read - nothing has touched the machine
+            # recently, by anyone, for at least QUIET_FLOOR_SECONDS - is
+            # honestly QUIET on a first sample; anything more recent than
+            # that can only be attributed to something else, since we have
+            # not yet injected anything ourselves, so it is HUMAN_ACTIVE at
+            # high confidence, the same fail-safe direction section 9.6
+            # already takes for an unreadable idle counter.
             if idle_ms > QUIET_FLOOR_SECONDS * 1000.0:
                 return PresenceState.QUIET, Confidence.HIGH
-            return PresenceState.QUIET, Confidence.LOW
+            return PresenceState.HUMAN_ACTIVE, Confidence.HIGH
 
         if margin_ms > self.guard_ms:
             return PresenceState.HUMAN_ACTIVE, Confidence.HIGH
