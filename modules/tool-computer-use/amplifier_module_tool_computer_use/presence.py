@@ -143,7 +143,26 @@ GUARD_MEASURED: dict[str, bool] = {
     # the measurement tightened it. Intra-`type_text` detection remains not
     # viable on Windows at any of these bands (masked fraction 20/60 = 33% at
     # production cadence) - unchanged conclusion, now evidence-backed.
-    "windows-wsl2": True,
+    # REVERTED to False 2026-08-02. A 900-sample run reported max=16.000ms
+    # across three independent 300-sample runs - internally coherent, and
+    # exactly the documented `GetTickCount` tick ceiling, so quite possibly
+    # correct. But it has never been INDEPENDENTLY reproduced, and two
+    # attempts to reproduce it both failed on harness bugs, not on the system:
+    #   (a) measuring `dwTime - t_inject` directly returned all-negative values
+    #       (min -59969ms) - the injection had not landed before the read, so
+    #       the sample reflected the PREVIOUS input, not ours.
+    #   (b) polling until `dwTime` caught up returned p50=407ms / max=453ms -
+    #       that is PowerShell's interpreted spin-loop cost (one marshalled
+    #       P/Invoke per iteration), not Win32 latency, which resolves in
+    #       microseconds.
+    # This flag's whole purpose is to keep MEASURED apart from INFERRED. An
+    # unreproduced number is inference no matter how plausible it looks, so
+    # this stays False until someone reproduces it with a harness that is
+    # itself validated - e.g. a compiled/native timing loop, or timing done
+    # inside `bridge.ps1` rather than across an interpreted loop.
+    # GUARD_MS stays at 20.0: it is the conservative direction (wider band =
+    # fewer false halts) and nothing about the shipped value is unsafe.
+    "windows-wsl2": False,
     # O4: measured directly on a live MacBook (macOS 26.6 arm64) - 300 samples,
     # max 8.56ms, and a 10ms band with 0/300 false positives. This is the
     # strongest evidence of the three platforms.
