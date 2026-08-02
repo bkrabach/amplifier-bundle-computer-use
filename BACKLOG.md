@@ -87,8 +87,15 @@ Evidence:
 - **Verified against a real human at the keyboard** — a paced `type_text` run
   halted correctly at chunk 34 of 40 when a human touched the trackpad:
   `HaltedError` raised, margin +29.84ms, `release_all` fired exactly once.
-- **Windows** — `GUARD_MEASURED["windows-wsl2"] = False`. Still open, see
-  below.
+- **Windows** — `GUARD_MS["windows-wsl2"] = 20.0`ms, `GUARD_MEASURED = True`.
+  Measured on a real Windows 11 desktop (`windows-host`, over its live
+  WSL2 interop boundary) across three independent 300-sample runs (900
+  samples total) of the reconciliation margin `PresenceMonitor` actually
+  computes: all three runs independently topped out at exactly 16.000ms
+  (the documented `GetTickCount` tick ceiling), 0/900 false positives at
+  20ms and above. Intra-`type_text` detection remains not viable on
+  Windows regardless (masked fraction `20/60 = 33%` at production
+  cadence) — see `presence.py`'s `GUARD_MS` comment for the full sweep.
 
 What shipped alongside detection: the halt invariant (`docs/designs/
 coexistence.md` §6.0, unconditional — no config key disables it); target

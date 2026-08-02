@@ -207,6 +207,24 @@ class CoexistenceGuard:
             self.release_all("target_changed")
             raise
 
+    def seed_halted(self, snapshot: PresenceSnapshot) -> None:
+        """Mark this guard as already-halted, from construction, because a
+        durable record says a human was detected in a PRIOR session on this
+        same target and has not yet been explicitly cleared (\\u00a713, D3 -
+        see `halt_state.py`).
+
+        This is an ADDITIVE seed, never a clear: it can only ever cause
+        `before_event()` to raise `HaltedError` sooner (immediately, on this
+        guard's very first call) than it otherwise would - it has no way to
+        make a guard less halted, and does not affect the sticky, one-way
+        nature of `_halted` at all. `test_halt_invariant.py`'s
+        `test_no_way_to_clear_a_latched_halt_from_the_guard_itself` still
+        holds: this method's name is not in that forbidden set, and calling
+        it can only ever add a halt, never remove one.
+        """
+        self._halted = True
+        self._halt_snapshot = snapshot
+
     def after_event(self) -> None:
         """Call immediately after every elementary injected event (right
         around the injection syscall, \u00a75.2): record our own injection

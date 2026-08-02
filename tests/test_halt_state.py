@@ -1,0 +1,176 @@
+"""Unit tests for `halt_state.py` - the durable, cross-session halt memory
+that closes defect 2 (`docs/designs/coexistence.md` \u00a713 D3): resume after a
+human-detected halt must require an explicit signal, not the mere passage
+of time.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
+
+from amplifier_module_tool_computer_use.halt_state import (
+    PERSISTED_BASIS,
+    PersistedHalt,
+    clear_halt,
+    list_halted_platforms,
+    load_halt,
+    record_halt,
+)
+from amplifier_module_tool_computer_use.presence import (
+    Confidence,
+    PresenceSnapshot,
+    PresenceState,
+)
+
+
+def _snapshot() -> PresenceSnapshot:
+    return PresenceSnapshot(
+        state=PresenceState.HUMAN_ACTIVE,
+        confidence=Confidence.HIGH,
+        basis="idle_reconciliation",
+        last_human_input_ago_ms=12.0,
+        margin_ms=30.0,
+        guard_ms=5.0,
+        guard_measured=True,
+        sample_interval_ms=60.0,
+        latched_until_ms=1234.0,
+    )
+
+
+# -- no record: the common, unslowed case ------------------------------------
+
+
+def test_no_record_means_no_halt(tmp_path: Path) -> None:
+    """A machine nobody has ever been detected on pays nothing - `load_halt`
+    returns `None`, not a default record."""
+    assert load_halt("linux-x11", state_dir=tmp_path) is None
+    assert list_halted_platforms(state_dir=tmp_path) == []
+
+
+# -- record / load round trip ------------------------------------------------
+
+
+def test_record_then_load_round_trips(tmp_path: Path) -> None:
+    record_halt(
+        "linux-x11", _snapshot(), reason="halted: test reason", state_dir=tmp_path
+    )
+    loaded = load_halt("linux-x11", state_dir=tmp_path)
+    assert loaded is not None
+    assert loaded.platform == "linux-x11"
+    assert loaded.reason == "halted: test reason"
+    assert loaded.margin_ms == 30.0
+    assert loaded.guard_ms == 5.0
+    assert loaded.guard_measured is True
+    assert loaded.last_human_input_ago_ms == 12.0
+    assert list_halted_platforms(state_dir=tmp_path) == ["linux-x11"]
+
+
+def test_persisted_halt_to_snapshot_is_honestly_labelled(tmp_path: Path) -> None:
+    """The rebuilt snapshot must never claim to be a fresh live sample -
+    `basis` distinguishes a durable memory from `idle_reconciliation`."""
+    record_halt("linux-x11", _snapshot(), reason="r", state_dir=tmp_path)
+    loaded = load_halt("linux-x11", state_dir=tmp_path)
+    assert loaded is not None
+    snap = loaded.to_snapshot()
+    assert snap.state is PresenceState.HUMAN_ACTIVE
+    assert snap.confidence is Confidence.HIGH
+    assert snap.basis == PERSISTED_BASIS
+    assert snap.basis != "idle_reconciliation"
+    assert snap.margin_ms == 30.0
+    assert snap.guard_ms == 5.0
+
+
+# -- separate platforms are isolated -----------------------------------------
+
+
+def test_different_platforms_do_not_collide(tmp_path: Path) -> None:
+    record_halt("linux-x11", _snapshot(), reason="linux halt", state_dir=tmp_path)
+    assert load_halt("macos", state_dir=tmp_path) is None
+    record_halt("macos", _snapshot(), reason="macos halt", state_dir=tmp_path)
+    linux = load_halt("linux-x11", state_dir=tmp_path)
+    macos = load_halt("macos", state_dir=tmp_path)
+    assert linux is not None and linux.reason == "linux halt"
+    assert macos is not None and macos.reason == "macos halt"
+    assert sorted(list_halted_platforms(state_dir=tmp_path)) == ["linux-x11", "macos"]
+
+
+# -- clear_halt: the ONLY resume path ----------------------------------------
+
+
+def test_clear_halt_removes_the_record(tmp_path: Path) -> None:
+    record_halt("linux-x11", _snapshot(), reason="r", state_dir=tmp_path)
+    assert load_halt("linux-x11", state_dir=tmp_path) is not None
+
+    cleared = clear_halt("linux-x11", state_dir=tmp_path)
+
+    assert cleared is True
+    assert load_halt("linux-x11", state_dir=tmp_path) is None
+    assert list_halted_platforms(state_dir=tmp_path) == []
+
+
+def test_clear_halt_on_nonexistent_record_returns_false(tmp_path: Path) -> None:
+    assert clear_halt("linux-x11", state_dir=tmp_path) is False
+
+
+# -- passage of time alone never clears it -----------------------------------
+
+
+def test_record_halt_has_no_expiry_parameter() -> None:
+    """`record_halt`/`load_halt` must not accept anything shaped like a TTL
+    or expiry - the whole point of this module is that ONLY `clear_halt`
+    (an explicit human action) removes a record, never elapsed wall time."""
+    import inspect
+
+    for fn in (record_halt, load_halt):
+        params = set(inspect.signature(fn).parameters)
+        for forbidden in ("ttl", "expiry", "expires", "max_age", "decay"):
+            assert not any(forbidden in p.lower() for p in params), (
+                f"{fn.__name__} exposes a time-based expiry parameter "
+                f"({params}) - resume must require an explicit signal, not "
+                "the mere passage of time"
+            )
+
+
+def test_repeated_record_halt_does_not_expire_or_reset(tmp_path: Path) -> None:
+    """Calling `record_halt` again (e.g. a second `HaltedError` in the same
+    still-halted session) must not somehow start a decay clock - the record
+    stays exactly as latched as it was the first time."""
+    record_halt("linux-x11", _snapshot(), reason="first", state_dir=tmp_path)
+    record_halt("linux-x11", _snapshot(), reason="second", state_dir=tmp_path)
+    loaded = load_halt("linux-x11", state_dir=tmp_path)
+    assert loaded is not None
+    assert loaded.reason == "second"  # latest fact, but still latched
+    # Still requires an explicit clear - re-recording is not a clear.
+    assert list_halted_platforms(state_dir=tmp_path) == ["linux-x11"]
+
+
+# -- corrupt record: fail safe (still latched), never silently "no halt" ----
+
+
+def test_corrupt_record_fails_safe_not_silent(tmp_path: Path) -> None:
+    state_dir = tmp_path
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "linux-x11.json").write_text("{not valid json", encoding="utf-8")
+
+    loaded = load_halt("linux-x11", state_dir=state_dir)
+
+    assert loaded is not None  # never silently treated as "no halt occurred"
+    assert "corrupt" in loaded.reason.lower()
+
+
+def test_persisted_halt_round_trip_dict() -> None:
+    original = PersistedHalt(
+        platform="linux-x11",
+        detected_at=1000.0,
+        reason="halted: r",
+        last_human_input_ago_ms=12.0,
+        margin_ms=30.0,
+        guard_ms=5.0,
+        guard_measured=True,
+    )
+    restored = PersistedHalt.from_dict(original.to_dict())
+    assert restored == original

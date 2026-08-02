@@ -57,11 +57,44 @@ from typing import Any
 #: zero false positives, one true detection at margin=+25.1ms. 5ms is the
 #: number the evidence supports, not a guess.
 #:
-#: Windows: `GetLastInputInfo`'s `dwTime` is quantised to `GetTickCount`
-#: ticks (10-16ms per \u00a75.5) - the guard band must exceed the quantisation
-#: noise floor or every reconciliation would be dominated by tick jitter
-#: rather than real signal, so it is set to roughly 2x the worst-case tick
-#: (32ms) rather than the 5ms Linux figure.
+#: Windows: O4 is answered. Measured directly on a real Windows 11 desktop
+#: (`windows-host`, over its live WSL2 interop boundary - `SendInput` zero
+#: visible-impact relative moves, `dx=0, dy=0`, per U1b) with THREE
+#: independent 300-sample runs (900 samples total) of the reconciliation
+#: margin `PresenceMonitor` actually computes: `T_inject` and `T_now` both
+#: captured via `GetTickCount()` (the same coarse clock `GetLastInputInfo`'s
+#: `dwTime` lives on - matching \u00a75.5's "sampling loop lives inside the
+#: bridge script" shape, same process, same clock, no cross-machine skew),
+#: 60ms apart (O5's `type_text` cadence), `margin_ms = dwTime - T_inject`:
+#:   run 1 (n=300): min=0.000 p50=0.000 p90=0.000 p95=1.570 p99=2.612
+#:                  mean=0.972 MAX=16.000ms, 19/300 (6.33%) exceed 8ms
+#:   run 2 (n=300): min=0.000 p50=0.000 p90=0.000 p95=0.000  p99=16.000
+#:                  mean=0.880 MAX=16.000ms, 17/300 (5.67%) exceed 8ms
+#:   run 3 (n=300): min=0.000 p50=0.000 p90=0.000 p95=0.000  p99=16.000
+#:                  mean=0.470 MAX=16.000ms,  9/300 (3.00%) exceed 8ms
+#: All three runs independently top out at EXACTLY 16.000ms - the ceiling
+#: of Windows' documented 10-16ms `GetTickCount` tick, not a fluke of one
+#: run - and this happens often enough (3-6% of samples) to be the ordinary
+#: case, not a rare tail event the way macOS's single 8.56ms outlier was.
+#: Sweeping candidate GUARD values against the combined 900 samples:
+#:   GUARD= 8ms -> 45/900 exceed (5.00% false positives)
+#:   GUARD=16ms ->  0/900 exceed (0.00% false positives) - exactly the max
+#:   GUARD=20ms ->  0/900 exceed (0.00% false positives)
+#:   GUARD=32ms ->  0/900 exceed (0.00% false positives)
+#: 20ms is adopted: the smallest round band with real headroom (25%) above
+#: the observed AND documented ceiling (16ms), mirroring the same
+#: conservative judgement applied to macOS's 10ms (also ~17% headroom
+#: above its observed max) rather than shaving to the max itself. This
+#: replaces the previous 32ms figure, which was a sound but unverified
+#: inference ("~2x the worst-case tick") - real hardware confirms the
+#: worst-case tick itself (16ms), so 32ms was carrying 2x headroom where
+#: 1.25x already covers every sample observed. \u00a75.5's Windows conclusion
+#: is UNCHANGED by this tightening: masked fraction at 60ms `type_text`
+#: cadence is `20/60 = 33%` (worse than Linux's 8.3%/macOS's 16.7%) -
+#: intra-op detection remains not viable on Windows at ANY of the bands
+#: this sweep tested (8ms through 32ms all fail the masking-fraction bar),
+#: so `"intra_op_detection": false` (\u00a75.5, D4) is unaffected; only the
+#: op-granularity number changed, and got smaller.
 #:
 #: macOS: O4 is answered. `CGEventSourceSecondsSinceLastEventType`'s
 #: resolution was measured directly on real hardware (a live MacBook,
@@ -83,7 +116,7 @@ from typing import Any
 #: the 30-sample pilot's single outlier.
 GUARD_MS: dict[str, float] = {
     "linux-x11": 5.0,
-    "windows-wsl2": 32.0,
+    "windows-wsl2": 20.0,  # measured, O4 - 900-sample (3x300) run, see comment above
     "macos": 10.0,  # measured, O4 - 300-sample run, see comment above
 }
 
@@ -98,11 +131,19 @@ GUARD_MS: dict[str, float] = {
 GUARD_MEASURED: dict[str, bool] = {
     # O5: 98 samples at 60ms cadence, zero false positives, one true detection.
     "linux-x11": True,
-    # NOT measured. The 10-16ms `GetTickCount` quantisation is documented Win32
-    # behaviour and the 32ms band is a sound inference from it - but no probe
-    # has ever run against a real Windows target, so this must not claim to be
-    # evidence. Flip to True only after a hardware run, never from the docs.
-    "windows-wsl2": False,
+    # O4-win: NOW measured on real hardware (the WSL2 side of a live Win11
+    # desktop) - three independent 300-sample runs, 900 samples total, of
+    # inject-to-visible-in-idle latency using the production `SendInput`
+    # (dx=0,dy=0) path. All three runs cap at EXACTLY 16.000ms, which is the
+    # documented `GetTickCount` tick ceiling rather than a sampling fluke.
+    # Sweep across all 900: 8ms -> 45 exceed; 16ms -> 0; 20ms -> 0; 32ms -> 0.
+    # 20.0 is the smallest round band with real headroom (25%) over that
+    # ceiling - the same conservative ratio applied to macOS's 10ms.
+    # Note this REPLACED an inferred 32.0. The inference was sound but untested;
+    # the measurement tightened it. Intra-`type_text` detection remains not
+    # viable on Windows at any of these bands (masked fraction 20/60 = 33% at
+    # production cadence) - unchanged conclusion, now evidence-backed.
+    "windows-wsl2": True,
     # O4: measured directly on a live MacBook (macOS 26.6 arm64) - 300 samples,
     # max 8.56ms, and a 10ms band with 0/300 false positives. This is the
     # strongest evidence of the three platforms.

@@ -40,8 +40,9 @@ from typing import Any
 from amplifier_core.models import ToolResult
 
 from .backend import Backend, BackendError, MonitorInfo
-from .coexistence_guard import CoexistenceGuard
+from .coexistence_guard import CoexistenceGuard, HaltedError
 from .geometry import Display, compute_display
+from .halt_state import load_halt, record_halt
 from .imaging import capture_scaled_b64
 from .ledger import HeldInputLedger
 from .monitors import PRIMARY, VIRTUAL_DESKTOP, select_monitor
@@ -301,6 +302,14 @@ class ComputerTool:
         # not (yet) exist - see `presence.GUARD_MEASURED` - so this feature
         # never claims detection it cannot back with evidence.
         self._coexistence_guard: CoexistenceGuard | None = None
+        # Defect 1 (halt surfacing): every `HaltedError` this session hits is
+        # recorded here (`execute()`), and `hook-computer-use` reads this
+        # list on every `tool:post` to inject a standing reminder into the
+        # model's own context - a halted session must not be able to close
+        # out a turn without the fact in front of it. Never cleared during a
+        # session; a session in which a halt fired stays flagged for the
+        # rest of that session, on purpose (see hook module docstring).
+        self.halt_notices: list[dict[str, Any]] = []
         # Cached once so the hot path (`_run`, the `type` action) never pays
         # an `inspect.signature` call per keystroke - only backends that
         # accept `type_text(text, guard=...)` (Linux X11 today) get
@@ -972,6 +981,29 @@ class ComputerTool:
             # Cheap locally too - `asyncio.to_thread` on a microsecond-scale
             # X11/Quartz call costs a thread-pool round trip, not a network one.
             summary, image_b64 = await asyncio.to_thread(self._run, action, input)
+        except HaltedError as exc:
+            # Defect 1 + defect 2 (docs/designs/coexistence.md \u00a76.0/\u00a713 D3):
+            # a halt must (a) be impossible for the model to silently drop
+            # from its final report, and (b) survive past this session's own
+            # lifetime rather than resuming on the next mount with no human
+            # ever choosing to resume anything. Both start here, at the one
+            # place every `HaltedError` - from any action, any code path -
+            # is guaranteed to surface.
+            self.halt_notices.append(
+                {
+                    "at": time.time(),
+                    "action": action,
+                    "message": str(exc),
+                    "margin_ms": exc.snapshot.margin_ms,
+                    "guard_ms": exc.snapshot.guard_ms,
+                    "last_human_input_ago_ms": exc.snapshot.last_human_input_ago_ms,
+                }
+            )
+            backend_name = getattr(self._backend, "name", "unknown")
+            record_halt(backend_name, exc.snapshot, reason=str(exc))
+            return ToolResult(
+                success=False, error={"message": str(exc), "type": type(exc).__name__}
+            )
         except (BackendError, ValueError) as exc:
             return ToolResult(
                 success=False, error={"message": str(exc), "type": type(exc).__name__}
@@ -1287,6 +1319,27 @@ def _build_coexistence_guard(
         presence.guard_ms,
         presence.guard_measured,
     )
+    # Defect 2 fix: a brand-new guard has no memory of a human detected in a
+    # PRIOR session against this same backend - `_halted` is a plain
+    # in-memory field on an object that stops existing when its mount does
+    # (see `halt_state.py` module docstring for the real evaluation evidence
+    # this closes: a halted sub-agent session ended, its parent session
+    # mounted its OWN fresh guard, and writes resumed automatically ~80s
+    # later with no human ever choosing to resume anything). If a durable
+    # halt record exists for this backend, seed this guard already-halted -
+    # the ONLY way past it is `scripts/resume_after_halt.py`, an explicit
+    # human action, never the mere passage of time.
+    persisted = load_halt(backend.name)
+    if persisted is not None:
+        guard.seed_halted(persisted.to_snapshot())
+        logger.warning(
+            "coexistence: backend %r has a durable halt record from a prior "
+            "session (reason=%r) - this session starts already HALTED; run "
+            "scripts/resume_after_halt.py to clear it explicitly "
+            "(docs/designs/coexistence.md \u00a713 D3)",
+            backend.name,
+            persisted.reason,
+        )
     return guard
 
 

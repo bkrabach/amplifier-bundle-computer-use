@@ -45,6 +45,11 @@ try:
 except ImportError:  # pragma: no cover
     TOOL_PRE = "tool:pre"
 
+try:
+    from amplifier_core.events import TOOL_POST  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover
+    TOOL_POST = "tool:post"
+
 logger = logging.getLogger(__name__)
 
 __version__ = "0.1.0"
@@ -556,6 +561,71 @@ def _make_gate_handler(coordinator: Any):
     return handler
 
 
+def _make_halt_notice_handler(coordinator: Any):
+    """Build the `tool:post` handler that closes defect 1
+    (`docs/designs/coexistence.md` \u00a76.0): a halted session must not be able
+    to reach a final response without the interruption in front of the
+    model.
+
+    The `HaltedError` message already reaches the model as this tool call's
+    own error result - and a real evaluation run proved that is not enough:
+    the model saw five halts spread across a session and still reported
+    "Task completed successfully" with zero mention of any interruption
+    (`.amplifier/evaluation/computer-use/20260802T113341Z/s2-interrupt-halt/`).
+    An isolated tool-error deep in a long transcript is easy for a model to
+    fail to surface in a summary written many turns later - especially once
+    other, successful actions follow it.
+
+    The fix used here is the kernel's own mechanism (`inject_context`,
+    `HOOKS_API.md`), not a second one built on top of it - exactly what
+    `coexistence.md` \u00a78.3 already prescribes for pause and asks not be
+    reinvented for halt: "Use the kernel's existing mechanism; do not build
+    a second one." `ComputerTool.execute()` records every `HaltedError` it
+    sees into `computer.halt_notices` (`tool-computer-use/__init__.py`);
+    this handler fires on every `tool:post` for `computer`/`desktop` and, as
+    long as that list is non-empty, injects a fresh system-role reminder
+    that the model cannot avoid seeing on its very next turn - repeated on
+    every subsequent tool call for the rest of the session, not just once,
+    so it is still there no matter how many more actions happen before the
+    model writes its final response. `ephemeral=True` mirrors the same
+    reminder pattern the kernel already uses for the task-list nudge every
+    turn: a fact that must be fresh on every turn, not one more permanent
+    message bloating history.
+    """
+
+    async def handler(event: str, data: dict[str, Any]) -> HookResult:
+        tool_name = (data or {}).get("tool_name")
+        if tool_name not in ("computer", "desktop"):
+            return HookResult(action="continue")
+        try:
+            tool = coordinator.get("tools", tool_name)
+        except Exception:  # noqa: BLE001 - a lookup failure must not break the turn
+            return HookResult(action="continue")
+        computer = tool if tool_name == "computer" else getattr(tool, "_computer", None)
+        notices = getattr(computer, "halt_notices", None)
+        if not notices:
+            return HookResult(action="continue")
+        latest = notices[-1]
+        return HookResult(
+            action="inject_context",
+            context_injection=(
+                "SAFETY NOTICE (computer-use human/agent coexistence guard): "
+                f"{len(notices)} human-detected interruption(s) occurred during "
+                "this driving session - a person at the machine produced input "
+                "the agent did not generate, and writes were halted before the "
+                f"next one (docs/designs/coexistence.md \u00a76.0). Most recent: "
+                f"{latest['message']} You MUST explicitly acknowledge this "
+                "interruption in any summary, report, or completion claim you "
+                "give the user - never report unqualified success or that the "
+                "task completed cleanly without mentioning it."
+            ),
+            context_injection_role="system",
+            ephemeral=True,
+        )
+
+    return handler
+
+
 async def mount(
     coordinator: Any, config: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -608,6 +678,12 @@ async def mount(
         _make_gate_handler(coordinator),
         priority=priority,
         name="hook-computer-use-gate",
+    )
+    coordinator.hooks.register(
+        TOOL_POST,
+        _make_halt_notice_handler(coordinator),
+        priority=priority,
+        name="hook-computer-use-halt-notice",
     )
     _trace(f"MOUNTED max_inline={max_inline}")
     logger.info("hook-computer-use mounted (max_inline_screenshots=%d)", max_inline)

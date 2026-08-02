@@ -20,7 +20,12 @@ from amplifier_module_tool_computer_use.coexistence_guard import (
 )
 from amplifier_module_tool_computer_use.exclusion import Rect
 from amplifier_module_tool_computer_use.pause import PausedError
-from amplifier_module_tool_computer_use.presence import PresenceMonitor
+from amplifier_module_tool_computer_use.presence import (
+    Confidence,
+    PresenceMonitor,
+    PresenceSnapshot,
+    PresenceState,
+)
 from amplifier_module_tool_computer_use.target_binding import TargetChangedError
 
 
@@ -153,6 +158,62 @@ def test_no_target_source_means_binding_is_never_enforced():
     guard.bind_target()
     assert guard.binding.status == "not_bound"
     guard.before_event()  # never raises on target binding
+
+
+# -- seed_halted: cross-session durable halt seeding (defect 2) --------------
+
+
+def test_seed_halted_makes_the_very_first_before_event_raise():
+    """A guard seeded from a durable halt record (`halt_state.py`) must halt
+    on its very FIRST `before_event()` call - before any live presence
+    sample could possibly have detected anything - because the record is
+    memory of a PRIOR session, not a live read."""
+    clock = FakeClock()
+    guard, released = make_guard(clock)
+    snapshot = PresenceSnapshot(
+        state=PresenceState.HUMAN_ACTIVE,
+        confidence=Confidence.HIGH,
+        basis="persisted_halt_from_prior_session",
+        last_human_input_ago_ms=90_000.0,
+        margin_ms=89_995.0,
+        guard_ms=5.0,
+        guard_measured=True,
+        sample_interval_ms=None,
+        latched_until_ms=None,
+    )
+
+    guard.seed_halted(snapshot)
+
+    assert guard.halted is True
+    with pytest.raises(HaltedError) as excinfo:
+        guard.before_event()
+    assert excinfo.value.snapshot is snapshot
+    assert released == ["halted"]
+
+
+def test_seed_halted_survives_even_a_long_quiet_idle_read():
+    """The whole point: a fresh guard's OWN live idle read would say
+    `quiet` (nothing has touched the machine in this new process's short
+    life) - `seed_halted` must not be something a subsequent quiet sample
+    can wash away. There is still no way to clear it from this class."""
+    clock = FakeClock()
+    guard, _released = make_guard(clock)
+    snapshot = PresenceSnapshot(
+        state=PresenceState.HUMAN_ACTIVE,
+        confidence=Confidence.HIGH,
+        basis="persisted_halt_from_prior_session",
+        last_human_input_ago_ms=90_000.0,
+        margin_ms=89_995.0,
+        guard_ms=5.0,
+        guard_measured=True,
+        sample_interval_ms=None,
+        latched_until_ms=None,
+    )
+    guard.seed_halted(snapshot)
+
+    clock.advance(120.0)  # far past LATCH_DECAY_SECONDS; idle_ms() stays huge -> quiet
+    with pytest.raises(HaltedError):
+        guard.before_event()  # live sample says quiet; seeded halt still wins
 
 
 # -- as_dict / presence envelope ----------------------------------------------

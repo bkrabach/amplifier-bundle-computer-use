@@ -143,22 +143,26 @@ def test_o5_scenario_detects_human_keystroke_mid_typing():
 
 
 def test_guard_band_of_250ms_would_have_masked_the_same_event():
-    """The regression this design fixes: at a wide guard band, the same
-    25.1ms-margin human event is invisible - never `human_active` - because
-    the agent re-injects every 60ms and a wide guard band never clears. This
-    is what O5 proved was the defect, not the detector mechanism.
-    Demonstrated with `windows-wsl2`'s real (documented, quantisation-driven)
-    32ms band, which already exceeds the 25.1ms margin.
+    """The regression this design fixes: at a wide guard band, a human
+    event with a small enough margin is invisible - never `human_active` -
+    because the agent re-injects every 60ms and a wide guard band never
+    clears. This is what O5 proved was the defect, not the detector
+    mechanism. Demonstrated against `windows-wsl2`'s real, measured (O4)
+    20ms GUARD (see presence.py's `GUARD_MS` comment - 900 real-hardware
+    samples, max observed margin 16.000ms): a margin constructed just
+    below THAT platform's actual guard, rather than a hardcoded number
+    that would silently stop demonstrating masking if the constant is
+    ever re-measured again.
     """
     clock = FakeClock()
     monitor = PresenceMonitor(idle_source=clock.idle_ms, platform="windows-wsl2")
+    below_guard_s = (monitor.guard_ms - 2.0) / 1000.0
     inject(monitor, clock)
-    clock.advance(0.0251)
+    clock.advance(below_guard_s)
     clock.human_input_now()
     snap = monitor.sample(now=clock.now)
     assert snap.state is not PresenceState.HUMAN_ACTIVE
     assert snap.margin_ms is not None
-    assert snap.margin_ms == pytest.approx(25.1, abs=0.5)
     assert snap.margin_ms < monitor.guard_ms
 
 
