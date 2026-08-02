@@ -176,3 +176,40 @@ def test_release_all_op_releases_everything_immediately():
     assert released == ["shift"]
     lines = [json.loads(x) for x in stdout.getvalue().strip().splitlines()]
     assert lines[2]["result"]["released"] == ["shift"]
+
+
+def test_every_op_handler_is_reachable_via_the_dispatch_table():
+    """Every `_op_*` method must be wired into `_HANDLERS`.
+
+    A handler that exists but is not in this table is DEAD CODE that fails at
+    runtime with `UnsupportedOpError` while every unit test passes - because
+    the tests call `_op_*` directly or mock `_call`, never exercising the
+    lookup `_dispatch` actually uses.
+
+    That is not hypothetical. `_op_presence_idle` shipped fully implemented,
+    correctly classified READ in `wire.py`, and unreachable. A real SSH session
+    against live hardware got:
+
+        BackendError: UnsupportedOpError: op 'presence_idle' not implemented
+
+    and the coexistence guard - which HAD been correctly constructed
+    (platform=windows-wsl2, guard_ms=20.0) - raised IdleUnreadableError on its
+    very first sample. So the failure mode was a hard crash on the first
+    guarded write against any remote target, not a silent gap.
+
+    This test is structural on purpose: it catches the whole class, not the one
+    instance, and it cannot be satisfied by adding another mock.
+    """
+    from amplifier_module_tool_computer_use import remote_agent as ra
+
+    agent_cls = ra.RemoteAgent
+    handlers = agent_cls._HANDLERS
+    op_methods = {
+        name for name in dir(agent_cls) if name.startswith("_op_") and name != "_op_"
+    }
+    wired = {fn.__name__ for fn in handlers.values()}
+    orphans = op_methods - wired
+    assert not orphans, (
+        f"handler(s) defined but unreachable via _HANDLERS: {sorted(orphans)} - "
+        "they will fail at runtime with UnsupportedOpError while unit tests pass"
+    )

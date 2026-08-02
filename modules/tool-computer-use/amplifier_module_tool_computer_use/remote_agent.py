@@ -399,6 +399,18 @@ class RemoteAgent:
         "type_text": _op_type_text,
         "key": _op_key,
         "hold": _op_hold,
+        # Coexistence presence read (docs/designs/coexistence.md §5). Missing
+        # this entry is why a real SSH session got
+        # `UnsupportedOpError: op 'presence_idle' not implemented in Phase 1`
+        # on every remote presence read: `_op_presence_idle` was fully
+        # implemented above and `wire.py` classified it READ, but `_dispatch`
+        # looks ops up HERE, so the handler was unreachable. Every unit test
+        # passed because they call `_op_presence_idle` directly or mock
+        # `_call` - none exercised this table. The consequence on real
+        # hardware was not a silent gap but a hard crash: the guard WAS
+        # constructed (platform=windows-wsl2, guard_ms=20.0) and then raised
+        # IdleUnreadableError on its first sample.
+        "presence_idle": _op_presence_idle,
         "release_all": _op_release_all,
         "bye": _op_bye,
     }
