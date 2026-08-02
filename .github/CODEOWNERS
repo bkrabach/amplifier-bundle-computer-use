@@ -1,0 +1,5 @@
+# Default owner for everything in this repository, unless a later, more
+# specific pattern below overrides it. See:
+# https://docs.github.com/articles/about-code-owners
+
+* @bkrabach

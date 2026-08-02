@@ -1,0 +1,51 @@
+# Ruff configuration for amplifier-bundle-computer-use.
+#
+# `line-length` is 88 (Ruff's default) because that is the width the existing tree was
+# already formatted at — do not raise it "for convenience"; doing so reformats files that
+# already conform and produces unrelated diff noise on every future PR.
+line-length = 88
+target-version = "py311"
+
+# Ruff's formatter also reformats fenced ```python code blocks inside Markdown files.
+# This repo's docs (docs/designs/*.md, BACKLOG.md, README.md, ...) contain illustrative
+# snippets that are not meant to be lint-checked or reflowed, so Markdown is out of
+# scope for this config entirely -- this is a Python formatter/linter, not a docs one.
+extend-exclude = ["*.md"]
+
+[lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort (import sorting)
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "C4",  # flake8-comprehensions
+]
+
+# Every ignore below is because pre-existing code in modules/ or tests/ does not (yet)
+# satisfy the rule, not because the rule is a bad idea. Do not "fix" the code to make
+# an ignore removable as a side effect of an unrelated change — lift an ignore only in
+# a change that is actually about that rule.
+ignore = [
+    "E402",  # Module level import not at top of file. Every test file under tests/
+             # inserts each module's path onto sys.path (modules/ isn't installed as a
+             # package outside CI/dev venvs) before importing from it — a deliberate,
+             # repo-wide pattern, not an oversight.
+    "E501",  # Line too long. The formatter (line-length above) already wraps anything
+             # it safely can; what's left is unsplittable literals, URLs, and comments.
+             # Enforcing a hard cutoff on top of that fights the formatter for no gain.
+    "SIM105", # Use `contextlib.suppress(...)`. A handful of existing try/except/pass
+              # blocks predate this config; valid future cleanup, not a lint failure.
+    "UP042",  # Replace `class X(str, Enum)` with `StrEnum` (py311+). A couple of
+              # existing enums predate this config.
+    "UP017",  # Use `datetime.UTC` instead of `datetime.timezone.utc`. One existing
+              # call site predates this config; both are correct on py311+.
+    "E731",   # Do not assign a lambda expression. One existing call site predates
+              # this config.
+]
+
+[lint.per-file-ignores]
+# The ship-gate scripts print a lot of human-readable status text; comprehension
+# rewrites would hurt readability more than they'd help.
+"scripts/*.py" = ["C4"]
