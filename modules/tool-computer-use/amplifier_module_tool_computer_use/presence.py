@@ -154,6 +154,26 @@ GUARD_MEASURED: dict[str, bool] = {
     # Unresolved. Do not treat the 297ms halt as proof of human detection until
     # this is settled; it is currently only proof that the halt PATH executes.
     #
+    # MEASURED 2026-08-02, with a VERIFIED primitive - and the result is that
+    # this band cannot be measured from the controller at all.
+    # bridge.ps1:147 `move` -> SetCursorPos (moves the cursor, does NOT register
+    # input). bridge.ps1:142 `key` -> SendInput (real input). Seven attempts used
+    # the wrong one. Using `key("shift")` - a modifier tap, no character, no side
+    # effect - registration is 80/80, gated by asserting idle drops on EVERY call
+    # before any number is reported:
+    #     min=296.0 p50=781.0 p90=828.0 p95=843.0 p99=875.0 max=875.0 (n=80)
+    # Every candidate band is exceeded 100% (5/10/16/20/32/50ms). That is NOT a
+    # refutation of 20.0. Transport latency - SSH round trip plus a powershell.exe
+    # spawn per action - is ~780ms, roughly 50x GetTickCount's ~16ms granularity,
+    # so the quantity GUARD_MS describes is buried under the apparatus measuring
+    # it. GUARD_MS is a LOCAL reconciliation window; validating it requires timing
+    # INSIDE bridge.ps1, same process, no transport in the path.
+    # DEPLOYMENT CONSEQUENCE, and the more important half: over the remote path a
+    # presence observation is 296-875ms STALE. A 20ms band reasoning about
+    # ~780ms-old data is a design question docs/designs/coexistence.md does not
+    # currently address. The remote guard may need its own band, or the
+    # reconciliation may need to move into the bridge.
+    #
     # SECOND CORRECTION 2026-08-02. The correction below ("the bundle's own
     # injection works, use be.move()") is ALSO wrong, and the reason matters.
     # Registration counts across every attempt: 1/150, 1/300, 4/100, 1/40 -
