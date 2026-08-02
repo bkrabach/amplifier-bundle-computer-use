@@ -31,8 +31,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # `--clear` is load-bearing: astral-sh/setup-uv already creates `.venv`
+      # when given a `python-version`, and a bare `uv venv` then fails with
+      # "A virtual environment already exists at: .venv" (exit 2). Verified in
+      # CI run 30725123629, which failed this way on both 3.11 and 3.12.
       - name: Create virtual environment
-        run: uv venv
+        run: uv venv --clear
 
       - name: Install modules and test dependencies
         run: |
