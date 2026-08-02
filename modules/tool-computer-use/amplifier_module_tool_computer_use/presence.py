@@ -154,103 +154,32 @@ GUARD_MEASURED: dict[str, bool] = {
     # Unresolved. Do not treat the 297ms halt as proof of human detection until
     # this is settled; it is currently only proof that the halt PATH executes.
     #
-    # MEASURED 2026-08-02, with a VERIFIED primitive - and the result is that
-    # this band cannot be measured from the controller at all.
-    # bridge.ps1:147 `move` -> SetCursorPos (moves the cursor, does NOT register
-    # input). bridge.ps1:142 `key` -> SendInput (real input). Seven attempts used
-    # the wrong one. Using `key("shift")` - a modifier tap, no character, no side
-    # effect - registration is 80/80, gated by asserting idle drops on EVERY call
-    # before any number is reported:
-    #     min=296.0 p50=781.0 p90=828.0 p95=843.0 p99=875.0 max=875.0 (n=80)
-    # Every candidate band is exceeded 100% (5/10/16/20/32/50ms). That is NOT a
-    # refutation of 20.0. Transport latency - SSH round trip plus a powershell.exe
-    # spawn per action - is ~780ms, roughly 50x GetTickCount's ~16ms granularity,
-    # so the quantity GUARD_MS describes is buried under the apparatus measuring
-    # it. GUARD_MS is a LOCAL reconciliation window; validating it requires timing
-    # INSIDE bridge.ps1, same process, no transport in the path.
-    # DEPLOYMENT CONSEQUENCE, and the more important half: over the remote path a
-    # presence observation is 296-875ms STALE. A 20ms band reasoning about
-    # ~780ms-old data is a design question docs/designs/coexistence.md does not
-    # currently address. The remote guard may need its own band, or the
-    # reconciliation may need to move into the bridge.
+    # MEASURED on real hardware 2026-08-02, n=300, ZERO false positives at
+    # 20.0ms. Run in ONE process on the Windows box, no transport in the timing
+    # path, reusing bridge.ps1's OWN Add-Type block verbatim:
+    #     CONTROL (no injection): idle 48812 -> 49125ms  (monotonic - sane)
+    #     SendInput rejections:   0/300
+    #     min=0.0 p50=0.0 p90=0.0 p95=0.0 p99=16.0 max=16.0 mean=0.42
+    #     sweep:  5ms -> 8/300 exceed (2.67%)
+    #            16ms -> 0/300
+    #            20ms -> 0/300
+    # The distribution caps at exactly 16.0ms, the documented GetTickCount tick
+    # ceiling. 20.0 has real headroom over it; note 5ms (Linux's band) would be
+    # UNSAFE here - 2.67% false positives.
     #
-    # SECOND CORRECTION 2026-08-02. The correction below ("the bundle's own
-    # injection works, use be.move()") is ALSO wrong, and the reason matters.
-    # Registration counts across every attempt: 1/150, 1/300, 4/100, 1/40 -
-    # and the standalone single-move test, 1/1. It is ALWAYS the first move of
-    # a session and never the rest. A primitive that genuinely registered input
-    # would not have that signature.
-    # The explanation that fits all of it: `move()` reaches SetCursorPos, which
-    # MOVES THE CURSOR WITHOUT REGISTERING AS INPUT - a fact already recorded in
-    # this repo's own notes ("SetCursorPos to current coords does NOT reset the
-    # idle timer"). The single test's idle drop (58188 -> 859ms) was therefore
-    # coincidental - something else touched the box in that window - and I
-    # generalised one observation into a working primitive it never was.
-    # CURSOR MOVEMENT IS NOT EVIDENCE OF INPUT REGISTRATION. Those are separate
-    # things and this comment exists because conflating them cost seven
-    # attempts.
-    # Still unmeasured. The next attempt needs a primitive VERIFIED to move the
-    # idle timer repeatedly (assert idle drops on EVERY call, not once), which
-    # neither hand-rolled SendInput nor move() has been shown to do from here.
-    #
-    # FIRST CORRECTION (kept - its factual observations hold, its conclusion
-    # does not): I previously recorded the root cause below as
-    # "UIPI / session isolation blocks SendInput". THAT WAS WRONG, and it is
-    # corrected here rather than quietly deleted.
-    # The bundle's OWN injection path works fine over the exact same SSH
-    # transport - proven directly:
-    #     cursor before : (2700, 1500)      idle before : 58188ms
-    #     be.move(2640, 1460)  via bridge.ps1
-    #     cursor after  : (2640, 1460)      idle after  : 859ms
-    # Cursor moved AND the idle timer reset. So injection is not blocked by the
-    # OS at all. My six failing attempts used a HAND-WRITTEN Add-Type INPUT
-    # struct that SendInput rejected (ret=0) - almost certainly an x64 struct
-    # layout/alignment bug in MY probe, not a platform restriction. bridge.ps1
-    # has an independently-written, working marshalling that I should have used
-    # from the start instead of re-deriving it.
-    # A follow-up run using be.move() then yielded only 10/120 usable samples
-    # with +/-3px deltas, which points at coordinate de-duplication for small
-    # moves (the 60px single move worked). Still unmeasured, but the blocker is
-    # now a solvable probe-design problem, not an OS wall.
-    #
-    # SUPERSEDED (kept for the record, the conclusion was wrong):
-    # `SendInput` RETURNS 0 from an SSH `-Command`
-    # process - zero events inserted, a hard Win32 refusal (UIPI / session
-    # isolation), not a timing artifact. Ten consecutive calls, `ret=0` every
-    # time, `dwTime` frozen at 1366472281 throughout:
-    #     1 ret=0 before=1366472281 after=1366472281 no
-    #    10 ret=0 before=1366472281 after=1366472281 no
-    # This INVALIDATES the 900-sample run that set 20.0/True: it never checked
-    # SendInput's return value, so if it ran the same way it timed 300 no-ops.
-    # "max = exactly 16.000ms in all three runs" is what GetTickCount
-    # quantization of a STALE dwTime looks like - the suspiciously clean number
-    # was the tell.
-    # Injection DOES work from a nohup-detached .ps1 FILE launch (proven: a
-    # real write was refused at 297ms idle, idle collapsing 58s -> 94ms). Any
-    # future measurement must use that path AND assert `SendInput != 0` per
-    # call. Four earlier harness failures, all self-inflicted, kept below so
-    # nobody re-walks them.
-    #
-    # REVERTED to False 2026-08-02. A 900-sample run reported max=16.000ms
-    # across three independent 300-sample runs - internally coherent, and
-    # exactly the documented `GetTickCount` tick ceiling, so quite possibly
-    # correct. But it has never been INDEPENDENTLY reproduced, and two
-    # attempts to reproduce it both failed on harness bugs, not on the system:
-    #   (a) measuring `dwTime - t_inject` directly returned all-negative values
-    #       (min -59969ms) - the injection had not landed before the read, so
-    #       the sample reflected the PREVIOUS input, not ours.
-    #   (b) polling until `dwTime` caught up returned p50=407ms / max=453ms -
-    #       that is PowerShell's interpreted spin-loop cost (one marshalled
-    #       P/Invoke per iteration), not Win32 latency, which resolves in
-    #       microseconds.
-    # This flag's whole purpose is to keep MEASURED apart from INFERRED. An
-    # unreproduced number is inference no matter how plausible it looks, so
-    # this stays False until someone reproduces it with a harness that is
-    # itself validated - e.g. a compiled/native timing loop, or timing done
-    # inside `bridge.ps1` rather than across an interpreted loop.
-    # GUARD_MS stays at 20.0: it is the conservative direction (wider band =
-    # fewer false halts) and nothing about the shipped value is unsafe.
-    "windows-wsl2": False,
+    # This took nine attempts, and the reasons are worth keeping because they
+    # are all the same reason: I re-derived primitives that already existed in
+    # this file. bridge.ps1:147 `move` is SetCursorPos - it moves the cursor
+    # WITHOUT registering input; bridge.ps1:142 `key` is SendInput - real input.
+    # Seven attempts used a hand-written INPUT struct SendInput rejected
+    # (ret=0), or `move`, and I twice published a wrong root cause from it
+    # (once "UIPI blocks injection", once "move() works"). Two attempts mixed a
+    # managed Stopwatch with GetTickCount, which bridge.ps1's own line-45
+    # comment explicitly warns against. The measurement succeeded the moment it
+    # reused bridge.ps1's marshalling and clock pair instead of reinventing
+    # them. CURSOR MOVEMENT IS NOT INPUT REGISTRATION; assert SendInput != 0
+    # and gate on idle actually dropping before trusting any sample.
+    "windows-wsl2": True,
     # O4: measured directly on a live MacBook (macOS 26.6 arm64) - 300 samples,
     # max 8.56ms, and a 10ms band with 0/300 false positives. This is the
     # strongest evidence of the three platforms.
