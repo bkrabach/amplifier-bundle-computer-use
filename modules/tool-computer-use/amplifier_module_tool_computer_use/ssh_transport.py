@@ -233,8 +233,7 @@ class SshTransport:
             ]
             with_args = " ".join(f"--with {shlex.quote(e)}" for e in extras)
             remote_cmd = (
-                f"{shlex.quote(uv_cmd)} run {with_args} python3 -c "
-                f"{shlex.quote(stub)}"
+                f"{shlex.quote(uv_cmd)} run {with_args} python3 -c {shlex.quote(stub)}"
             )
         else:
             remote_cmd = f"python3 -c {shlex.quote(stub)}"
