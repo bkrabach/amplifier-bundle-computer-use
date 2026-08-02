@@ -143,6 +143,34 @@ GUARD_MEASURED: dict[str, bool] = {
     # the measurement tightened it. Intra-`type_text` detection remains not
     # viable on Windows at any of these bands (masked fraction 20/60 = 33% at
     # production cadence) - unchanged conclusion, now evidence-backed.
+    # OPEN QUESTION, recorded so it is not lost: a live end-to-end test DID
+    # halt a real ComputerTool.execute() write at 297ms idle, with idle
+    # collapsing 58s -> 94ms. But SendInput is refused (ret=0) from every
+    # process reachable over SSH, including the detached .ps1 path that test
+    # used. So SOMETHING produced input the guard attributed to a human, and it
+    # was not the synthetic firer. The remaining candidate is the agent's OWN
+    # writes through bridge.ps1 not being recorded via record_inject() in time
+    # - which would make that halt a FALSE POSITIVE rather than a detection.
+    # Unresolved. Do not treat the 297ms halt as proof of human detection until
+    # this is settled; it is currently only proof that the halt PATH executes.
+    #
+    # ROOT CAUSE FOUND 2026-08-02: `SendInput` RETURNS 0 from an SSH `-Command`
+    # process - zero events inserted, a hard Win32 refusal (UIPI / session
+    # isolation), not a timing artifact. Ten consecutive calls, `ret=0` every
+    # time, `dwTime` frozen at 1366472281 throughout:
+    #     1 ret=0 before=1366472281 after=1366472281 no
+    #    10 ret=0 before=1366472281 after=1366472281 no
+    # This INVALIDATES the 900-sample run that set 20.0/True: it never checked
+    # SendInput's return value, so if it ran the same way it timed 300 no-ops.
+    # "max = exactly 16.000ms in all three runs" is what GetTickCount
+    # quantization of a STALE dwTime looks like - the suspiciously clean number
+    # was the tell.
+    # Injection DOES work from a nohup-detached .ps1 FILE launch (proven: a
+    # real write was refused at 297ms idle, idle collapsing 58s -> 94ms). Any
+    # future measurement must use that path AND assert `SendInput != 0` per
+    # call. Four earlier harness failures, all self-inflicted, kept below so
+    # nobody re-walks them.
+    #
     # REVERTED to False 2026-08-02. A 900-sample run reported max=16.000ms
     # across three independent 300-sample runs - internally coherent, and
     # exactly the documented `GetTickCount` tick ceiling, so quite possibly
