@@ -62,11 +62,25 @@ class HaltedError(RuntimeError):
 
     def __init__(self, snapshot: PresenceSnapshot) -> None:
         self.snapshot = snapshot
+        # \u00a75.7: declare, don't fake - when this sample's own idle_source()
+        # call cost real transport time (a remote backend), say so in the
+        # same sentence a human/operator actually reads, not only in a field
+        # they have to know to inspect. `transport_latency_ms` is ~0 for an
+        # in-process (local) read, so this clause is silent for the common
+        # case and only speaks up when there is something to declare.
+        transport_note = ""
+        if snapshot.transport_latency_ms > 1.0:
+            transport_note = (
+                f" (this observation crossed a transport costing "
+                f"{snapshot.transport_latency_ms:.1f}ms - effective_staleness="
+                f"{snapshot.effective_staleness_ms:.1f}ms, not guard_ms alone)"
+            )
         super().__init__(
             "halted: a human at this machine produced input "
             f"{snapshot.last_human_input_ago_ms:.1f}ms ago that this agent did "
             f"not generate (margin={snapshot.margin_ms}, "
-            f"guard={snapshot.guard_ms}ms). Halting before the next write."
+            f"guard={snapshot.guard_ms}ms){transport_note}. "
+            "Halting before the next write."
         )
 
 

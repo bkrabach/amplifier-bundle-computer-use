@@ -997,6 +997,12 @@ class ComputerTool:
                     "margin_ms": exc.snapshot.margin_ms,
                     "guard_ms": exc.snapshot.guard_ms,
                     "last_human_input_ago_ms": exc.snapshot.last_human_input_ago_ms,
+                    # \u00a75.7 (measured safety gap): declared alongside guard_ms,
+                    # not silently folded into it or omitted - see
+                    # presence.PresenceSnapshot's own docstring. ~0 for a
+                    # local backend; real and large for a remote one.
+                    "transport_latency_ms": exc.snapshot.transport_latency_ms,
+                    "effective_staleness_ms": exc.snapshot.effective_staleness_ms,
                 }
             )
             backend_name = getattr(self._backend, "name", "unknown")
@@ -1341,6 +1347,28 @@ def _build_coexistence_guard(
         presence.guard_ms,
         presence.guard_measured,
     )
+    # \u00a75.7 (measured safety gap, docs/designs/coexistence.md): a remote
+    # backend's presence_idle_ms() is an SSH round trip (plus, on Windows, a
+    # per-op powershell.exe spawn) - not the in-process microsecond call
+    # `guard_ms` was measured against. Measured on windows-host (n=80,
+    # key("shift")): 296-875ms. Declared HERE, at construction, the same
+    # place every other coexistence capability already declares what it can
+    # and cannot promise (\u00a75.5's Windows intra-type_text declaration) -
+    # never left for a caller to discover only by noticing a halt came late.
+    # Every live sample ALSO carries its own measured
+    # transport_latency_ms/effective_staleness_ms (presence.PresenceSnapshot)
+    # so this is a standing notice, not the only place it is visible.
+    if bool(getattr(backend, "is_remote", False)):
+        logger.warning(
+            "coexistence: backend %r is remote - every presence sample "
+            "crosses a transport whose measured latency (296-875ms, "
+            "windows-host n=80) is up to ~40x this platform's %.1fms "
+            "guard_ms. Do not read guard_ms alone as the size of this "
+            "session's blind window; each sample's own "
+            "effective_staleness_ms is the honest figure.",
+            backend.name,
+            presence.guard_ms,
+        )
     # Defect 2 fix: a brand-new guard has no memory of a human detected in a
     # PRIOR session against this same backend - `_halted` is a plain
     # in-memory field on an object that stops existing when its mount does

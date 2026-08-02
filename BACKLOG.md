@@ -10,11 +10,40 @@ to build, it doesn't belong on this list.
 
 ## Core experience — must land before anything below
 
-- **Per-monitor targeting through the remote path.** Per-monitor selection works
-  locally, but a remote capture currently returns the whole virtual-desktop
-  bounding box. On a real four-monitor 4K desktop that is a 7.52x downscale with
-  ~20% of the frame being dead space no display sits behind. Unusable for real
-  work. `ComputerTool` owns monitor selection; `RemoteBackend` bypasses it.
+- ~~**Per-monitor targeting through the remote path.**~~ **DONE - and this
+  entry was already stale.** Re-checked against the real four-monitor 4K
+  Windows desktop this feature was built for (`user@windows-host`, live
+  hardware, not a mock): the full remote round trip -
+  `ComputerTool` (monitor selection) -> `RemoteBackend.capture_scaled` ->
+  the real NDJSON wire -> `RemoteAgent._op_capture_scaled` ->
+  `WindowsBackend.capture(region=...)` - already crops at the far end and
+  reports the selected monitor's own dimensions, not the virtual-desktop
+  bounding box (`ScreenGeometry(width=9626, height=4323, origin_x=0,
+  origin_y=-2163)`).
+  - Default (unconfigured) path scopes to the primary monitor: `current_monitor
+    = DISPLAY3`, screenshot returns `1280x720` (never `9626x4323`).
+  - An explicit non-primary, NEGATIVE-origin monitor (`DISPLAY1`, `x=1946,
+    y=-2160`) returns `1280x720` and a two-independent-capture-methods
+    pixel diff (a full-desktop capture cropped locally vs. a direct
+    region-scoped `CopyFromScreen`) came back byte-identical (mean abs diff
+    `0.00`) - the region reaching the agent is exactly right, not an
+    approximation.
+  - A LIVE mid-session switch (`desktop.select_monitor`, the actual
+    model-facing action) from `DISPLAY3` to a different negative-origin
+    monitor propagates to the very next `computer` screenshot: new origin,
+    new dimensions, no stale state.
+  - The coordinate path was checked, not assumed: `Display.to_screen()` on
+    the targeted (negative-origin) monitor mapped into that monitor's own
+    real bounds, matching `test_geometry.py`'s existing negative-origin unit
+    coverage.
+  - The one real gap found was a **test coverage** gap, not a code defect:
+    `tests/test_remote_monitor_scoping_e2e.py`'s fixture was entirely
+    non-negative and could not have caught a sign error in the region math
+    anywhere along that round trip. Closed with
+    `test_negative_origin_monitor_survives_the_full_remote_round_trip` and
+    `test_live_monitor_switch_between_negative_origin_monitors_over_the_remote_round_trip`,
+    using the exact real-hardware layout as the fixture.
+  - See `docs/MICROSOFT_PROPOSAL.md` \u00a710.5 for the full evidence.
 
 - **Run it as a real Amplifier session, end to end.** Component-level proof is
   not product-level proof. The hook, native tool promotion, the screenshot

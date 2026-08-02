@@ -229,7 +229,31 @@ class IdleUnreadableError(RuntimeError):
 
 @dataclass(frozen=True)
 class PresenceSnapshot:
-    """The `presence` block attached to every result, \u00a75.3."""
+    """The `presence` block attached to every result, \u00a75.3.
+
+    `transport_latency_ms` / `effective_staleness_ms` (\u00a75.7): a measured safety
+    gap, not a hypothetical one. Over a remote backend (`RemoteBackend`,
+    `docs/designs/remote-transport.md`), `idle_source()` is not an in-process
+    syscall - it is an SSH round trip plus (on Windows) a fresh
+    `powershell.exe` spawn per read. Measured on `windows-host` (n=80,
+    `key("shift")`, 80/80 registration): min=296.0 p50=781.0 p90=828.0
+    p95=843.0 p99=875.0 max=875.0 mean=779.6 ms. Reasoning about that
+    observation with only `guard_ms` (20.0 for `windows-wsl2`) silently
+    presents a 20ms band as if it applied to data that is up to ~40x staler
+    - exactly the "claims a guarantee it does not have" failure \u00a75.5 already
+    refuses for Windows intra-`type_text` detection. `transport_latency_ms`
+    is the ACTUAL measured wall-clock cost of the `idle_source()` call this
+    snapshot came from (near-zero for an in-process Linux/macOS/Windows-local
+    read, real and large for anything crossing a transport) - never a fixed,
+    invented, or looked-up constant, so it tracks whatever the live
+    connection is actually doing rather than baking in one box's network
+    conditions. `effective_staleness_ms = guard_ms + transport_latency_ms` is
+    the single honest number for "how wide is the window in which a human
+    touch on this backend could go undetected by this sample" - reported
+    for every backend (it is `~guard_ms` for a local one), never gating
+    `_classify()`'s comparison itself (see that method's docstring for why
+    widening the THRESHOLD is the wrong fix, not merely an unproven one).
+    """
 
     state: PresenceState
     confidence: Confidence
@@ -240,6 +264,20 @@ class PresenceSnapshot:
     guard_measured: bool
     sample_interval_ms: float | None
     latched_until_ms: float | None
+    #: \u00a75.7 - additive, defaults to 0.0 so every pre-existing construction
+    #: site (tests, `halt_state.py`'s durable-record rebuild) stays valid
+    #: unchanged. Always populated by `PresenceMonitor.sample()` itself.
+    transport_latency_ms: float = 0.0
+
+    @property
+    def effective_staleness_ms(self) -> float:
+        """\u00a75.7: the honest size of this sample's blind window - `guard_ms`
+        plus whatever this specific `idle_source()` call actually cost in
+        wall-clock time. Distinct from, and never a replacement for,
+        `guard_ms` itself (that stays exactly the per-platform measured
+        constant from `GUARD_MS` - see that table's own provenance
+        comments)."""
+        return self.guard_ms + self.transport_latency_ms
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -252,6 +290,8 @@ class PresenceSnapshot:
             "guard_measured": self.guard_measured,
             "sample_interval_ms": self.sample_interval_ms,
             "latched_until_ms": self.latched_until_ms,
+            "transport_latency_ms": self.transport_latency_ms,
+            "effective_staleness_ms": self.effective_staleness_ms,
         }
 
 
@@ -322,16 +362,46 @@ class PresenceMonitor:
 
         Intended to be called once per inter-injection gap - i.e. right
         before the *next* injection - matching O5's harness shape exactly.
+
+        \u00a75.7 - measured safety gap fix: `now` is the anchor every downstream
+        comparison treats as "the instant this observation became true." For
+        an in-process `idle_source()` (Linux/macOS, microseconds) it does not
+        matter whether `now` is captured immediately before or after that
+        call. For a REMOTE `idle_source()` (`RemoteBackend.presence_idle_ms`,
+        an SSH round trip - and on Windows a fresh `powershell.exe` spawn per
+        read - measured 296-875ms, windows-host, n=80) it matters enormously:
+        capturing `now` BEFORE issuing that call (the previous behavior)
+        anchors every comparison to a moment up to a full round trip BEFORE
+        `idle_ms` was actually valid, which silently manufactures staleness on
+        top of whatever the transport already costs - `idle_ms` reflects the
+        target's idle counter at roughly the END of the round trip, not the
+        start. Capturing `now` immediately AFTER `idle_source()` returns (the
+        fix here) anchors the comparison to the moment the observation is
+        actually usable, cutting that self-inflicted bias to (at most) the
+        transport's own response-transit tail - the one piece genuinely
+        outside this process's ability to measure or correct without
+        instrumenting the remote side. `transport_latency_ms` (measured
+        below, \u00a75.7) reports the conservative upper bound on what remains:
+        the FULL measured cost of the `idle_source()` call, never a smaller,
+        invented "residual" this process cannot actually verify.
+
+        Explicit `now=` (every existing unit test, using a fake clock) is
+        left untouched by this fix - those tests already control both the
+        call and its timestamp themselves, so nothing about their behavior
+        changes.
         """
-        now = now if now is not None else time.monotonic()
-        interval_ms: float | None = None
-        if self._last_sample_monotonic is not None:
-            interval_ms = (now - self._last_sample_monotonic) * 1000.0
-        self._last_sample_monotonic = now
+        explicit_now = now is not None
+        t_call_start = time.monotonic()
 
         try:
             idle_ms = float(self.idle_source())
         except Exception as exc:  # any read failure -> unknown, never a guess
+            transport_latency_ms = (time.monotonic() - t_call_start) * 1000.0
+            bookkeeping_now = now if explicit_now else t_call_start
+            interval_ms: float | None = None
+            if self._last_sample_monotonic is not None:
+                interval_ms = (bookkeeping_now - self._last_sample_monotonic) * 1000.0
+            self._last_sample_monotonic = bookkeeping_now
             self._state = PresenceState.UNKNOWN
             snap = PresenceSnapshot(
                 state=PresenceState.UNKNOWN,
@@ -343,11 +413,21 @@ class PresenceMonitor:
                 guard_measured=self.guard_measured,
                 sample_interval_ms=interval_ms,
                 latched_until_ms=self._latched_until,
+                transport_latency_ms=transport_latency_ms,
             )
             self._last_snapshot = snap
             raise IdleUnreadableError(f"idle_source() raised: {exc}") from exc
 
-        inferred_last_input = now - (idle_ms / 1000.0)
+        t_call_end = time.monotonic()
+        transport_latency_ms = (t_call_end - t_call_start) * 1000.0
+        resolved_now = now if explicit_now else t_call_end
+
+        interval_ms = None
+        if self._last_sample_monotonic is not None:
+            interval_ms = (resolved_now - self._last_sample_monotonic) * 1000.0
+        self._last_sample_monotonic = resolved_now
+
+        inferred_last_input = resolved_now - (idle_ms / 1000.0)
 
         if self._last_inject_monotonic is None:
             # No injection has happened yet this session - nothing of ours to
@@ -360,14 +440,14 @@ class PresenceMonitor:
         state, confidence = self._classify(margin_ms, idle_ms)
 
         if state is PresenceState.HUMAN_ACTIVE:
-            self._latched_until = now + LATCH_DECAY_SECONDS
-        elif self._latched_until is not None and now < self._latched_until:
+            self._latched_until = resolved_now + LATCH_DECAY_SECONDS
+        elif self._latched_until is not None and resolved_now < self._latched_until:
             # Latch (\u00a75.4): once seen, present until LATCH_DECAY_SECONDS of
             # silence - a fresh `quiet` sample within the latch window does not
             # clear it early.
             state = PresenceState.HUMAN_ACTIVE
             confidence = Confidence.HIGH
-        elif self._latched_until is not None and now >= self._latched_until:
+        elif self._latched_until is not None and resolved_now >= self._latched_until:
             self._latched_until = None
 
         self._state = state
@@ -381,6 +461,7 @@ class PresenceMonitor:
             guard_measured=self.guard_measured,
             sample_interval_ms=interval_ms,
             latched_until_ms=self._latched_until,
+            transport_latency_ms=transport_latency_ms,
         )
         self._last_snapshot = snap
         return snap

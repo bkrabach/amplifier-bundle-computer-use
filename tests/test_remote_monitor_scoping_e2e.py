@@ -93,6 +93,31 @@ FOUR_MONITORS = [
     MonitorInfo(id="DISPLAY4", x=3840, y=2160, width=3840, height=2160, primary=False),
 ]
 
+#: The EXACT layout measured live against the real reference hardware
+#: (`user@windows-host`, the WSL2 side of a real four-monitor Win11
+#: desktop) - `screen_geometry()` there reports `ScreenGeometry(width=9626,
+#: height=4323, origin_x=0, origin_y=-2163)` and `list_monitors()` reports
+#: exactly these four bounds. Two of the four have NEGATIVE y origins
+#: (monitors physically positioned above the primary) - `FOUR_MONITORS`
+#: above is all non-negative and would not have caught a sign error in the
+#: region math anywhere along ComputerTool -> RemoteBackend -> wire ->
+#: RemoteAgent -> `Backend.capture()`. `geometry.py`'s own `Display.to_screen`/
+#: `to_model` already had dedicated negative-origin unit tests
+#: (`test_geometry.py`); this is the same real layout exercised through the
+#: FULL remote round trip, which `FOUR_MONITORS` never was.
+REAL_HARDWARE_MONITORS = [
+    MonitorInfo(
+        id="\\\\.\\DISPLAY1", x=1946, y=-2160, width=3840, height=2160, primary=False
+    ),
+    MonitorInfo(
+        id="\\\\.\\DISPLAY4", x=5786, y=-2163, width=3840, height=2160, primary=False
+    ),
+    MonitorInfo(
+        id="\\\\.\\DISPLAY2", x=5760, y=0, width=3840, height=2160, primary=False
+    ),
+    MonitorInfo(id="\\\\.\\DISPLAY3", x=0, y=0, width=3840, height=2160, primary=True),
+]
+
 
 def _real_png(width: int, height: int) -> bytes:
     from PIL import Image
@@ -297,3 +322,82 @@ def test_monitor_enumeration_failure_is_not_silently_swallowed_for_explicit_targ
 
     with pytest.raises(BackendError, match="not found among enumerated monitors"):
         ComputerTool(backend, {"target_monitor": "DISPLAY99"}).resolve_display()
+
+
+def test_negative_origin_monitor_survives_the_full_remote_round_trip():
+    """Same proof as
+    `test_non_primary_monitor_region_survives_the_full_remote_round_trip`,
+    but against `REAL_HARDWARE_MONITORS` - the EXACT layout measured live on
+    `user@windows-host` (see that fixture's docstring), where two of
+    the four monitors have a NEGATIVE y origin because they sit physically
+    above the primary display.
+
+    `FOUR_MONITORS` (used by every other test in this file) is entirely
+    non-negative and cannot exercise a sign error anywhere along
+    `ComputerTool` -> `RemoteBackend` -> the real NDJSON wire ->
+    `RemoteAgent` -> `Backend.capture()`. This closes that gap: a captured
+    region for a negative-origin monitor must reach the agent as that exact
+    (negative) rectangle, not clamped to zero and not silently substituted
+    for a different monitor's bounds.
+    """
+    computer, fake_platform = _build_remote_computer(
+        REAL_HARDWARE_MONITORS, target_monitor="\\\\.\\DISPLAY1"
+    )
+
+    assert computer.current_monitor is not None
+    assert computer.current_monitor.id == "\\\\.\\DISPLAY1"
+    assert computer.display.origin_y < 0  # the whole point of this test
+
+    summary, b64 = computer._run("screenshot", {})
+
+    assert summary == "screenshot captured"
+    assert b64 is not None
+    # DISPLAY1: x=1946, y=-2160, 3840x2160 -> region (1946, -2160, 5786, 0).
+    # The negative y1/y2 must reach the agent's `capture()` call UNCHANGED -
+    # not clamped to 0, not shifted, not silently swapped for another
+    # monitor's (all-non-negative) bounds.
+    assert fake_platform.capture_calls == [(1946, -2160, 5786, 0)]
+
+    png_bytes = base64.standard_b64decode(b64)
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(png_bytes))
+    disp = computer.display
+    assert img.size == (disp.model_width, disp.model_height)
+
+    # Coordinate-path check (the trap the task brief specifically warns
+    # about): model-space center must map to a screen point INSIDE this
+    # negative-origin monitor's real bounds, not the virtual-desktop origin.
+    mx, my = disp.model_width // 2, disp.model_height // 2
+    sx, sy = disp.to_screen(mx, my)
+    cur = computer.current_monitor
+    assert cur.x <= sx < cur.x + cur.width
+    assert cur.y <= sy < cur.y + cur.height
+
+
+def test_live_monitor_switch_between_negative_origin_monitors_over_the_remote_round_trip():
+    """The RUNTIME switch path (`ComputerTool.select_monitor`, what the
+    `desktop.select_monitor` tool action calls) must propagate to the very
+    NEXT remote capture - not just the mount-time `target_monitor` config
+    path every other test in this file exercises. Switches between two
+    DIFFERENT negative-origin monitors on the real hardware layout, so a
+    stale-origin bug (e.g. caching the previous monitor's sign) cannot hide
+    behind "it happened to be zero already".
+    """
+    computer, fake_platform = _build_remote_computer(
+        REAL_HARDWARE_MONITORS, target_monitor="\\\\.\\DISPLAY1"
+    )
+    assert computer.current_monitor.id == "\\\\.\\DISPLAY1"
+
+    new_disp = computer.select_monitor("\\\\.\\DISPLAY4")
+
+    assert computer.current_monitor.id == "\\\\.\\DISPLAY4"
+    assert (new_disp.origin_x, new_disp.origin_y) == (5786, -2163)
+
+    fake_platform.capture_calls.clear()
+    summary, b64 = computer._run("screenshot", {})
+
+    assert summary == "screenshot captured"
+    # DISPLAY4: x=5786, y=-2163, 3840x2160 -> region (5786, -2163, 9626, -3).
+    assert fake_platform.capture_calls == [(5786, -2163, 9626, -3)]
+    assert b64 is not None
