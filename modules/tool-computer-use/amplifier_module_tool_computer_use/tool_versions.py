@@ -73,7 +73,15 @@ BETA_HEADER_FOR_VERSION: dict[str, str] = {
 
 #: Verified model -> required tool_version pairs. See module docstring.
 KNOWN_MODEL_TOOL_VERSIONS: dict[str, str] = {
-    "claude-sonnet-4-5-20250929": "computer_20250124",
+    # Keyed on the UNDATED generation prefix, not the dated id the evidence was
+    # captured against (`claude-sonnet-4-5-20250929`). `required_for_model`
+    # matches `model.startswith(known)`, so a dated key can only ever match the
+    # exact dated id - the plain alias `claude-sonnet-4-5`, which is what a
+    # provider commonly reports, fell through to FALLBACK_TOOL_VERSION
+    # (`computer_20251124`) and 400'd every request. Found by the evaluation
+    # harness on its first real run, against a DTU whose provider reported the
+    # undated alias. The undated prefix covers both forms.
+    "claude-sonnet-4-5": "computer_20250124",
     "claude-sonnet-5": "computer_20251124",
     "claude-opus-5": "computer_20251124",
 }
