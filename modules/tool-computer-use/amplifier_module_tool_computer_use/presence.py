@@ -154,9 +154,19 @@ GUARD_MEASURED: dict[str, bool] = {
     # Unresolved. Do not treat the 297ms halt as proof of human detection until
     # this is settled; it is currently only proof that the halt PATH executes.
     #
-    # MEASURED on real hardware 2026-08-02, n=300, ZERO false positives at
-    # 20.0ms. Run in ONE process on the Windows box, no transport in the timing
-    # path, reusing bridge.ps1's OWN Add-Type block verbatim:
+    # MEASURED ON REAL HARDWARE 2026-08-02 - windows-host, the WSL2 side of a
+    # live Win11 desktop (hostname ALIENWARE-R13, x86_64). n=300, ZERO false
+    # positives at 20.0ms.
+    # To be unambiguous about "local", since it is easy to misread: the SCRIPT
+    # ran ON r13. "Local" means the timing loop ran inside ONE PowerShell
+    # process on that Windows box with no SSH round trip INSIDE the loop - as
+    # opposed to an earlier run that sampled across the wire and measured
+    # ~780ms of transport latency instead of the guard band. The dev box this
+    # was driven from is aarch64 Linux with no PowerShell and no /mnt/c, so
+    # this measurement could not have run there at all. Artifact left in place
+    # at r13:C:\Windows\Temp\cu_g11.txt, first line CONTROL=48812,49125,
+    # matching the control figures below.
+    # Reuses bridge.ps1's OWN Add-Type block verbatim:
     #     CONTROL (no injection): idle 48812 -> 49125ms  (monotonic - sane)
     #     SendInput rejections:   0/300
     #     min=0.0 p50=0.0 p90=0.0 p95=0.0 p99=16.0 max=16.0 mean=0.42
