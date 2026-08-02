@@ -862,29 +862,41 @@ class MacOSBackend:
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
 
     def type_text(self, text: str, guard: Any = None) -> None:
-        """Type literal Unicode text via `CGEventKeyboardSetUnicodeString`.
+        """Type literal Unicode text via `CGEventKeyboardSetUnicodeString`, one
+        Python string character at a time.
 
-        Unlike `key()`/`hold_key()`, this needs no keycode/layout table at all: the
-        Unicode string is attached directly to a keyboard event and WindowServer
-        synthesizes whatever keystrokes are needed, correctly, for any layout -
+        Unlike `key()`/`hold_key()`, this needs no keycode/layout table at all: each
+        character is attached directly to its own keyboard event and WindowServer
+        synthesizes whatever keystroke is needed, correctly, for any layout -
         including characters with no key on the current physical keyboard. This is
         the macOS-native equivalent of `LinuxX11Backend.type_text`'s dynamic scratch-
         keysym mapping, but built into the platform rather than improvised.
 
-        `guard` (see `Backend.type_text`) is accepted for protocol conformance
-        but not yet used here: macOS's presence-detector `GUARD` band is an
-        unmeasured placeholder pending O4 (`presence.GUARD_MEASURED["macos"]`
-        is `False`), so this bundle does not yet claim intra-`type_text`
-        detection on this platform - see `docs/designs/coexistence.md` \u00a75.5.
+        Per-character, not one `CGEvent` for the whole string - this is what makes
+        `guard` (`coexistence_guard.CoexistenceGuard`, \u00a75.2/\u00a78.6 of
+        `docs/designs/coexistence.md`) meaningful here at all. `GUARD_MS["macos"]`
+        is now measured (O4 - see `presence.py`), so this backend claims the same
+        intra-`type_text` detection Linux already does (\u00a75.2): a human keystroke
+        landing MID-STRING must be able to interrupt between characters, which a
+        single whole-string `CGEvent` made structurally impossible. Omitting `guard`
+        (the default) preserves the per-character loop but skips every guard call -
+        existing callers with no guard are unaffected in every respect except that
+        this now posts one `CGEvent` pair per character instead of one pair for the
+        whole string, which WindowServer already delivered to the focused field
+        identically either way.
         """
-        del guard
         self._ensure_input_trusted()
-        event = Quartz.CGEventCreateKeyboardEvent(None, 0, True)
-        Quartz.CGEventKeyboardSetUnicodeString(event, len(text), text)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
-        up = Quartz.CGEventCreateKeyboardEvent(None, 0, False)
-        Quartz.CGEventKeyboardSetUnicodeString(up, len(text), text)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+        for ch in text:
+            if guard is not None:
+                guard.before_event()
+            down = Quartz.CGEventCreateKeyboardEvent(None, 0, True)
+            Quartz.CGEventKeyboardSetUnicodeString(down, len(ch), ch)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+            up = Quartz.CGEventCreateKeyboardEvent(None, 0, False)
+            Quartz.CGEventKeyboardSetUnicodeString(up, len(ch), ch)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+            if guard is not None:
+                guard.after_event()
 
     # -- windows (CGWindowList) ----------------------------------------------------
     def list_windows(self) -> WindowList:
@@ -1031,6 +1043,89 @@ class MacOSBackend:
             raise BackendError(
                 f"pbcopy failed: {proc.stderr.strip() or proc.returncode}"
             )
+
+    # -- coexistence: presence + target binding (docs/designs/coexistence.md) ----
+    def presence_idle_ms(self) -> float:
+        """Milliseconds since the last input event (real OR synthetic) reached
+        this machine, via `CGEventSourceSecondsSinceLastEventType` against the
+        HID system input state - the `idle_source` the presence detector
+        (`presence.PresenceMonitor`) reconciles against its own injection
+        timestamps (\u00a75 of the coexistence design), the macOS counterpart to
+        `LinuxX11Backend.presence_idle_ms`.
+
+        `kCGEventSourceStateHIDSystemState` (not `...CombinedSessionState`)
+        matches what a real human's hardware keyboard/mouse and this backend's
+        own `CGEventPost` calls both feed - the same system-wide HID event
+        stream, so our own injections reset this counter exactly like a real
+        keystroke does (the same U1b property already relied on for Linux/
+        Windows). `kCGAnyInputEventType` reports the most recent event of ANY
+        type (motion, click, or key), matching \u00a75's "any input, synthetic or
+        real" requirement.
+
+        Verified working over SSH on a live MacBook (macOS 26.6 arm64) as part
+        of the O4 measurement run `presence.GUARD_MS["macos"]` is now based on
+        - see `presence.py`. Cheap: one in-process Quartz call, no subprocess,
+        safe to call once per elementary event.
+
+        Not part of the `Backend` protocol (`backend.py`) - looked up via
+        `getattr` by whatever constructs the `CoexistenceGuard` for this
+        backend, exactly like the Linux equivalent.
+        """
+        seconds = Quartz.CGEventSourceSecondsSinceLastEventType(
+            Quartz.kCGEventSourceStateHIDSystemState, Quartz.kCGAnyInputEventType
+        )
+        return float(seconds) * 1000.0
+
+    def current_target(self) -> str | None:
+        """Frontmost window handle, for target binding (\u00a78.6) - the O9 answer
+        for macOS.
+
+        Reuses the exact z-order signal `list_windows()` already trusts: Apple
+        documents `kCGWindowListOptionOnScreenOnly` as returning windows in
+        front-to-back order, so the first normal-layer (`kCGWindowLayer == 0`)
+        entry is the true frontmost window. This needs only the Screen
+        Recording permission `capture()`/`list_windows()` already depend on -
+        NOT the Accessibility/Automation TCC prompt a `CGWindowID ->
+        AXUIElement` lookup (`focus_window()`'s `osascript` approach) would
+        require. That is the deliberate choice made here: a reliable
+        frontmost-window identity IS obtainable without a new permission
+        prompt, so target binding can be enforced on macOS rather than merely
+        declared "unverified" as \u00a78.6 anticipated might be necessary
+        pending O9.
+
+        Returns `None` - never a guessed handle - when window enumeration
+        itself is unavailable (Screen Recording revoked, or zero on-screen
+        windows). `TargetBinding.status` then reports `"unverified"` for the
+        operation rather than silently pretending to enforce a check it could
+        not make (\u00a78.6) - the same stable, declared-honest fallback
+        `LinuxX11Backend.current_target` uses when its desktop has no
+        `_NET_ACTIVE_WINDOW`; `None` IS that stable sentinel, not a new one,
+        because `TargetBinding` already defines exactly what it means.
+
+        Caveat, stated plainly: this is reasoned from the same documented
+        z-order behavior `list_windows()` already relies on in production, but
+        has not been independently re-verified against a live Mac for
+        target-binding use specifically - no macOS hardware was driven for
+        this change (see the accompanying report). Treat this as a
+        well-founded implementation pending that confirmation, not as a
+        second O9 probe result.
+        """
+        try:
+            info_list = Quartz.CGWindowListCopyWindowInfo(
+                Quartz.kCGWindowListOptionOnScreenOnly
+                | Quartz.kCGWindowListExcludeDesktopElements,
+                Quartz.kCGNullWindowID,
+            )
+        except Exception:  # noqa: BLE001 - a read failure here must never crash
+            return None
+        for entry in info_list or []:
+            if int(entry.get("kCGWindowLayer", 0)) != 0:
+                continue
+            wid = entry.get("kCGWindowNumber")
+            if wid is None:
+                continue
+            return str(int(wid))
+        return None
 
     def close(self) -> None:
         """No persistent resources held: every Core Graphics/AX call above is a

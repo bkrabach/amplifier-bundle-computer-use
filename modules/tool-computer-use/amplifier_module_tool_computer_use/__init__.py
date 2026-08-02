@@ -26,11 +26,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import inspect
 import json
 import logging
+import os
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +62,37 @@ MARKER = "__amplifier_computer_use__"
 
 SHOT_DIR = Path.home() / ".amplifier" / "computer-use" / "shots"
 SHOT_TTL_SECONDS = 2 * 60 * 60
+
+#: Security hardening (adversarial review, no prior gating beyond the parent
+#: directory's inherited umask): screenshots of a driven desktop are
+#: sensitive content on a shared/multi-user controller box - a world- or
+#: group-readable shot directory lets any other local account read them for
+#: the full TTL window. `0700`/`0600` restrict both the per-session directory
+#: and every file in it to this process's own user, regardless of umask
+#: (umask only affects the mode `mkdir`/`open` request initially - it is not
+#: itself a floor, so an explicit `os.chmod` after creation is what actually
+#: guarantees this rather than merely hoping the umask happens to be strict).
+_PRIVATE_DIR_MODE = 0o700
+_PRIVATE_FILE_MODE = 0o600
+
+
+def _text_digest(text: str) -> str:
+    """A short, stable, non-reversible fingerprint for an audit log line -
+    never the plaintext itself. Matches the discipline
+    `docs/designs/remote-transport.md` \u00a710 specifies for `type_text`
+    (`args_digest`, not `args`) - this bundle previously did not actually
+    implement that logging for ANY action; this is the shared primitive
+    behind extending it to every write op that carries free-form text
+    (`type`, `set_clipboard`)."""
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _bytes_digest(data: bytes) -> str:
+    """Same fingerprint primitive as `_text_digest`, for binary payloads
+    (screenshot/zoom PNG bytes) - \u00a73 of the task: \"add at least a content
+    hash entry for captures.\""""
+    return hashlib.sha256(data).hexdigest()[:16]
+
 
 ACTIONS = [
     "screenshot",
@@ -111,11 +145,26 @@ _CLICK_ACTIONS = {
 
 
 def _prune_shots() -> None:
+    """Delete expired screenshot files across every per-session subdirectory.
+
+    Screenshots now live under `SHOT_DIR/<session_id>/*.png` (one subdirectory
+    per `ComputerTool` instance - see `ComputerTool.__init__`'s `_session_id`
+    and `execute()`) rather than one flat shared directory, so this glob is
+    `*/*.png`, not `*.png`. Also best-effort removes session directories that
+    are now empty, so a long-lived controller does not accumulate one empty
+    directory per past session forever.
+    """
     cutoff = time.time() - SHOT_TTL_SECONDS
     try:
-        for old in SHOT_DIR.glob("*.png"):
+        for old in SHOT_DIR.glob("*/*.png"):
             if old.stat().st_mtime < cutoff:
                 old.unlink(missing_ok=True)
+        for session_dir in SHOT_DIR.glob("*"):
+            if session_dir.is_dir():
+                try:
+                    session_dir.rmdir()  # no-op (raises, caught) if not empty
+                except OSError:
+                    pass
     except OSError:  # pragma: no cover - best-effort housekeeping
         pass
 
@@ -198,6 +247,48 @@ class ComputerTool:
         # D2: resolved once (by mount(), right after backend selection) and cached -
         # never touched on the request hot path. See `resolve_display`.
         self._display: Display | None = None
+
+        # -- security hardening: per-session screenshot scoping ---------------
+        # A fresh id per `ComputerTool` instance (i.e. per mount, in practice
+        # per session) - `execute()` writes screenshots under
+        # `SHOT_DIR/self._session_id/`, not the flat shared directory every
+        # session previously wrote into together. See `execute()` and
+        # `_prune_shots()`.
+        self._session_id: str = uuid.uuid4().hex
+
+        # -- security hardening: clipboard read policy ------------------------
+        # `get_clipboard` (docs/designs/DesktopTool) previously had no gate
+        # beyond `read_only` - a full clipboard read flows verbatim into
+        # `ToolResult.output`, then the model provider's API, then a durable
+        # transcript, and a clipboard can carry things a screenshot never
+        # shows (a just-copied password, an unseen paste buffer). This is a
+        # DISTINCT, explicit policy from `read_only`/`gate_writes` (a read,
+        # not a write) - see `DesktopTool.execute()`'s `get_clipboard` branch
+        # for where it is enforced and audit-logged.
+        #   - "allow": clipboard content returned verbatim (the only
+        #     behavior that existed before this hardening pass).
+        #   - "redact": length + a short content digest only, never the text
+        #     itself - the same digest-not-plaintext discipline this pass
+        #     also applies to `type_text`/`set_clipboard` audit logging.
+        #   - "block": the action fails, same shape as `read_only` blocking
+        #     a write.
+        # Default mirrors this module's existing `read_only`/`gate_writes`
+        # precedent exactly (safer for remote - a machine you are, by
+        # definition, not looking at; unchanged for local, preserving every
+        # existing local caller's behavior): "allow" locally, "redact" for a
+        # remote target - UNLESS the operator already blocked clipboard
+        # reads entirely via `read_only` (`_READ_ONLY_BLOCKED` in
+        # `DesktopTool`), in which case this policy is moot.
+        clipboard_policy_cfg = cfg.get("clipboard_read_policy")
+        if clipboard_policy_cfg is None:
+            self._clipboard_read_policy = "redact" if self._is_remote else "allow"
+        else:
+            self._clipboard_read_policy = str(clipboard_policy_cfg)
+            if self._clipboard_read_policy not in {"allow", "redact", "block"}:
+                raise ValueError(
+                    "config 'clipboard_read_policy' must be one of "
+                    f"'allow'/'redact'/'block', got {clipboard_policy_cfg!r}"
+                )
 
         # -- human/agent coexistence (docs/designs/coexistence.md) -----------
         # Built by `mount()` (`_build_coexistence_guard`), never constructed
@@ -504,6 +595,48 @@ class ComputerTool:
             )
         self._tool_version = resolved
 
+    # -- coexistence guard wiring for every mutating action ----------------------
+    @contextmanager
+    def _guard_write(self, *, coord: tuple[int, int] | None = None):
+        """Wrap one mutating action in the coexistence guard's before/after
+        discipline (`docs/designs/coexistence.md` \u00a75.2/\u00a78.6), extended in
+        this pass from `type_text` (the only action guarded before) to every
+        action in `MUTATING`.
+
+        Checked ONCE, around the whole action - not once per constituent
+        click/motion inside a composite - matching \u00a78.4's "complete the
+        composite (\u2264~200ms), then honour the pause" rule: `double_click`/
+        `triple_click` (multiple clicks), `left_click_drag` (down+move+up),
+        and `scroll` (N wheel notches) are each faster than the OS's own
+        double-click timing window, so interrupting between their
+        constituent events would silently convert a double_click into a
+        single click - exactly the failure \u00a78.4 warns against. A human
+        detected mid-composite is instead caught at the very next action's
+        guard check, bounded by the same ~200ms this design already accepts
+        as the pause-latency cost of an atomic composite (\u00a712). `type`
+        keeps its own separate, finer-grained per-keystroke wiring
+        (`backend.type_text(..., guard=guard)`) precisely because a
+        multi-hundred-character string is NOT a tightly-timed composite -
+        the two cases are handled differently on purpose, not by oversight.
+
+        A no-op context (nothing enforced, identical to every action's
+        behavior before this pass) when no guard exists for this backend/
+        platform (`self._coexistence_guard is None` - e.g. Windows, or any
+        platform with coexistence explicitly disabled).
+        """
+        guard = self._coexistence_guard
+        if guard is None:
+            yield
+            return
+        guard.check_start_permission()
+        guard.bind_target()
+        guard.before_event(coord=coord)
+        try:
+            yield
+        finally:
+            guard.after_event()
+            guard.release_target()
+
     # -- execution --------------------------------------------------------------
     def _run(self, action: str, params: dict[str, Any]) -> tuple[str, str | None]:
         """Run one Anthropic computer-tool action against `self._backend`.
@@ -536,6 +669,13 @@ class ComputerTool:
                 region = (m.x, m.y, m.x + m.width, m.y + m.height)
             b64 = capture_scaled_b64(
                 backend, disp, region, self._max_edge, self._max_pixels
+            )
+            # \u00a73 audit hardening: a content hash for every capture, never the
+            # pixels themselves in the log - the same digest-not-plaintext
+            # discipline applied below to type/set_clipboard.
+            logger.info(
+                "computer-use audit: op=screenshot sha256=%s",
+                _bytes_digest(base64.standard_b64decode(b64)),
             )
             return "screenshot captured", b64
 
@@ -625,31 +765,43 @@ class ComputerTool:
             handle = params.get("handle")
             if not handle:
                 raise ValueError("action 'focus_window' requires 'handle'")
-            backend.focus_window(str(handle))
+            with self._guard_write():
+                backend.focus_window(str(handle))
             return f"focused window {handle}", None
 
         if action in _CLICK_ACTIONS:
             button, count = _CLICK_ACTIONS[action]
             x, y = coord() if params.get("coordinate") is not None else (None, None)
-            backend.click(x, y, button=button, count=count)
+            with self._guard_write(
+                coord=(x, y) if x is not None and y is not None else None
+            ):
+                backend.click(x, y, button=button, count=count)
             where = (
                 f" at {params.get('coordinate')}" if params.get("coordinate") else ""
             )
+            logger.info("computer-use audit: op=%s%s", action, where)
             return f"{action}{where}", None
 
         if action == "mouse_move":
             x, y = coord()
-            backend.move(x, y)
+            with self._guard_write(coord=(x, y)):
+                backend.move(x, y)
             return f"mouse_move at {params.get('coordinate')}", None
 
         if action == "left_mouse_down":
             x, y = coord() if params.get("coordinate") is not None else (None, None)
-            backend.mouse_down(x, y, "left")
+            with self._guard_write(
+                coord=(x, y) if x is not None and y is not None else None
+            ):
+                backend.mouse_down(x, y, "left")
             return "left_mouse_down", None
 
         if action == "left_mouse_up":
             x, y = coord() if params.get("coordinate") is not None else (None, None)
-            backend.mouse_up(x, y, "left")
+            with self._guard_write(
+                coord=(x, y) if x is not None and y is not None else None
+            ):
+                backend.mouse_up(x, y, "left")
             return "left_mouse_up", None
 
         if action == "left_click_drag":
@@ -657,7 +809,16 @@ class ComputerTool:
                 coord("start_coordinate") if params.get("start_coordinate") else None
             )
             end = coord()
-            backend.drag(start, end)
+            # Guarded once around the whole drag (down+move+up), per
+            # `_guard_write`'s docstring - a drag is exactly the kind of
+            # tightly-timed composite \u00a78.4 says must complete, not tear.
+            # `coord=end` (not `start`): the exclusion-zone check (\u00a77.5)
+            # cares about where the drag's synthetic input actually lands.
+            with self._guard_write(coord=end):
+                backend.drag(start, end)
+            logger.info(
+                "computer-use audit: op=left_click_drag start=%s end=%s", start, end
+            )
             return f"dragged to {params.get('coordinate')}", None
 
         if action == "scroll":
@@ -666,16 +827,25 @@ class ComputerTool:
             if not direction:
                 raise ValueError("action 'scroll' requires 'scroll_direction'")
             amount = int(params.get("scroll_amount") or params.get("amount") or 3)
-            backend.scroll(x, y, str(direction), amount)
+            with self._guard_write(
+                coord=(x, y) if x is not None and y is not None else None
+            ):
+                backend.scroll(x, y, str(direction), amount)
             return f"scrolled {direction} x{amount}", None
 
         if action in {"key", "hold_key"}:
             if not text:
                 raise ValueError(f"action {action!r} requires 'text'")
-            if action == "key":
-                backend.key(str(text))
-            else:
-                backend.hold_key(str(text), float(params.get("duration") or 1.0))
+            with self._guard_write():
+                if action == "key":
+                    backend.key(str(text))
+                else:
+                    backend.hold_key(str(text), float(params.get("duration") or 1.0))
+            # Combos (e.g. "ctrl+s") are short, symbolic, and not free-form
+            # secret text the way typed prose or a clipboard payload can be -
+            # logged directly, unlike \u00a73's digest-not-plaintext rule for
+            # `type`/`set_clipboard` below.
+            logger.info("computer-use audit: op=%s combo=%s", action, text)
             return f"pressed {text}", None
 
         if action == "type":
@@ -698,6 +868,16 @@ class ComputerTool:
                     guard.release_target()
             else:
                 backend.type_text(body)
+            # §3 audit hardening: a digest, never the plaintext - typed
+            # content frequently includes credentials (the same rationale
+            # `docs/designs/remote-transport.md` §10 already gives for
+            # `type_text`'s `args_digest`; this is where that discipline is
+            # actually implemented, and where `set_clipboard` below matches it).
+            logger.info(
+                "computer-use audit: op=type chars=%d sha256=%s",
+                len(body),
+                _text_digest(body),
+            )
             return f"typed {len(body)} characters", None
 
         if action == "wait":
@@ -749,11 +929,32 @@ class ComputerTool:
         # Screenshots live on disk; only a path travels in the transcript. The hook
         # inlines the bytes at request time, so the transcript never carries base64.
         # (Marker protocol unchanged - see hook-computer-use.)
+        #
+        # Security hardening: previously one flat directory shared by every
+        # session, relying entirely on the inherited umask for permissions -
+        # on a shared/multi-user controller box that can leave screenshots of
+        # a driven desktop world- or group-readable for the full TTL window.
+        # Now: a per-session subdirectory (`self._session_id`, set once in
+        # `__init__`), and BOTH the directory and the file get an explicit
+        # `os.chmod` after creation - umask only affects the mode requested
+        # at creation time, it is not itself a guarantee, so this is what
+        # actually enforces owner-only access regardless of umask.
         SHOT_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(SHOT_DIR, _PRIVATE_DIR_MODE)
+        # Prune BEFORE creating this call's own session directory - not
+        # after. `_prune_shots()` also removes now-empty session
+        # directories (housekeeping for past sessions); running it after
+        # creating (but before writing into) the CURRENT session directory
+        # would race with that cleanup and delete the directory this very
+        # call is about to write into, since it is briefly empty.
         _prune_shots()
+        session_dir = SHOT_DIR / self._session_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(session_dir, _PRIVATE_DIR_MODE)
 
-        path = SHOT_DIR / f"{uuid.uuid4().hex}.png"
+        path = session_dir / f"{uuid.uuid4().hex}.png"
         path.write_bytes(base64.standard_b64decode(image_b64))
+        os.chmod(path, _PRIVATE_FILE_MODE)
         disp = self.display
         return ToolResult(
             success=True,
@@ -868,11 +1069,53 @@ class DesktopTool:
             # protocol, move the (possibly-remote) blocking call off the event
             # loop at this boundary instead.
             if action == "get_clipboard":
+                # §3 hardening: `clipboard_read_policy` (ComputerTool.__init__)
+                # is an explicit, named, always-audited gate distinct from
+                # `read_only` - see that attribute's docstring for the full
+                # rationale and default rules.
+                policy = self._computer._clipboard_read_policy
+                if policy == "block":
+                    return ToolResult(
+                        success=False,
+                        error={
+                            "message": "action 'get_clipboard' blocked by "
+                            "clipboard_read_policy=block"
+                        },
+                    )
                 output = await asyncio.to_thread(backend.get_clipboard)
+                digest = _text_digest(output)
+                logger.info(
+                    "computer-use audit: op=get_clipboard policy=%s chars=%d sha256=%s",
+                    policy,
+                    len(output),
+                    digest,
+                )
+                if policy == "redact":
+                    return ToolResult(
+                        success=True,
+                        output=(
+                            f"<clipboard content redacted by policy "
+                            f"(clipboard_read_policy=redact): {len(output)} chars, "
+                            f"sha256={digest}>"
+                        ),
+                    )
                 return ToolResult(success=True, output=output)
             if action == "set_clipboard":
-                await asyncio.to_thread(
-                    backend.set_clipboard, str(input.get("text") or "")
+                body = str(input.get("text") or "")
+                # Same guard discipline every other mutating action in
+                # `ComputerTool._run` now gets (§2) - `set_clipboard` mutates
+                # target state but is dispatched here, not through `_run`,
+                # so it needs its own explicit wiring rather than inheriting
+                # `_guard_write` for free.
+                with self._computer._guard_write():
+                    await asyncio.to_thread(backend.set_clipboard, body)
+                # §3 audit hardening: digest, never plaintext - the same
+                # discipline `type` uses, since clipboard content is exactly
+                # the kind of thing that "frequently includes credentials."
+                logger.info(
+                    "computer-use audit: op=set_clipboard chars=%d sha256=%s",
+                    len(body),
+                    _text_digest(body),
                 )
                 return ToolResult(success=True, output="clipboard set")
             if action == "list_monitors":
@@ -935,8 +1178,9 @@ def _build_coexistence_guard(
     has no proven presence-detector wiring yet (`docs/designs/coexistence.md`).
 
     Deliberately conservative: a guard is only ever constructed for a backend
-    that exposes `presence_idle_ms()` (today: `LinuxX11Backend` only - see
-    that method's docstring). A backend with no such method gets no
+    that exposes `presence_idle_ms()` (today: `LinuxX11Backend` and, since
+    `presence.GUARD_MS["macos"]` was measured by O4, `MacOSBackend` too - see
+    each method's docstring). A backend with no such method gets no
     coexistence layer at all, rather than one built on a guessed/unmeasured
     `GUARD` band - the same "do not claim a guarantee you do not have"
     principle \u00a75.5 applies to Windows `type_text`.

@@ -335,3 +335,207 @@ def test_probe_unavailable_when_zero_displays(monkeypatch):
     result = backend.probe()
     assert result.available is False
     assert "zero active displays" in result.reason
+
+
+# -- coexistence: presence_idle_ms / current_target (TASK 1) -------------------
+#
+# Everything below is a faked `Quartz` module - no real Core Graphics call is
+# ever made, and no macOS hardware is touched (see the accompanying report:
+# these behaviors are reasoned from documented Apple behavior and unit-tested
+# here, but have not been independently re-verified against a live Mac).
+
+
+class _FakePresenceQuartz:
+    """Stand-in for `Quartz`, exposing only what `presence_idle_ms`/
+    `current_target` touch."""
+
+    def __init__(
+        self, idle_seconds: float = 0.0, windows: list[dict] | None = None
+    ) -> None:
+        self.idle_seconds = idle_seconds
+        self.windows = windows if windows is not None else []
+        self.last_event_source_state = None
+        self.last_event_type = None
+
+    def CGEventSourceSecondsSinceLastEventType(self, state, event_type):
+        self.last_event_source_state = state
+        self.last_event_type = event_type
+        return self.idle_seconds
+
+    kCGEventSourceStateHIDSystemState = "HIDSystemState"
+    kCGAnyInputEventType = "AnyInputEventType"
+
+    def CGWindowListCopyWindowInfo(self, options, relative_to):
+        return list(self.windows)
+
+    kCGWindowListOptionOnScreenOnly = 1
+    kCGWindowListExcludeDesktopElements = 16
+    kCGNullWindowID = 0
+
+
+def test_presence_idle_ms_converts_seconds_to_milliseconds(monkeypatch):
+    fake = _FakePresenceQuartz(idle_seconds=0.0123)
+    monkeypatch.setattr(macos, "Quartz", fake)
+    backend = MacOSBackend({})
+
+    idle_ms = backend.presence_idle_ms()
+
+    assert idle_ms == pytest.approx(12.3, abs=0.001)
+
+
+def test_presence_idle_ms_uses_hid_system_state_and_any_input_event(monkeypatch):
+    """The two constants matter: HID system state (not combined-session
+    state) is what a real human's hardware AND this backend's own
+    `CGEventPost` calls both feed - see `presence_idle_ms`'s docstring."""
+    fake = _FakePresenceQuartz(idle_seconds=1.0)
+    monkeypatch.setattr(macos, "Quartz", fake)
+    backend = MacOSBackend({})
+
+    backend.presence_idle_ms()
+
+    assert fake.last_event_source_state == fake.kCGEventSourceStateHIDSystemState
+    assert fake.last_event_type == fake.kCGAnyInputEventType
+
+
+def test_current_target_returns_frontmost_normal_layer_window(monkeypatch):
+    fake = _FakePresenceQuartz(
+        windows=[
+            {"kCGWindowLayer": 0, "kCGWindowNumber": 4242},
+            {"kCGWindowLayer": 0, "kCGWindowNumber": 99},
+        ]
+    )
+    monkeypatch.setattr(macos, "Quartz", fake)
+    backend = MacOSBackend({})
+
+    assert backend.current_target() == "4242"
+
+
+def test_current_target_skips_non_normal_layer_windows():
+    """Menu bar / dock / overlay windows (`kCGWindowLayer != 0`) must not be
+    reported as the frontmost target - matches `list_windows()`'s own
+    filtering."""
+    fake = _FakePresenceQuartz(
+        windows=[
+            {"kCGWindowLayer": 25, "kCGWindowNumber": 1},  # e.g. the dock
+            {"kCGWindowLayer": 0, "kCGWindowNumber": 777},
+        ]
+    )
+    import amplifier_module_tool_computer_use.macos as macos_mod
+
+    macos_mod.Quartz = fake
+    backend = MacOSBackend({})
+
+    assert backend.current_target() == "777"
+
+
+def test_current_target_returns_none_when_enumeration_fails():
+    """§8.6: a read failure must report `None` (-> `TargetBinding` reports
+    "unverified") rather than raising or guessing a handle."""
+
+    class _BoomQuartz:
+        def CGWindowListCopyWindowInfo(self, options, relative_to):
+            raise RuntimeError("Screen Recording revoked")
+
+        kCGWindowListOptionOnScreenOnly = "OnScreenOnly"
+        kCGWindowListExcludeDesktopElements = "ExcludeDesktopElements"
+        kCGNullWindowID = 0
+
+    import amplifier_module_tool_computer_use.macos as macos_mod
+
+    macos_mod.Quartz = _BoomQuartz()
+    backend = MacOSBackend({})
+
+    assert backend.current_target() is None
+
+
+def test_current_target_returns_none_when_zero_windows():
+    fake = _FakePresenceQuartz(windows=[])
+    import amplifier_module_tool_computer_use.macos as macos_mod
+
+    macos_mod.Quartz = fake
+    backend = MacOSBackend({})
+
+    assert backend.current_target() is None
+
+
+# -- coexistence: per-character type_text guard wiring (TASK 1) ---------------
+
+
+class _FakeTypeQuartz:
+    """Stand-in for `Quartz`, exposing only what `type_text` (and the
+    `_ensure_input_trusted` gate it calls) touch."""
+
+    kCGHIDEventTap = "HIDEventTap"
+
+    def __init__(self) -> None:
+        self.posted_strings: list[str] = []
+
+    def CGEventCreateKeyboardEvent(self, source, keycode, key_down):
+        return {"keycode": keycode, "key_down": key_down, "unicode": ""}
+
+    def CGEventKeyboardSetUnicodeString(self, event, length, text):
+        event["unicode"] = text
+
+    def CGEventPost(self, tap, event):
+        self.posted_strings.append(event["unicode"])
+
+
+class _FakeGuard:
+    """Records before_event()/after_event() call order - no real
+    `CoexistenceGuard`/`PresenceMonitor` needed to prove the per-character
+    wiring shape itself."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def before_event(self) -> None:
+        self.calls.append("before")
+
+    def after_event(self) -> None:
+        self.calls.append("after")
+
+
+def test_type_text_posts_one_event_pair_per_character(monkeypatch):
+    fake = _FakeTypeQuartz()
+    monkeypatch.setattr(macos, "Quartz", fake)
+    monkeypatch.setattr(MacOSBackend, "_ensure_input_trusted", lambda self: None)
+    backend = MacOSBackend({})
+
+    backend.type_text("ab")
+
+    # Two characters -> two down events + two up events, one CGEvent PAIR
+    # per character (not one CGEvent for the whole string) - this is what
+    # makes per-keystroke guard checks meaningful at all (§5.2).
+    assert fake.posted_strings == ["a", "a", "b", "b"]
+
+
+def test_type_text_calls_guard_before_and_after_each_character(monkeypatch):
+    fake = _FakeTypeQuartz()
+    monkeypatch.setattr(macos, "Quartz", fake)
+    monkeypatch.setattr(MacOSBackend, "_ensure_input_trusted", lambda self: None)
+    backend = MacOSBackend({})
+    guard = _FakeGuard()
+
+    backend.type_text("xyz", guard=guard)
+
+    assert guard.calls == [
+        "before",
+        "after",
+        "before",
+        "after",
+        "before",
+        "after",
+    ]
+
+
+def test_type_text_with_no_guard_skips_every_guard_call(monkeypatch):
+    """Omitting `guard` (the default) must not invoke anything guard-shaped -
+    existing callers with no guard are unaffected."""
+    fake = _FakeTypeQuartz()
+    monkeypatch.setattr(macos, "Quartz", fake)
+    monkeypatch.setattr(MacOSBackend, "_ensure_input_trusted", lambda self: None)
+    backend = MacOSBackend({})
+
+    backend.type_text("hi")  # guard=None (default) - must not raise
+
+    assert fake.posted_strings == ["h", "h", "i", "i"]
