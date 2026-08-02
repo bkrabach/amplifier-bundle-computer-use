@@ -154,7 +154,27 @@ GUARD_MEASURED: dict[str, bool] = {
     # Unresolved. Do not treat the 297ms halt as proof of human detection until
     # this is settled; it is currently only proof that the halt PATH executes.
     #
-    # CORRECTION 2026-08-02: I previously recorded the root cause below as
+    # SECOND CORRECTION 2026-08-02. The correction below ("the bundle's own
+    # injection works, use be.move()") is ALSO wrong, and the reason matters.
+    # Registration counts across every attempt: 1/150, 1/300, 4/100, 1/40 -
+    # and the standalone single-move test, 1/1. It is ALWAYS the first move of
+    # a session and never the rest. A primitive that genuinely registered input
+    # would not have that signature.
+    # The explanation that fits all of it: `move()` reaches SetCursorPos, which
+    # MOVES THE CURSOR WITHOUT REGISTERING AS INPUT - a fact already recorded in
+    # this repo's own notes ("SetCursorPos to current coords does NOT reset the
+    # idle timer"). The single test's idle drop (58188 -> 859ms) was therefore
+    # coincidental - something else touched the box in that window - and I
+    # generalised one observation into a working primitive it never was.
+    # CURSOR MOVEMENT IS NOT EVIDENCE OF INPUT REGISTRATION. Those are separate
+    # things and this comment exists because conflating them cost seven
+    # attempts.
+    # Still unmeasured. The next attempt needs a primitive VERIFIED to move the
+    # idle timer repeatedly (assert idle drops on EVERY call, not once), which
+    # neither hand-rolled SendInput nor move() has been shown to do from here.
+    #
+    # FIRST CORRECTION (kept - its factual observations hold, its conclusion
+    # does not): I previously recorded the root cause below as
     # "UIPI / session isolation blocks SendInput". THAT WAS WRONG, and it is
     # corrected here rather than quietly deleted.
     # The bundle's OWN injection path works fine over the exact same SSH
