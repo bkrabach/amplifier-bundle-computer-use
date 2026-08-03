@@ -61,7 +61,7 @@ from __future__ import annotations
 
 import logging
 
-from .providers import beta_headers, model_tool_types
+from .providers import beta_headers, dialect_for_tool_type, model_tool_types
 
 logger = logging.getLogger(__name__)
 
@@ -219,14 +219,40 @@ def resolve_tool_version(
     return FALLBACK_TOOL_VERSION, False
 
 
-def beta_header_for(tool_version: str) -> str:
-    """The `anthropic-beta` header value for `tool_version`.
+def beta_header_for(tool_version: str) -> str | None:
+    """The beta header that opts `tool_version` into native tool use, or `None`
+    when the vendor that owns it HAS NO SUCH CONCEPT.
 
-    Falls back to the header for `FALLBACK_TOOL_VERSION` for a `tool_version`
-    string this module has never seen (e.g. a brand new, explicitly configured
-    type) - a missing beta header degrades to "server treats it as an ordinary
-    tool", not a crash.
+    `None` and "some header string" are different answers, and this function
+    used to be unable to tell them apart. It was a flat
+    `BETA_HEADER_FOR_VERSION.get(tool_version, <anthropic's fallback>)`, so
+    every type not in Anthropic's table - including OpenAI's bare `computer`,
+    whose vendor has no beta-header mechanism at all - was handed Anthropic's
+    `computer-use-2025-11-24`. An empty `beta_headers` on a `Dialect` said
+    "this vendor has no such concept" and the lookup heard "unknown type".
+
+    The distinction is recoverable from the table already in hand, with no new
+    field: ask which dialect OWNS the type.
+
+      * Owned by a dialect -> that dialect's own answer is authoritative,
+        including the absence of one. `computer` -> `None`, because OpenAI has
+        no beta header, not because we failed to find one.
+      * Owned by nobody (`dialect_for_tool_type` fell through to
+        `DEFAULT_DIALECT`) -> genuinely unknown, e.g. a brand new, explicitly
+        configured Anthropic type this build predates. Keep the historical
+        fallback: a *wrong-generation* Anthropic beta header still opts into
+        computer-use, whereas no header at all silently degrades the tool to an
+        ordinary function tool.
+
+    Incumbent behaviour is unchanged, and that is a property of the data rather
+    than a coincidence: every one of `ANTHROPIC.tool_types` has an entry in
+    `ANTHROPIC.beta_headers`, so "owned but absent" cannot arise for it.
+    `tests/test_provider_dialects.py` pins that as an invariant of the table -
+    a dialect's `beta_headers` must be empty (no such concept) or total over
+    its `tool_types` (no accidental holes) - so a future type added without a
+    header fails the suite instead of silently resolving to `None`.
     """
-    return BETA_HEADER_FOR_VERSION.get(
-        tool_version, BETA_HEADER_FOR_VERSION[FALLBACK_TOOL_VERSION]
-    )
+    dialect = dialect_for_tool_type(tool_version)
+    if tool_version in dialect.tool_types:
+        return dialect.beta_headers.get(tool_version)
+    return BETA_HEADER_FOR_VERSION[FALLBACK_TOOL_VERSION]

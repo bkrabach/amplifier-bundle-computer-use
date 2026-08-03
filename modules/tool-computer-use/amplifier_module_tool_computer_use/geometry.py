@@ -17,6 +17,26 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
+class ImageSpace:
+    """The pixel size of the screenshot the model was actually shown.
+
+    The *sub-fact* of `Display` that a provider dialect needs in order to read a
+    tool call: a vendor that emits normalized or relative coordinates cannot be
+    translated into MODEL space without knowing how big that image was. It is
+    deliberately NOT a `Display` - a dialect has no business knowing the screen
+    size, the monitor origin, or the model->screen mapping. It reads a payload;
+    the only thing outside the payload it can legitimately need is what the
+    model was looking at when it wrote it.
+
+    Per-session and mutable mid-session (`ComputerTool.select_monitor`), so it
+    is passed per call rather than closed over anywhere.
+    """
+
+    width: int
+    height: int
+
+
+@dataclass(frozen=True)
 class Display:
     """Mapping between the real desktop and the image the model actually sees."""
 
@@ -26,6 +46,12 @@ class Display:
     model_height: int
     origin_x: int = 0
     origin_y: int = 0
+
+    @property
+    def image_space(self) -> ImageSpace:
+        """Just the model-image size, for callers with no business knowing the
+        rest of this mapping - see `ImageSpace` and `providers.read_call`."""
+        return ImageSpace(self.model_width, self.model_height)
 
     @property
     def scale_x(self) -> float:

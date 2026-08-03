@@ -41,7 +41,7 @@ from amplifier_core.models import ToolResult
 
 from .backend import Backend, BackendError, MonitorInfo
 from .coexistence_guard import CoexistenceGuard, HaltedError
-from .geometry import Display, compute_display
+from .geometry import Display, ImageSpace, compute_display
 from .halt_state import load_halt, make_durable_halt_poll, record_halt
 from .imaging import capture_scaled_b64
 from .ledger import HeldInputLedger
@@ -504,6 +504,22 @@ class ComputerTool:
             )
         return self._display
 
+    @property
+    def image_space(self) -> ImageSpace | None:
+        """The coordinate space a tool-call payload's numbers are relative to:
+        the size of the screenshot the model was actually shown.
+
+        `None`, rather than raising like `display`, when geometry was never
+        resolved - and that difference is deliberate. This is read at the very
+        top of `execute()`, BEFORE its error handling; raising here would turn
+        every unmounted-display tool call into an exception escaping `execute()`
+        instead of the clean `ToolResult` error it returns today. A dialect that
+        needs the size and is handed `None` raises `ValueError` naming what is
+        missing, which `execute()` already converts into an ordinary tool error.
+        Loud, in the right place, without moving the failure outside the handler.
+        """
+        return None if self._display is None else self._display.image_space
+
     # -- Tool protocol ----------------------------------------------------------
     @property
     def name(self) -> str:
@@ -569,6 +585,32 @@ class ComputerTool:
 
     # -- native promotion (read by hook-computer-use) ---------------------------
     @property
+    def native_tool_type(self) -> str:
+        """The native tool type this tool has resolved for THIS turn - the key
+        `providers.dialect_for_tool_type` dispatches on.
+
+        Exists because `hook-computer-use` needs exactly this fact and had no
+        honest way to get it. It was reading `native_tool_spec["type"]`, i.e.
+        recovering a vendor-neutral fact by parsing a VENDOR-SHAPED artifact.
+        That works only for vendors that happen to put their type under a key
+        named `type`; a vendor that discriminates by some other key has no
+        `type` at all, and the hook silently fell back to a default belonging to
+        a different vendor and probed the mounted provider for the wrong wire
+        convention entirely.
+
+        The fix is not to teach the hook more wire formats - it declares
+        `dependencies = []` and cannot import `providers.py`, by design. It is
+        to stop making it infer: the tool already knows the answer, so it says
+        it. Plain `str`, no import, no coupling - the same duck-typed read the
+        hook already does for `native_tool_spec`.
+
+        For both dialects that put their type on the wire this is exactly
+        `native_tool_spec["type"]`, so the hook's answer for them is unchanged -
+        pinned in `tests/test_provider_dialects.py`.
+        """
+        return self._tool_version
+
+    @property
     def native_tool_spec(self) -> dict[str, Any]:
         """The native tool declaration for whichever dialect `_tool_version`
         belongs to (`providers.py`) - sized to the cached display when that
@@ -616,7 +658,11 @@ class ComputerTool:
         )
 
     @property
-    def native_beta_header(self) -> str:
+    def native_beta_header(self) -> str | None:
+        """`None` when the vendor owning this tool type has no beta-header
+        mechanism at all - a distinct answer from any header string, and one
+        this used to be unable to give (see `tool_versions.beta_header_for`).
+        A caller must send no header for `None`, never an empty one."""
         return beta_header_for(self._tool_version)
 
     def note_model(self, model: str | None) -> None:
@@ -995,7 +1041,7 @@ class ComputerTool:
         genuine per-dialect difference is what a result must carry -
         `result_must_carry_screenshot`.
         """
-        dialect, calls = read_call(input)
+        dialect, calls = read_call(input, self.image_space)
 
         last_summary = ""
         last_image_b64: str | None = None
@@ -1031,34 +1077,8 @@ class ComputerTool:
                     # screenshot transfer. Cheap locally too - `asyncio.to_thread`
                     # on a microsecond-scale X11/Quartz call costs a thread-pool
                     # round trip, not a network one.
-                    # THE ONE EDIT GEMINI FORCED OUTSIDE `providers.py`.
-                    # Anthropic and OpenAI both emit absolute pixels in the
-                    # screenshot's own space, so `read_call` was already a
-                    # complete translation for them. Gemini emits a normalized
-                    # 0..999 grid, and converting that needs the model image
-                    # size - a fact `read_actions` is not given and cannot
-                    # obtain (it takes only the payload, and the size is
-                    # per-session and mutable via `desktop.select_monitor`, so
-                    # it cannot be closed over when `DIALECTS` is built at
-                    # import time).
-                    #
-                    # Placed HERE, inside the same handler as `_run`, rather
-                    # than at the top of the loop: `self.display` can raise
-                    # `BackendError` when mount never resolved geometry, and
-                    # `_run` already reads it under exactly this handler. Any
-                    # earlier and an unmounted display would turn today's clean
-                    # "unknown action" ToolResult into an escaping exception.
-                    # Identity for both existing dialects, so their behaviour
-                    # is bit-for-bit unchanged - `providers._already_model_space`.
                     summary, image_b64 = await asyncio.to_thread(
-                        self._run,
-                        action,
-                        dialect.to_model_space(
-                            action,
-                            params,
-                            self.display.model_width,
-                            self.display.model_height,
-                        ),
+                        self._run, action, params
                     )
                 except HaltedError as exc:
                     return self._record_halt_result(action, exc)

@@ -177,3 +177,23 @@ def test_beta_header_for_unknown_version_falls_back_safely():
     assert beta_header_for("computer_99999999") == beta_header_for(
         FALLBACK_TOOL_VERSION
     )
+
+
+def test_beta_header_for_a_vendor_with_no_such_concept_is_none():
+    """ "No beta-header mechanism" and "type I don't recognise" are different
+    answers, and this used to give the same one to both. `computer` is OpenAI's
+    and OpenAI has no beta-header opt-in at all, so the honest answer is `None`
+    - not Anthropic's `computer-use-2025-11-24`, which is what a flat dict
+    lookup with an Anthropic-shaped default returned."""
+    assert beta_header_for("computer") is None
+
+
+def test_beta_header_for_still_falls_back_for_a_genuinely_unknown_type():
+    """An unrecognised `computer_*` string is owned by no dialect, so it stays
+    a real unknown and keeps the historical fallback. A wrong-generation
+    Anthropic header still opts into computer-use; no header at all would
+    silently degrade the tool to an ordinary function tool."""
+    assert beta_header_for("computer_99999999") == beta_header_for(
+        FALLBACK_TOOL_VERSION
+    )
+    assert beta_header_for("computer_99999999") is not None

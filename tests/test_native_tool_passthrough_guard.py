@@ -466,3 +466,92 @@ def test_wrap_provider_wraps_openai_shaped_provider():
 
     assert wrapped is True
     assert getattr(provider, hook_mod._WRAPPED_FLAG, False) is True
+
+
+# ---------------------------------------------------------------------------
+# _resolve_native_tool_type: read the fact, do not infer it from the artifact
+# ---------------------------------------------------------------------------
+
+
+class _CoordinatorWithTool:
+    def __init__(self, tool) -> None:
+        self._tool = tool
+
+    def get(self, mount_point, name=None):
+        return self._tool if (mount_point, name) == ("tools", "computer") else None
+
+
+def test_resolve_native_tool_type_prefers_the_tools_own_statement():
+    """`native_tool_type` is the tool STATING which type it is declaring.
+    `native_tool_spec["type"]` is that same fact INFERRED from a vendor-shaped
+    wire dict. When both exist the stated one wins - it is the authority, and
+    the wire dict is only ever a projection of it."""
+
+    class _StatesAndDeclares:
+        @property
+        def native_tool_type(self) -> str:
+            return "computer_20250124"
+
+        @property
+        def native_tool_spec(self) -> dict:
+            return {"type": "computer_20250124", "name": "computer"}
+
+    assert (
+        hook_mod._resolve_native_tool_type(_CoordinatorWithTool(_StatesAndDeclares()))
+        == "computer_20250124"
+    )
+
+
+def test_resolve_native_tool_type_falls_back_to_the_wire_type_when_not_stated():
+    """Unchanged behaviour for anything mounted under `computer` that predates
+    `native_tool_type` - including this file's own `_FakeComputerTool`."""
+    coord = _CoordinatorWithTool(_FakeComputerTool("computer"))
+    assert hook_mod._resolve_native_tool_type(coord) == "computer"
+
+
+def test_resolve_native_tool_type_answers_for_a_declaration_with_no_wire_type():
+    """THE GAP THIS CLOSES. A vendor whose declaration is discriminated by its
+    own key has no top-level `type`, so the old inference returned `None` and
+    this function fell through to `_DEFAULT_PROBE_TOOL_TYPE` - a DIFFERENT
+    vendor's type - and then probed the mounted provider for the wrong wire
+    convention, silently. Reading the stated fact answers correctly without
+    this module knowing any wire format, and without importing anything (it
+    declares `dependencies = []`)."""
+
+    class _NoWireType:
+        @property
+        def native_tool_type(self) -> str:
+            return "some_vendor_tool"
+
+        @property
+        def native_tool_spec(self) -> dict:
+            return {"some_vendor_tool": {"environment": "DESKTOP"}}
+
+    resolved = hook_mod._resolve_native_tool_type(_CoordinatorWithTool(_NoWireType()))
+    assert resolved == "some_vendor_tool"
+    assert resolved != hook_mod._DEFAULT_PROBE_TOOL_TYPE
+
+
+def test_resolve_native_tool_type_survives_a_raising_stated_type():
+    """Both sources are properties, and a property that raises must not take
+    down the request path (the D3 class of bug). A raising `native_tool_type`
+    logs and falls through to the wire type rather than propagating."""
+
+    class _RaisesThenDeclares:
+        @property
+        def native_tool_type(self) -> str:
+            raise RuntimeError("boom")
+
+        @property
+        def native_tool_spec(self) -> dict:
+            return {"type": "computer_20241022"}
+
+    coord = _CoordinatorWithTool(_RaisesThenDeclares())
+    assert hook_mod._resolve_native_tool_type(coord) == "computer_20241022"
+
+
+def test_resolve_native_tool_type_falls_back_when_nothing_is_mounted():
+    assert (
+        hook_mod._resolve_native_tool_type(_CoordinatorWithTool(None))
+        == hook_mod._DEFAULT_PROBE_TOOL_TYPE
+    )

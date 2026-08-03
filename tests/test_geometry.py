@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
 
 from amplifier_module_tool_computer_use.geometry import (
     Display,
+    ImageSpace,
     compute_display,
 )
 
@@ -208,3 +209,22 @@ def test_to_model_clamps_real_screen_coords_from_a_different_negative_monitor():
     mx, my = disp.to_model(0, 0)  # (0, 0) is real, but on DISPLAY3, not this one
     assert 0 <= mx <= disp.model_width - 1
     assert 0 <= my <= disp.model_height - 1
+
+
+# -- ImageSpace ----------------------------------------------------------------
+
+
+def test_image_space_is_just_the_model_image_size():
+    """What a provider dialect needs to read a payload, and nothing more: a
+    dialect has no business knowing the screen size or the monitor origin."""
+    disp = Display(
+        screen_width=3840,
+        screen_height=2160,
+        model_width=1280,
+        model_height=720,
+        origin_x=1920,
+        origin_y=0,
+    )
+    space = disp.image_space
+    assert (space.width, space.height) == (1280, 720)
+    assert space == ImageSpace(1280, 720)

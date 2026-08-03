@@ -314,19 +314,44 @@ def _provider_supports_native_computer_tool(
 
 
 def _resolve_native_tool_type(coordinator: Any) -> str:
-    """The native tool `type` the mounted `computer` tool is actually about
-    to declare this turn, read from its own `native_tool_spec` - never
-    guessed from provider identity or hardcoded to one vendor's convention.
+    """The native tool type the mounted `computer` tool is actually about to
+    declare this turn - never guessed from provider identity or hardcoded to
+    one vendor's convention.
 
-    Falls back to `_DEFAULT_PROBE_TOOL_TYPE` only when no real answer is
-    available: `computer` is not mounted this session (lookup fails,
+    Two sources, in this order, and the order is the whole point:
+
+    1. `tool.native_tool_type` - the tool STATING the fact. Preferred, because
+       "which tool type am I declaring" is a vendor-neutral question and the
+       tool is the only thing that actually knows the answer.
+    2. `tool.native_tool_spec["type"]` - the fact INFERRED from the vendor's
+       wire declaration. Kept for any `computer`-named tool that predates (1),
+       including this suite's own fakes.
+
+    Source 2 was the only source, and it is structurally unable to answer for a
+    vendor that does not put its type under a key called `type`. Not every one
+    does: a declaration can be discriminated by its own vendor key, in which
+    case `native.get("type")` is `None` and this function used to fall through
+    to `_DEFAULT_PROBE_TOOL_TYPE` - ANOTHER VENDOR'S type - and then probe the
+    mounted provider for the wrong wire convention entirely, silently. That is
+    not a fallback, it is a wrong answer wearing a fallback's clothes.
+
+    The fix is deliberately NOT "teach this module the wire formats". Those
+    live in `tool-computer-use`'s `providers.py`, and this module declares
+    `dependencies = []` and installs standalone, so it cannot import that table
+    - and a soft `try/except ImportError` around it would be exactly the silent
+    degradation this bundle exists to prevent. Nothing here needs to know a
+    wire format anyway; it needs one string. So the tool hands it over, by the
+    same duck-typed attribute read this function already does for
+    `native_tool_spec`. No import, no dependency, no inference.
+
+    `_DEFAULT_PROBE_TOOL_TYPE` remains for the case where there is genuinely no
+    answer to read: `computer` is not mounted this session (lookup fails,
     returns `None`, or - in unit tests - a fake coordinator never registers
-    one), or the mounted object under that name does not expose
-    `native_tool_spec` at all. That fallback is not a guess about which
-    vendor is in play; it is the same representative value this module used
-    before per-tool-type resolution existed, kept as the default so a
-    provider capability probe run with no tool context still means
-    something (see the direct `_provider_supports_native_computer_tool`/
+    one), or the mounted object exposes neither source. That fallback is not a
+    guess about which vendor is in play; it is the same representative value
+    this module used before per-tool-type resolution existed, kept so a
+    provider capability probe run with no tool context still means something
+    (see the direct `_provider_supports_native_computer_tool`/
     `_provider_derives_native_tool_betas` calls in this module's test suite).
     """
     tool = None
@@ -334,7 +359,26 @@ def _resolve_native_tool_type(coordinator: Any) -> str:
         tool = coordinator.get("tools", "computer")
     except Exception:
         logger.debug("computer-use: 'computer' tool lookup failed", exc_info=True)
-    if tool is not None and getattr(type(tool), "native_tool_spec", None) is not None:
+    if tool is None:
+        return _DEFAULT_PROBE_TOOL_TYPE
+
+    # Class-level descriptor check, never `hasattr` on the instance: both of
+    # these are properties, and `hasattr` swallows only `AttributeError`, so a
+    # property raising anything else escapes a guard written to contain it.
+    # That exact bug (D3) took down every request on this path once already.
+    if getattr(type(tool), "native_tool_type", None) is not None:
+        try:
+            stated = tool.native_tool_type
+        except Exception:
+            logger.exception(
+                "computer-use: reading native_tool_type from the mounted "
+                "'computer' tool raised"
+            )
+        else:
+            if isinstance(stated, str) and stated:
+                return stated
+
+    if getattr(type(tool), "native_tool_spec", None) is not None:
         try:
             native = tool.native_tool_spec
         except Exception:

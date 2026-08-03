@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
 
 import pytest
 from amplifier_module_tool_computer_use import providers
+from amplifier_module_tool_computer_use.geometry import ImageSpace
 from amplifier_module_tool_computer_use.tool_versions import (
     BETA_HEADER_FOR_VERSION,
     KNOWN_MODEL_TOOL_VERSIONS,
@@ -224,3 +225,132 @@ def test_tool_versions_tables_are_assembled_from_the_dialects():
     # OpenAI has no beta-header opt-in for this tool, and must not acquire one
     # by inheriting Anthropic's.
     assert "computer" not in BETA_HEADER_FOR_VERSION
+
+
+# -- coordinate space: the seam's vocabulary for "what were these numbers
+# -- measured against" (see `Dialect.read_actions`' second argument)
+# ---------------------------------------------------------------------------
+
+
+class _ExplodingImageSpace:
+    """Raises on ANY attribute access, including `__class__` reads by
+    `isinstance`. Handed to a reader that must not consult it."""
+
+    def __getattribute__(self, name):  # pragma: no cover - the point is it isn't hit
+        raise AssertionError(f"image_space was consulted: .{name}")
+
+
+@pytest.mark.parametrize(
+    ("dialect", "payload"),
+    [
+        (providers.ANTHROPIC, {"action": "left_click", "coordinate": [1, 2]}),
+        (providers.OPENAI, {"actions": [{"type": "move", "x": 3, "y": 4}]}),
+    ],
+)
+def test_incumbent_readers_never_consult_the_image_space(dialect, payload):
+    """Mechanical proof of inertness for the two dialects driving a real
+    desktop today: both emit absolute pixels in the screenshot's own space, so
+    knowing the image size must make no difference to how their payloads are
+    read. Anything but total non-use would be a behaviour change on a live
+    path, so this asserts non-use rather than sameness of output."""
+    exploding = _ExplodingImageSpace()
+    assert list(dialect.read_actions(payload, exploding)) == list(
+        dialect.read_actions(payload, None)
+    )
+    assert list(providers.read_call(payload, exploding)[1]) == list(
+        providers.read_call(payload)[1]
+    )
+
+
+def test_read_call_hands_the_image_space_to_the_dialect_that_claims_the_payload(
+    monkeypatch,
+):
+    """The plumbing itself, independent of any vendor that needs it: whatever
+    `read_call` is given reaches the reader that claims the payload."""
+    seen: list[object] = []
+
+    def _claiming_reader(payload, image_space):
+        seen.append(image_space)
+        return [("screenshot", {})]
+
+    probe = providers.Dialect(
+        name="probe",
+        tool_types=("probe_type",),
+        declare=lambda t, **kw: {"type": t},
+        read_actions=_claiming_reader,
+        result_must_carry_screenshot=False,
+    )
+    monkeypatch.setattr(
+        providers, "DIALECTS", (probe, providers.DEFAULT_DIALECT), raising=True
+    )
+
+    space = ImageSpace(1280, 720)
+    dialect, calls = providers.read_call({"anything": True}, space)
+
+    assert dialect is probe
+    assert list(calls) == [("screenshot", {})]
+    assert seen == [space]
+
+
+def test_a_dialect_that_needs_the_image_space_and_is_handed_none_fails_loud(
+    monkeypatch,
+):
+    """The `None` default is not a licence to guess. A reader that genuinely
+    needs the size must raise, naming the missing fact - and `execute()` turns
+    a `ValueError` from iteration into an ordinary tool error."""
+
+    def _needs_the_space(payload, image_space):
+        def _gen():
+            if image_space is None:
+                raise ValueError(
+                    "cannot read normalized coordinates: the size of the image "
+                    "the model was shown is not available"
+                )
+            yield ("screenshot", {})
+
+        return _gen()
+
+    probe = providers.Dialect(
+        name="probe",
+        tool_types=("probe_type",),
+        declare=lambda t, **kw: {"type": t},
+        read_actions=_needs_the_space,
+        result_must_carry_screenshot=False,
+    )
+    monkeypatch.setattr(
+        providers, "DIALECTS", (probe, providers.DEFAULT_DIALECT), raising=True
+    )
+
+    _, calls = providers.read_call({"anything": True})
+    with pytest.raises(ValueError, match="not available"):
+        list(calls)
+
+
+# -- "this vendor has no such concept" is a distinct answer from "unknown" ----
+
+
+def test_beta_headers_are_either_absent_entirely_or_total_over_tool_types():
+    """`beta_header_for` now treats an owned type with no header as a definite
+    `None` ("this vendor has no such mechanism") rather than falling back to
+    another vendor's header. That is only safe while a dialect's `beta_headers`
+    has no accidental holes, so the table must be all-or-nothing: empty (no
+    such concept) or total over `tool_types`. A new type added without its
+    header fails here instead of silently resolving to `None`."""
+    for dialect in providers.DIALECTS:
+        if not dialect.beta_headers:
+            continue
+        missing = [t for t in dialect.tool_types if t not in dialect.beta_headers]
+        assert not missing, (dialect.name, missing)
+
+
+def test_the_wire_type_and_the_stated_type_agree_for_every_dialect_that_has_one():
+    """`ComputerTool.native_tool_type` states the tool type directly, and
+    `hook-computer-use` now prefers it over parsing `native_tool_spec["type"]`.
+    For every dialect that DOES put its type on the wire under `type`, the two
+    sources must give the same answer - otherwise this change would have moved
+    the hook's answer for a live path."""
+    for dialect in providers.DIALECTS:
+        for tool_type in dialect.tool_types:
+            spec = dialect.declare(tool_type, width=1280, height=720, enable_zoom=False)
+            if "type" in spec:
+                assert spec["type"] == tool_type, (dialect.name, tool_type)

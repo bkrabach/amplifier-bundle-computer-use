@@ -62,6 +62,8 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from .geometry import ImageSpace
+
 #: Anthropic's `computer` action names carrying the tool's own vocabulary.
 #: OpenAI's `computer_call` action `type` -> this tool's `action` name, for the
 #: click shapes whose target depends on `button` (every other type maps 1:1
@@ -79,14 +81,6 @@ _OPENAI_BUTTON_TO_ACTION = {
 #: expects. Deliberately a plain tuple in a plain iterable, NOT a named
 #: `ActionBatch` type - see `read_call`.
 Call = tuple[str, dict[str, Any]]
-
-
-def _already_model_space(
-    action: str, params: dict[str, Any], model_width: int, model_height: int
-) -> dict[str, Any]:
-    """Identity `to_model_space` - for dialects whose coordinates already ARE
-    model-space pixels (Anthropic, OpenAI). See `Dialect.to_model_space`."""
-    return params
 
 
 def _normalize_openai_action(raw: Mapping[str, Any]) -> Call:
@@ -173,7 +167,22 @@ class Dialect:
     #: Read a tool-call payload into this tool's own `(action, params)`
     #: vocabulary, or return `None` if the payload is not written in this
     #: dialect. May raise `ValueError` while iterating - see `read_call`.
-    read_actions: Callable[[Mapping[str, Any]], Iterable[Call] | None]
+    #:
+    #: The second argument is the COORDINATE SPACE the payload's numbers are
+    #: relative to: the size of the screenshot the model was actually shown
+    #: (`None` when the tool has not resolved its display geometry yet). It is
+    #: the one fact about the world outside the payload that reading a payload
+    #: can legitimately need, and it is passed rather than closed over because
+    #: it is per-session and changes mid-session (`select_monitor`).
+    #:
+    #: Both incumbent dialects ignore it - they emit absolute pixels in the
+    #: screenshot's own space, so the payload is already self-describing. A
+    #: dialect emitting normalized or relative coordinates cannot be read
+    #: without it, and one that needs it and is handed `None` must say so
+    #: loudly (`ValueError`), never guess a size.
+    read_actions: Callable[
+        [Mapping[str, Any], ImageSpace | None], Iterable[Call] | None
+    ]
 
     #: OpenAI's `computer_call_output` is invalid without an image, so a batch
     #: that produced none gets one more screenshot appended. Anthropic is happy
@@ -188,23 +197,6 @@ class Dialect:
     #: Wire type -> the beta header that opts into it. Empty for vendors with
     #: no such concept (OpenAI).
     beta_headers: Mapping[str, str] = field(default_factory=dict)
-
-    #: Rewrite one `(action, params)` pair into MODEL pixel space, given the
-    #: size of the image the model was actually shown.
-    #:
-    #: ADDED FOR GEMINI, and the one field that could NOT be filled without a
-    #: caller change. Anthropic and OpenAI both emit absolute pixels in the
-    #: screenshot's own space, so `read_actions` alone was a complete
-    #: translation for them and this field is the identity. Gemini emits a
-    #: normalized 0..999 grid, so its translation needs a fact `read_actions`
-    #: is not given and cannot obtain: the model image size. That size lives on
-    #: `ComputerTool.display` and changes mid-session (`desktop.select_monitor`),
-    #: so it cannot be closed over when `DIALECTS` is built at import time.
-    #: Hence a second, display-aware step, applied by `ComputerTool.execute`
-    #: between `read_call` and `_run` - see that method.
-    to_model_space: Callable[[str, dict[str, Any], int, int], dict[str, Any]] = (
-        _already_model_space
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -238,9 +230,17 @@ def _declare_anthropic(
     return spec
 
 
-def _read_anthropic_action(payload: Mapping[str, Any]) -> Iterable[Call]:
+def _read_anthropic_action(
+    payload: Mapping[str, Any], image_space: ImageSpace | None
+) -> Iterable[Call]:
     """Anthropic sends exactly one action per tool call, with the action name
     under `action` and its parameters as siblings.
+
+    `image_space` is accepted and NEVER READ: Anthropic emits absolute pixels
+    in the screenshot's own space, so the payload is already self-describing
+    and this dialect's translation is complete without knowing the image size.
+    Proven mechanically - `tests/test_provider_dialects.py` hands both
+    incumbent readers an object that raises on any attribute access.
 
     The catch-all: never returns `None`, so it must be last in `DIALECTS`. An
     unrecognised or missing `action` is deliberately passed through as-is -
@@ -310,13 +310,19 @@ def _normalize_openai_batch(raw_actions: list[Any]) -> Iterator[Call]:
         yield _normalize_openai_action(entry)
 
 
-def _read_openai_actions(payload: Mapping[str, Any]) -> Iterable[Call] | None:
+def _read_openai_actions(
+    payload: Mapping[str, Any], image_space: ImageSpace | None
+) -> Iterable[Call] | None:
     """OpenAI batches one or more actions under a single `computer_call`'s
     `actions` list. `amplifier-module-provider-openai` carries that batch
     through as `arguments={"actions": [...]}` (see its
     `_extract_computer_actions`), so the presence of that list IS the wire
     signature - detection by actual shape, never by asking which provider is
     mounted.
+
+    `image_space` is accepted and NEVER READ - same reason as
+    `_read_anthropic_action`: `x`/`y` are absolute pixels in the screenshot's
+    own space, so nothing outside the payload is needed to read it.
     """
     raw = payload.get("actions")
     if not isinstance(raw, list):
@@ -345,31 +351,8 @@ OPENAI = Dialect(
 
 
 # ---------------------------------------------------------------------------
-# Gemini: NO wire `type` at all, NORMALIZED coordinates, one function per verb
+# Gemini: no wire `type` at all, verb-per-function, normalized 0..999 grid
 # ---------------------------------------------------------------------------
-#
-# Transcribed from live traffic captured 2026-08-03
-# (`tests/fixtures/captures/gemini-*.json`) against
-# `gemini-2.5-computer-use-preview-10-2025`. Every divergence below is a
-# recorded 200/400 or a measured cursor position, not a reading of Google's
-# docs - which disagree with the traffic in at least two places (see
-# `_normalize_gemini_action`).
-#
-# What did NOT fit the `Dialect` shape as it stood, and what each cost:
-#
-#   1. NORMALIZED COORDINATES -> a new `to_model_space` field AND an edit to
-#      `ComputerTool.execute`. `read_actions` receives only the payload; the
-#      conversion needs the model image size, which is per-session, mutable
-#      (`desktop.select_monitor`), and therefore not closeable-over at import
-#      time. This is the one strain that reached outside this file.
-#   2. NO WIRE `type` -> `tool_types` stops being "type strings this dialect
-#      owns on the wire" and becomes an internal key. `dialect_for_tool_type`
-#      still works; `hook-computer-use._resolve_native_tool_type`, which reads
-#      `native_tool_spec["type"]`, does NOT - see `_declare_gemini`.
-#   3. SCROLL MAGNITUDE IS A NORMALIZED DISTANCE, not a notch count -> could
-#      not be absorbed at all. `Call = tuple[str, dict]` carries no units, and
-#      no fixture pins a pixels-per-notch value. Fails loud - see
-#      `_normalize_gemini_action`.
 
 #: Gemini emits coordinates on a fixed 0..999 INTEGER GRID over the screenshot,
 #: never in image pixels. Proven decisively by `gemini-unknown5.json`: probing
@@ -401,16 +384,6 @@ def _declare_gemini(
     -> accepted; `{"type": "computer_use", ...}` -> 400 `Unknown name "type"
     at 'tools[0]'`. The vendor key IS the discriminator.
 
-    Consequence this function cannot fix from inside this module:
-    `hook-computer-use._resolve_native_tool_type` reads `native_tool_spec`
-    and takes `native.get("type")`. For this shape that is `None`, so the hook
-    silently falls back to `_DEFAULT_PROBE_TOOL_TYPE` - Anthropic's
-    `computer_20251124` - and probes the mounted provider for the wrong
-    vendor's wire convention entirely. See
-    `tests/test_gemini_dialect.py::test_seam_gap_hook_resolves_the_wrong_tool_type_for_gemini`,
-    which pins that wrong answer as a measured fact rather than leaving it
-    undiscovered.
-
     `width`/`height`/`enable_zoom` are accepted and discarded, exactly as in
     `_declare_openai` and for the same reason: no caller should have to know
     which dialect wants what.
@@ -418,20 +391,37 @@ def _declare_gemini(
     return {"computer_use": {"environment": "ENVIRONMENT_DESKTOP"}}
 
 
-def _normalize_gemini_action(name: str, args: Mapping[str, Any]) -> Call:
+def _normalize_gemini_action(
+    name: str, args: Mapping[str, Any], image_space: ImageSpace | None
+) -> Call:
     """Translate ONE Gemini `functionCall` into this tool's `(action, params)`
-    vocabulary. Coordinates stay in Gemini's 0..999 space here - converting
-    them needs the display, which arrives later via `to_model_space`.
+    vocabulary, in MODEL pixel space.
 
     Raises `ValueError` - surfaced to the model as an ordinary tool error - for
-    every verb this tool has no honest equivalent for. Nothing is guessed at.
+    every verb this tool has no honest equivalent for, and for a normalized
+    coordinate that cannot be placed because the image it was measured against
+    is unknown. Nothing is guessed at.
     """
 
     def xy() -> list[float]:
         x, y = args.get("x"), args.get("y")
         if x is None or y is None:
             raise ValueError(f"gemini action {name!r} is missing x/y")
-        return [float(x), float(y)]
+        if image_space is None:
+            raise ValueError(
+                f"gemini action {name!r} carries normalized 0-{_GEMINI_COORD_MAX} "
+                "coordinates, which cannot be placed without the size of the "
+                "image the model was shown; display geometry is not resolved"
+            )
+        # Deliberately FLOAT. Rounding to whole model pixels here loses the
+        # fraction `Display.to_screen` needs: for the proof capture, y=84 is
+        # 60.48 model px, which scales to 181 screen px (the measured truth),
+        # while a pre-rounded 60 scales to 180. One pixel - but it is the
+        # difference between reproducing the capture and approximating it.
+        return [
+            float(x) * image_space.width / _GEMINI_COORD_SPAN,
+            float(y) * image_space.height / _GEMINI_COORD_SPAN,
+        ]
 
     if name in ("move_to", "hover_at"):
         return "mouse_move", {"coordinate": xy()}
@@ -446,17 +436,23 @@ def _normalize_gemini_action(name: str, args: Mapping[str, Any]) -> Call:
         # captured `magnitude: 999` against a 720px-tall image, i.e. a
         # NORMALIZED DISTANCE, while this tool's `scroll_amount` - and
         # `Backend.scroll`'s `amount` beneath it - is a WHEEL NOTCH COUNT.
-        # Converting one to the other needs a pixels-per-notch constant that no
-        # capture provides and that differs per platform and per application.
-        # `Call` is `tuple[str, dict]` with no unit metadata, so there is
-        # nowhere to carry "this number is 999/1000ths of a screen height"
-        # forward either. Inventing a constant here would be exactly the
-        # inference the `models` tables forbid, so this fails loud instead.
+        #
+        # Note what this is NOT: it is not the coordinate problem again.
+        # `image_space` is right here and it does not help. Converting a
+        # distance-on-screen into notches needs pixels-per-notch, which is a
+        # property of the TARGET (X11 issues N discrete button-4/5 events;
+        # macOS posts N `kCGScrollEventUnitLine` lines; the pixels either
+        # produces depend on the focused application's line height and the
+        # user's scroll settings) - not a property of the vendor. There is no
+        # value `Dialect` could hold that would be correct, because the fact
+        # does not belong to the vendor at all. Inventing one here would be
+        # exactly the inference the `models` tables forbid, so this fails loud.
         raise ValueError(
             "gemini 'scroll_document' magnitude is a normalized 0-999 distance "
             f"(got {args.get('magnitude')!r}), but this tool's scroll_amount is a "
-            "wheel-notch count; no capture pins a pixels-per-notch conversion, so "
-            "it is not guessed at. Capture one against a real target to close this."
+            "wheel-notch count; pixels-per-notch is a property of the target "
+            "backend, not of the vendor, and no capture pins one, so it is not "
+            "guessed at. Capture one against a real target to close this."
         )
     if name == "open_web_browser":
         raise ValueError(
@@ -470,13 +466,15 @@ def _normalize_gemini_action(name: str, args: Mapping[str, Any]) -> Call:
     )
 
 
-def _normalize_gemini_batch(name: str, args: Mapping[str, Any]) -> Iterator[Call]:
+def _normalize_gemini_batch(
+    name: str, args: Mapping[str, Any], image_space: ImageSpace | None
+) -> Iterator[Call]:
     """One action per call, yielded LAZILY - and the laziness is load-bearing.
 
-    `ComputerTool.execute` calls `read_call` at `__init__.py:998`, OUTSIDE the
-    `try:` that begins at `:1002`. So a `ValueError` raised while *reading*
-    escapes `execute()` entirely instead of becoming a clean tool error, while
-    the identical `ValueError` raised while *iterating* is caught and returned.
+    `ComputerTool.execute` calls `read_call` OUTSIDE the `try:` that wraps
+    iteration. So a `ValueError` raised while *reading* escapes `execute()`
+    entirely instead of becoming a clean tool error, while the identical
+    `ValueError` raised while *iterating* is caught and returned.
 
     Neither incumbent dialect exposes that: Anthropic's reader never raises (it
     passes the action name through untouched and lets `execute` own the
@@ -485,16 +483,19 @@ def _normalize_gemini_batch(name: str, args: Mapping[str, Any]) -> Iterator[Call
     read time and sends exactly one action per call, so the obvious eager
     `return [_normalize_gemini_action(...)]` is what a third implementor
     writes - and it silently moves every Gemini verb error outside the caller's
-    error handling. Verified by writing it that way first.
+    error handling.
 
-    `Dialect.read_actions`'s type is `Callable[..., Iterable[Call] | None]`;
-    nothing in it distinguishes "iterable that raises on construction" from
-    "iterable that raises on iteration", and nothing enforces the difference.
+    `Dialect.read_actions`'s type distinguishes neither "iterable that raises
+    on construction" from "iterable that raises on iteration"; nothing enforces
+    the difference. STILL TRUE after the coordinate-space fix - see
+    `tests/test_gemini_dialect.py`, which pins the laziness directly.
     """
-    yield _normalize_gemini_action(name, args)
+    yield _normalize_gemini_action(name, args, image_space)
 
 
-def _read_gemini_actions(payload: Mapping[str, Any]) -> Iterable[Call] | None:
+def _read_gemini_actions(
+    payload: Mapping[str, Any], image_space: ImageSpace | None
+) -> Iterable[Call] | None:
     """Gemini's response envelope is `functionCall`/`functionResponse`, not
     `tool_use` (Anthropic) or `computer_call` (OpenAI), and the VERB IS THE
     FUNCTION NAME - `{"name": "move_to", "args": {"x": 311, "y": 84}}` - not a
@@ -517,37 +518,16 @@ def _read_gemini_actions(payload: Mapping[str, Any]) -> Iterable[Call] | None:
         return None
     # Detection eager, normalization lazy - see `_normalize_gemini_batch` for
     # why the second half of that is not a style choice.
-    return _normalize_gemini_batch(name, args)
-
-
-def _gemini_to_model_space(
-    action: str, params: dict[str, Any], model_width: int, model_height: int
-) -> dict[str, Any]:
-    """Gemini's 0..999 grid -> MODEL pixel space.
-
-    Deliberately returns FLOATS. Rounding to whole model pixels here loses the
-    fraction that `Display.to_screen` needs: for the proof capture, y=84 is
-    60.48 model px, which scales to 181 screen px (the measured truth), while
-    a pre-rounded 60 scales to 180. One pixel here, but it is the difference
-    between reproducing the capture and approximating it.
-    """
-    out = dict(params)
-    for key in ("coordinate", "start_coordinate"):
-        raw = params.get(key)
-        if isinstance(raw, (list, tuple)) and len(raw) >= 2:
-            out[key] = [
-                float(raw[0]) * model_width / _GEMINI_COORD_SPAN,
-                float(raw[1]) * model_height / _GEMINI_COORD_SPAN,
-            ]
-    return out
+    return _normalize_gemini_batch(name, args, image_space)
 
 
 GEMINI = Dialect(
     name="gemini",
     # NOT a wire `type` - Gemini has none (see `_declare_gemini`). This is an
-    # internal key so `dialect_for_tool_type` / `tool_versions` keep working;
-    # it never reaches the wire. The field's own docstring says "type strings
-    # this dialect owns on the wire", and for this dialect that is a lie of
+    # internal key so `dialect_for_tool_type` / `tool_versions` keep working,
+    # and it is what `ComputerTool.native_tool_type` states to the hook; it
+    # never reaches the wire. The field's own docstring says "type strings this
+    # dialect owns on the wire", and for this dialect that is a lie of
     # convenience - recorded here rather than papered over.
     tool_types=("computer_use",),
     declare=_declare_gemini,
@@ -564,14 +544,11 @@ GEMINI = Dialect(
         # `gemini-2.5-computer-use-preview-10-2025`.
         "gemini-2.5-computer-use": "computer_use",
     },
-    # Gemini has no beta-header opt-in for this tool. NOTE this empty table is
-    # NOT enough to keep Anthropic's header away from a Gemini session:
-    # `tool_versions.beta_header_for` falls back to
-    # `BETA_HEADER_FOR_VERSION[FALLBACK_TOOL_VERSION]` for any unknown type, so
-    # `beta_header_for("computer_use")` returns Anthropic's
-    # `computer-use-2025-11-24`. Pinned in `tests/test_gemini_dialect.py`.
+    # Gemini has no beta-header opt-in for this tool, and saying so is now a
+    # real answer rather than an absence indistinguishable from ignorance:
+    # `tool_versions.beta_header_for` asks which dialect OWNS the type, so
+    # `beta_header_for("computer_use")` returns `None`, not Anthropic's header.
     beta_headers={},
-    to_model_space=_gemini_to_model_space,
 )
 
 
@@ -599,9 +576,27 @@ def dialect_for_tool_type(tool_type: str) -> Dialect:
     return DEFAULT_DIALECT
 
 
-def read_call(payload: Mapping[str, Any]) -> tuple[Dialect, Iterable[Call]]:
+def read_call(
+    payload: Mapping[str, Any], image_space: ImageSpace | None = None
+) -> tuple[Dialect, Iterable[Call]]:
     """Which dialect this tool-call payload is written in, and the actions it
-    asks for - in order.
+    asks for - in this tool's own `(action, params)` vocabulary, in MODEL pixel
+    space, in order.
+
+    `image_space` is the COORDINATE SPACE the payload's numbers live in - the
+    size of the screenshot the model was actually shown. It is the one fact
+    about the world outside the payload that reading a payload can legitimately
+    require, and it is a parameter rather than something the table closes over
+    because it is per-session and changes mid-session (`select_monitor`), so
+    there is no correct value to bake in when `DIALECTS` is built at import
+    time.
+
+    Defaulted to `None` so a caller with no display context (every unit test
+    that only exercises absolute-pixel dialects) needs no ceremony. That is not
+    a silent degradation: a dialect that genuinely needs the size and is handed
+    `None` raises `ValueError` naming the missing fact, which `execute()`
+    already turns into an ordinary tool error. What it must never do is invent
+    a size.
 
     Keyed on payload SHAPE, not on the tool type currently declared: a session
     can have its `tool_version` corrected mid-flight (see
@@ -627,10 +622,10 @@ def read_call(payload: Mapping[str, Any]) -> tuple[Dialect, Iterable[Call]]:
             # it feeds (`tool_versions.KNOWN_MODEL_TOOL_VERSIONS`) without
             # silently changing which dialect reads a payload.
             continue
-        actions = dialect.read_actions(payload)
+        actions = dialect.read_actions(payload, image_space)
         if actions is not None:
             return dialect, actions
-    actions = DEFAULT_DIALECT.read_actions(payload)
+    actions = DEFAULT_DIALECT.read_actions(payload, image_space)
     if actions is None:  # pragma: no cover - the catch-all never declines
         raise AssertionError(
             f"{DEFAULT_DIALECT.name} is DEFAULT_DIALECT but declined a payload; "
