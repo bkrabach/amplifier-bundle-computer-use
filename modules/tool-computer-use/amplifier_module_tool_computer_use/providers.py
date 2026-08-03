@@ -58,6 +58,9 @@ there are exactly two vendors.
 
 from __future__ import annotations
 
+import json
+import math
+import re
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -548,6 +551,249 @@ GEMINI = Dialect(
     # real answer rather than an absence indistinguishable from ignorance:
     # `tool_versions.beta_header_for` asks which dialect OWNS the type, so
     # `beta_header_for("computer_use")` returns `None`, not Anthropic's header.
+    beta_headers={},
+)
+
+
+# ---------------------------------------------------------------------------
+# Qwen (Alibaba DashScope): OUT-OF-SAMPLE EXTENSIBILITY PROBE - NOT SHIPPED
+#
+# DELIBERATELY ABSENT FROM `DIALECTS`. This record is a measuring instrument for
+# the claim in `docs/designs/multi-provider-design.md` Sec 18 ("adding provider
+# N+1 is bounded work"), not a provider this bundle supports. Qwen was dropped
+# in Phase 0 BEFORE this module existed (`tests/fixtures/captures/qwen-verdict.md`),
+# so its shape informed nothing here - which is exactly what makes it a valid
+# out-of-sample test and what Sec 18 says the Gemini measurement lacked.
+#
+# Keeping it out of `DIALECTS` keeps real dispatch, `model_tool_types()` and
+# `beta_headers()` bit-identical. `tests/test_qwen_out_of_sample.py` monkeypatches
+# it in, exactly as the existing synthetic-dialect tests already do.
+#
+# RESULT OF THE PROBE - which of `Dialect`'s seven fields can hold Qwen's facts:
+#
+#   name                          FITS
+#   tool_types                    STRAINS - Qwen has no wire tool type in any
+#                                 sense; unlike Gemini (whose vendor key
+#                                 `computer_use` at least discriminates a real
+#                                 `tools[]` entry) Qwen puts NOTHING in `tools[]`.
+#                                 An entry here is a pure internal fiction.
+#   declare                       CANNOT - see `_declare_qwen`.
+#   read_actions                  FITS AS A FUNCTION, UNREACHABLE AS A PATH -
+#                                 see `_read_qwen_actions`.
+#   result_must_carry_screenshot  N/A - there is no `tool_result` block to carry
+#                                 anything; the screenshot goes back as an
+#                                 ordinary user-turn image.
+#   models                        VACUOUS - maps model -> tool type, and there is
+#                                 no tool type. Also cannot hold the per-model
+#                                 `smart_resize` numbers the coordinate mapping
+#                                 needs (`Mapping[str, str]`).
+#   beta_headers                  FITS (empty - no such concept), vacuously.
+# ---------------------------------------------------------------------------
+
+#: Alibaba's GUI-Plus doc extracts the action with exactly this regex over
+#: `message.content`. Transcribed from the doc, not designed here.
+_QWEN_TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+
+#: Qwen-VL's `smart_resize` rounds both image dimensions to a multiple of this
+#: before the vision encoder sees them, and the model emits coordinates in THAT
+#: space - not in the source image's space and not in the 0-1000 space its own
+#: system prompt claims. UNVERIFIED against a live call (region-locked, no key);
+#: transcribed from the published preprocessing helper. Present only to show
+#: what the coordinate mapping WOULD need, never to claim it is right.
+_QWEN_IMAGE_FACTOR = 28
+
+#: Also UNVERIFIED, and worse: these are per-MODEL-DEPLOYMENT numbers, not
+#: per-vendor ones. They are module constants here only because `Dialect.models`
+#: is a `Mapping[str, str]` and has nowhere to put a number. See the probe
+#: result table above.
+_QWEN_MIN_PIXELS = 3136
+_QWEN_MAX_PIXELS = 12_845_056
+
+
+def _qwen_smart_resize(width: int, height: int) -> tuple[int, int]:
+    """The resized `(width, height)` the vision encoder actually saw.
+
+    UNVERIFIED - see `_QWEN_IMAGE_FACTOR`. Included so the coordinate half of
+    the probe is a real function rather than a claim about one.
+    """
+    h_bar = max(
+        _QWEN_IMAGE_FACTOR, round(height / _QWEN_IMAGE_FACTOR) * _QWEN_IMAGE_FACTOR
+    )
+    w_bar = max(
+        _QWEN_IMAGE_FACTOR, round(width / _QWEN_IMAGE_FACTOR) * _QWEN_IMAGE_FACTOR
+    )
+    if h_bar * w_bar > _QWEN_MAX_PIXELS:
+        beta = math.sqrt((height * width) / _QWEN_MAX_PIXELS)
+        h_bar = math.floor(height / beta / _QWEN_IMAGE_FACTOR) * _QWEN_IMAGE_FACTOR
+        w_bar = math.floor(width / beta / _QWEN_IMAGE_FACTOR) * _QWEN_IMAGE_FACTOR
+    elif h_bar * w_bar < _QWEN_MIN_PIXELS:
+        beta = math.sqrt(_QWEN_MIN_PIXELS / (height * width))
+        h_bar = math.ceil(height * beta / _QWEN_IMAGE_FACTOR) * _QWEN_IMAGE_FACTOR
+        w_bar = math.ceil(width * beta / _QWEN_IMAGE_FACTOR) * _QWEN_IMAGE_FACTOR
+    return w_bar, h_bar
+
+
+class QwenNotDeclarableError(NotImplementedError):
+    """`Dialect.declare` has no codomain that can express Qwen's declaration.
+
+    A distinct type so the probe test asserts THIS, and can never accidentally
+    pass on some unrelated `NotImplementedError`.
+    """
+
+
+def _declare_qwen(
+    tool_type: str, *, width: int, height: int, enable_zoom: bool
+) -> dict[str, Any]:
+    """THE FIRST BREAK. There is no honest return value.
+
+    `declare`'s contract is "build the native tool declaration", and every
+    consumer puts the returned dict in the request's `tools[]` array:
+    `ComputerTool.native_tool_spec` -> the orchestrator's `_build_tool_spec` ->
+    `ToolSpec` -> the provider's tool list. That destination is baked into the
+    field, not into any one dialect.
+
+    Qwen puts NOTHING in `tools[]`. DashScope documents `type` as "Currently,
+    only function is supported" and the API reference contains zero
+    computer-use tool types. Its declaration is a `computer_use` JSON schema
+    PASTED INTO THE SYSTEM PROMPT AS TEXT (Alibaba's own GUI-Plus doc). The
+    schema is a dict, so the SHAPE is expressible - the SLOT is not. There is
+    no field on `Dialect` for "text that belongs in the system prompt" and no
+    consumer that would carry one there.
+
+    The three candidate return values and why each is forbidden:
+
+      * `{}` - emits an empty, malformed entry in `tools[]`. Silent degradation.
+      * the `computer_use` schema dict - puts a computer-use schema in the one
+        slot DashScope documents as function-only. Either a 400 or a SILENT
+        DROP; `qwen-verdict.md` explicitly records which of the two as
+        unverified, so choosing this is choosing a coin-flip between "fails
+        loudly" and "fails invisibly".
+      * `None` - violates the declared `dict[str, Any]` return type, and no
+        consumer has a "this dialect declares nothing" branch.
+
+    So it raises. A raising `declare` is not a stub - it is the measurement:
+    the seam can hold this vendor's NAME but not its DECLARATION.
+    """
+    raise QwenNotDeclarableError(
+        "Qwen has no native tool declaration: its computer_use schema is pasted "
+        "into the SYSTEM PROMPT as text, and `Dialect.declare` can only return a "
+        "dict destined for the request's `tools[]` array. Expressing this needs a "
+        "new Dialect field AND a new consumer that reaches the system prompt - "
+        "neither exists (see providers.py, Qwen probe)."
+    )
+
+
+def _normalize_qwen_action(
+    raw: Mapping[str, Any], image_space: ImageSpace | None
+) -> Call:
+    """Translate ONE regex-extracted Qwen `<tool_call>` body into this tool's
+    `(action, params)` vocabulary, in MODEL pixel space.
+
+    The action vocabulary itself absorbs cleanly - Qwen's pasted schema is
+    modelled on Anthropic's, so `left_click`/`type`/`key` arrive under `action`
+    with a `coordinate` pair, which is very nearly `_read_anthropic_action`'s
+    shape.
+
+    The COORDINATES are the interesting part, and this is the one axis where
+    the seam's existing vocabulary genuinely earns its keep: Qwen's numbers are
+    in the `smart_resize`d image's space, so they cannot be placed without
+    knowing the size of the image the model was shown - which is exactly what
+    `image_space` is and why `Dialect.read_actions` takes it. Handed `None`,
+    this raises rather than guessing, per `_normalize_gemini_action`'s
+    precedent.
+    """
+    args = raw.get("arguments")
+    body: Mapping[str, Any] = args if isinstance(args, Mapping) else raw
+    action = str(body.get("action") or "").strip()
+    params: dict[str, Any] = dict(body)
+
+    coord = params.get("coordinate")
+    if isinstance(coord, (list, tuple)) and len(coord) == 2:
+        if image_space is None:
+            raise ValueError(
+                f"qwen action {action!r} carries coordinates in the model's "
+                "internal smart_resize image space, which cannot be placed "
+                "without the size of the image the model was shown; display "
+                "geometry is not resolved"
+            )
+        resized_w, resized_h = _qwen_smart_resize(image_space.width, image_space.height)
+        params["coordinate"] = [
+            float(coord[0]) * image_space.width / resized_w,
+            float(coord[1]) * image_space.height / resized_h,
+        ]
+    return action, params
+
+
+def _normalize_qwen_batch(
+    bodies: list[Mapping[str, Any]], image_space: ImageSpace | None
+) -> Iterator[Call]:
+    """Lazy, for `_normalize_gemini_batch`'s reason: `ComputerTool.execute`
+    calls `read_call` OUTSIDE its `try:`, so a `ValueError` raised at read time
+    escapes the caller's error handling while the identical one raised during
+    iteration becomes a clean tool error."""
+    for body in bodies:
+        yield _normalize_qwen_action(body, image_space)
+
+
+def _read_qwen_actions(
+    payload: Mapping[str, Any], image_space: ImageSpace | None
+) -> Iterable[Call] | None:
+    """THE SECOND BREAK - and this one is about the CALLER, not the callee.
+
+    As a function this works: given the documented payload it extracts and
+    normalizes correctly, and `tests/test_qwen_out_of_sample.py` proves it end
+    to end through `read_call`.
+
+    What does not work is that NOTHING EVER CALLS IT. `read_actions`' entire
+    reachable surface is `read_call`, whose only caller is
+    `ComputerTool.execute`, which the orchestrator invokes only for a parsed
+    TOOL CALL: `amplifier-module-loop-streaming` does
+    `tool_calls = provider.parse_tool_calls(response)` and, on an empty list,
+    streams the response as final assistant text and never dispatches a tool
+    (`amplifier_module_loop_streaming/__init__.py:1785-1787`). Qwen emits no
+    tool call - its action is `<tool_call>...</tool_call>` INSIDE
+    `message.content`, and `parse_tool_calls` returns `response.tool_calls`,
+    which is empty.
+
+    So the shim below (accepting `{"content": <str>}`) is a fiction with no
+    producer. Something upstream would have to regex the assistant text and
+    synthesize a tool call; that something is a provider module or the hook,
+    both OUTSIDE `providers.py`, and one of them outside this repo entirely.
+
+    Detection is by shape, per the incumbents: a `content` string containing at
+    least one `<tool_call>` block.
+    """
+    content = payload.get("content")
+    if not isinstance(content, str):
+        return None
+    bodies: list[Mapping[str, Any]] = []
+    for blob in _QWEN_TOOL_CALL_RE.findall(content):
+        try:
+            parsed = json.loads(blob)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, Mapping):
+            bodies.append(parsed)
+    if not bodies:
+        return None
+    return _normalize_qwen_batch(bodies, image_space)
+
+
+QWEN = Dialect(
+    name="qwen",
+    # PURE FICTION - see the probe result table above. Qwen contributes nothing
+    # to `tools[]`, so there is no wire type to name and nothing this string
+    # could ever be checked against. Gemini's equivalent lie at least
+    # discriminates a real `tools[]` entry; this one discriminates nothing.
+    tool_types=("qwen_computer_use",),
+    declare=_declare_qwen,
+    read_actions=_read_qwen_actions,
+    # Not False-because-verified, False-because-inapplicable: Qwen returns the
+    # screenshot as an ordinary user-turn image, not as a `tool_result` block,
+    # so "must the result carry a screenshot" has no referent at all. The field
+    # cannot express "this question does not apply to me".
+    result_must_carry_screenshot=False,
+    models={},
     beta_headers={},
 )
 
