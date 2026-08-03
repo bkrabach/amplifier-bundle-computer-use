@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .exclusion import ExclusionZone
+from .halt_state import PERSISTED_BASIS
 from .pause import DragState, PauseController, PausedError
 from .presence import PresenceMonitor, PresenceSnapshot, PresenceState
 from .target_binding import TargetBinding, TargetChangedError
@@ -75,13 +76,39 @@ class HaltedError(RuntimeError):
                 f"{snapshot.transport_latency_ms:.1f}ms - effective_staleness="
                 f"{snapshot.effective_staleness_ms:.1f}ms, not guard_ms alone)"
             )
-        super().__init__(
-            "halted: a human at this machine produced input "
-            f"{snapshot.last_human_input_ago_ms:.1f}ms ago that this agent did "
-            f"not generate (margin={snapshot.margin_ms}, "
-            f"guard={snapshot.guard_ms}ms){transport_note}. "
-            "Halting before the next write."
-        )
+        if snapshot.basis == PERSISTED_BASIS:
+            # This snapshot was loaded from `halt_state.py`'s durable, on-disk
+            # record (`seed_halted()`, called from `_build_coexistence_guard`)
+            # - a MEMORY of a human detected in a PRIOR session, not a live
+            # sample. The live-sample wording below ("produced input Xms ago")
+            # would be actively wrong here: real wall-clock time has passed
+            # since detection - minutes, or the six weeks this exact
+            # ambiguity was reported over - and `last_human_input_ago_ms` on
+            # this snapshot is frozen at whatever it read at the ORIGINAL
+            # session's detection, not "just now". Presenting it as present
+            # tense invites exactly the wrong read - "someone's there right
+            # now, I'll come back later" - when waiting is guaranteed never
+            # to clear it; only an explicit human signal does.
+            super().__init__(
+                "halted: a PRIOR session recorded a human detected at this "
+                "machine and persisted that fact to disk - this is a MEMORY, "
+                "not a live reading. It does NOT mean someone is at the "
+                "keyboard right now, and it will not clear itself no matter "
+                "how long you wait - only an explicit human signal does. "
+                "Halting before the next write. To resume: after confirming "
+                "it is safe, run `python scripts/resume_after_halt.py` (repo "
+                "checkout) or the `amplifier-computer-use-resume` console "
+                "script (installed package, no checkout needed) for this "
+                "backend."
+            )
+        else:
+            super().__init__(
+                "halted: a human at this machine produced input "
+                f"{snapshot.last_human_input_ago_ms:.1f}ms ago that this agent did "
+                f"not generate (margin={snapshot.margin_ms}, "
+                f"guard={snapshot.guard_ms}ms){transport_note}. "
+                "Halting before the next write."
+            )
 
 
 class ExcludedCoordinateError(RuntimeError):

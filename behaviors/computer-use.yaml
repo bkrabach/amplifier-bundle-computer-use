@@ -17,9 +17,14 @@ tools:
       # Anthropic's guidance: at or below WXGA. Bigger is slower AND less accurate.
       max_edge: 1280
       enable_zoom: true
-      # true = screenshots only, all input blocked. Defaults to TRUE for a
-      # remote (ssh://) target even when unset here.
-      read_only: false
+      # read_only is deliberately UNSET here, not set to false: the code's own
+      # default (`ComputerTool.__init__`) is false for a local target and TRUE
+      # for a remote (ssh://) one - but that smart default only applies when
+      # the key is ABSENT. Shipping an explicit `read_only: false` would shadow
+      # it permanently, so uncommenting `target: ssh://...` above would silently
+      # keep write access on a machine you are not looking at. Set `read_only`
+      # explicitly yourself only if you want to override the default in either
+      # direction; see docs/SETUP.md \u00a75/\u00a76.
       # tool_version is deliberately unset: it is resolved from the live model on
       # every request (Anthropic's type is versioned per model generation; OpenAI's
       # is the bare `computer`). Setting it statically risks a stale pairing.

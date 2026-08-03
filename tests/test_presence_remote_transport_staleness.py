@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
 
 from amplifier_module_tool_computer_use import _build_coexistence_guard
 from amplifier_module_tool_computer_use.coexistence_guard import HaltedError
+from amplifier_module_tool_computer_use.halt_state import PERSISTED_BASIS
 from amplifier_module_tool_computer_use.presence import (
     Confidence,
     PresenceMonitor,
@@ -250,6 +251,61 @@ def test_halted_error_message_declares_transport_latency_when_significant():
 def test_halted_error_message_is_unchanged_for_a_local_zero_latency_snapshot():
     """The declaration is additive and silent in the common (local) case -
     no new clause for a snapshot with negligible transport_latency_ms."""
+    snap = PresenceSnapshot(
+        state=PresenceState.HUMAN_ACTIVE,
+        confidence=Confidence.HIGH,
+        basis="idle_reconciliation",
+        last_human_input_ago_ms=12.0,
+        margin_ms=30.0,
+        guard_ms=5.0,
+        guard_measured=True,
+        sample_interval_ms=60.0,
+        latched_until_ms=None,
+    )
+    message = str(HaltedError(snap))
+    assert "transport" not in message.lower()
+
+
+# -- HaltedError message distinguishes a persisted (disk) halt from a live --
+# -- sample: the "someone's there right now" reading is wrong for a memory --
+# -- of a PRIOR session and must not be implied here.                     --
+
+
+def test_halted_error_message_for_a_persisted_record_does_not_claim_present_tense():
+    """A snapshot rebuilt from `halt_state.PersistedHalt.to_snapshot()` (basis
+    `PERSISTED_BASIS`) is a MEMORY of a prior session's detection, not a live
+    sample - the six-weeks-later reader must not conclude "someone's there
+    right now, I'll wait", because waiting can never clear this halt."""
+    snap = PresenceSnapshot(
+        state=PresenceState.HUMAN_ACTIVE,
+        confidence=Confidence.HIGH,
+        basis=PERSISTED_BASIS,
+        last_human_input_ago_ms=12.0,
+        margin_ms=30.0,
+        guard_ms=5.0,
+        guard_measured=True,
+        sample_interval_ms=None,
+        latched_until_ms=None,
+    )
+    message = str(HaltedError(snap))
+    lowered = message.lower()
+    # Names the mechanism as a memory, not a live reading.
+    assert "prior session" in lowered
+    assert "memory" in lowered
+    # Explicitly refuses the wrong present-tense reading.
+    assert "does not mean someone is at the keyboard right now" in lowered
+    # Explicitly refuses the "waiting will fix it" reading - the whole point.
+    assert "will not clear itself" in lowered or "not clear itself" in lowered
+    # Names an actual recovery path, not just "an explicit human signal".
+    assert "resume_after_halt.py" in message
+    assert "amplifier-computer-use-resume" in message
+    # Must NOT reuse the live-sample present-tense phrasing.
+    assert "produced input" not in lowered
+
+
+def test_halted_error_message_for_a_live_sample_is_unchanged_by_the_persisted_case():
+    """Guard against the persisted-case branch leaking into the ordinary,
+    live-sample path (`basis="idle_reconciliation"`, the common case)."""
     snap = PresenceSnapshot(
         state=PresenceState.HUMAN_ACTIVE,
         confidence=Confidence.HIGH,

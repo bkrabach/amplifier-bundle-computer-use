@@ -37,7 +37,7 @@ _REMEDIATION = (
     "above - e.g. a missing dependency, no DISPLAY/XAUTHORITY, powershell.exe "
     "unreachable, or a missing macOS Accessibility/Screen Recording grant), or "
     "set config.target='ssh://user@host' to drive a different, reachable "
-    "machine instead. See CONTRIBUTING.md for per-platform backend "
+    "machine instead. See docs/SETUP.md \u00a74 for per-platform backend "
     "requirements."
 )
 

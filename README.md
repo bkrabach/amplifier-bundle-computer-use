@@ -28,6 +28,34 @@ CLI, no browser extension required.
 
 ---
 
+## Install
+
+Registering this bundle is ordinary Amplifier bundle management:
+
+```bash
+# 1. Register it (the name "computer-use" comes from this repo's own bundle.md)
+amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-computer-use.git@main
+
+# 2. Use it for a session
+amplifier run --bundle computer-use "What's on my screen right now?"
+
+# ...or make it your active bundle so you don't need --bundle every time
+amplifier bundle use computer-use
+amplifier run "What's on my screen right now?"
+```
+
+Confirm it registered correctly with `amplifier bundle show computer-use` — it should
+list `tool-computer-use`, `hook-computer-use`, and `computer-use:computer-operator`.
+Working from a local clone instead of GitHub? `amplifier bundle add
+file:///path/to/amplifier-bundle-computer-use` instead.
+
+**Registering the bundle is not the same as the tools working.** See
+**[docs/SETUP.md](docs/SETUP.md)** for the four things that decide whether `computer` and
+`desktop` actually function once a session starts: upstream module versions, a model with
+native computer-use support, a reachable target machine, and (for remote targets) SSH.
+
+---
+
 ## What makes this the native thing
 
 Both Anthropic and OpenAI post-train their models on a **specific server-side tool
@@ -155,12 +183,13 @@ you are not looking at:
 **See [`docs/SETUP.md`](docs/SETUP.md) — this is the part that is more involved than a
 typical bundle.** In brief:
 
-- **A version floor on three upstream modules** — `loop-streaming` ≥ `f8004e0` (PR #36),
-  `provider-anthropic` ≥ `94a4354` (PR #79) and `e983a23` (PR #81), and/or
-  `provider-openai` ≥ `3af4ce1` (PR #58) and `2f44edc` (PR #59). Their package versions
-  are all still `1.0.0` and are useless as a floor; pin by commit. The bundle probes the
-  installed code rather than trusting a version string, and refuses to mount if the
-  orchestrator cannot carry the native tool form.
+- **Recent-enough upstream modules** — `loop-streaming`, and `provider-anthropic` and/or
+  `provider-openai`, need changes not yet reflected in their package version (all three
+  still declare `1.0.0`, so there is no version floor to check up front). You do not need
+  to pin anything by commit before you start: the bundle probes the actually-installed
+  code at mount time rather than trusting a version string, and refuses to mount (naming
+  the exact commit to upgrade to) if the orchestrator cannot carry the native tool form.
+  See `docs/SETUP.md` §1 for how the probe works.
 - **A model with `supports_native_computer_use`** — OpenAI: `minor >= 4`, not `-nano`.
   Anthropic: per-family version thresholds. §2 of the setup doc has the tables.
 - **A target machine** — local (WSL2+Windows / macOS / Linux X11) or remote over SSH.

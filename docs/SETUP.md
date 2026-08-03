@@ -12,7 +12,56 @@ that live outside this repository:
 | 3 | **A target machine, and its per-platform prerequisites** | Backend probe fails; tools never appear in the session |
 | 4 | **For remote targets: SSH, key auth, and `uv`/`python3` on the far end** | Connect-time error, or a Phase-2 `BackendError` on an unimplemented action |
 
-Work through them in that order. Each section tells you the exact check to run.
+Work through them in that order. Each section tells you the exact check to run. **But
+first, register the bundle at all** — none of the above matters until Amplifier knows
+this bundle exists.
+
+---
+
+## Install (do this first)
+
+Registering this bundle is ordinary Amplifier bundle management — the unusual part
+starts *after* registration, in the four rows above. Concretely, this repo is a normal
+bundle (`bundle.md` at the repo root, name `computer-use`), so the standard
+`amplifier bundle` commands apply:
+
+1. **Register it** — fetches the bundle and reads its own name from `bundle.md`, so the
+   name below is not something you invent:
+
+   ```bash
+   amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-computer-use.git@main
+   ```
+
+   Verified against this exact repo — the command reports back `Bundle's canonical name:
+   computer-use`. Working from a local clone instead of GitHub? Use a `file://` URI
+   instead: `amplifier bundle add file:///path/to/amplifier-bundle-computer-use`.
+
+2. **Use it for a session** — either per-run:
+
+   ```bash
+   amplifier run --bundle computer-use "What's on my screen right now?"
+   ```
+
+   or set it as your active bundle first, so you don't need `--bundle` every time:
+
+   ```bash
+   amplifier bundle use computer-use
+   amplifier run "What's on my screen right now?"
+   ```
+
+3. **Confirm it's actually there** before you rely on it:
+
+   ```bash
+   amplifier bundle show computer-use
+   ```
+
+   Once registered this lists the tools/hooks/agents it contributes
+   (`tool-computer-use`, `hook-computer-use`, `computer-use:computer-operator`) — if it
+   doesn't, registration itself failed and nothing below this point will work either.
+
+That's registration. It does **not** mean the tools will work yet — that depends on the
+four moving parts below (module versions, model capability, a reachable target machine,
+and, for remote targets, SSH). Read on for those.
 
 ---
 
@@ -41,19 +90,11 @@ is not product-level proof.
 ## 1. Upstream module version floor
 
 Three Amplifier modules must carry recent changes, or this bundle either refuses to
-mount or quietly degrades.
+mount or quietly degrades. **You do not need to check this up front** — see below.
 
 **The package version numbers are useless as a floor.** All three still declare
-`version = "1.0.0"` in their `pyproject.toml` and did not bump for these changes.
-Pin by commit or PR:
-
-| Module | Need at or after | What it gives you |
-|---|---|---|
-| `amplifier-module-loop-streaming` | `f8004e0` (PR **#36**) | Preserves a tool's `native_tool_spec` through `ToolSpec` construction, so the native form reaches the provider |
-| `amplifier-module-provider-anthropic` | `94a4354` (PR **#79**) | Provider derives the `anthropic-beta` header itself from native tool types; stops stamping `cache_control` on them |
-| `amplifier-module-provider-anthropic` | `e983a23` (PR **#81**) | Adds `supports_native_computer_use` + `computer_use_tool_type` to `ModelCapabilities` |
-| `amplifier-module-provider-openai` | `3af4ce1` (PR **#58**) | Emits the bare `{"type": "computer"}` declaration OpenAI requires |
-| `amplifier-module-provider-openai` | `2f44edc` (PR **#59**) | Adds `supports_native_computer_use` to `ModelCapabilities` |
+`version = "1.0.0"` in their `pyproject.toml` and did not bump for these changes, so
+this bundle does not ask you to pin anything by commit before you start. Instead:
 
 **How the bundle checks.** It does *not* trust a version string — manifests can lie and a
 shallow clone may not have one. `hook-computer-use` drives the actually-installed code
@@ -551,36 +592,59 @@ No `markers=` line → screenshots are not reaching the model.
 
 ## 11. Minimal working config
 
-Local desktop, look-only — the safest first run:
+These are complete, copy-pasteable **behavior files** — every module needs a `source:` key
+naming where to fetch it from, which a bare `tools:`/`hooks:` fragment (no filename, no
+path) cannot show. Save either one as e.g. `my-computer-use.yaml` and register it with
+`amplifier bundle add file:///path/to/my-computer-use.yaml` (see §0 above), or copy the
+`tools:`/`hooks:` blocks into your own existing behavior file.
+
+Local desktop, look-only — the safest first run (`my-computer-use.yaml`):
 
 ```yaml
+bundle:
+  name: my-computer-use
+  version: 0.1.0
+  description: Minimal local, look-only computer-use config
+
 tools:
   - module: tool-computer-use
+    source: git+https://github.com/microsoft/amplifier-bundle-computer-use.git@main#subdirectory=modules/tool-computer-use
     config:
       read_only: true
 
 hooks:
   - module: hook-computer-use
+    source: git+https://github.com/microsoft/amplifier-bundle-computer-use.git@main#subdirectory=modules/hook-computer-use
     config:
       max_inline_screenshots: 3
 ```
 
-Remote desktop, interactive, gated writes:
+Remote desktop, interactive, gated writes (`my-computer-use.yaml`):
 
 ```yaml
+bundle:
+  name: my-computer-use
+  version: 0.1.0
+  description: Minimal remote, gated-write computer-use config
+
 tools:
   - module: tool-computer-use
+    source: git+https://github.com/microsoft/amplifier-bundle-computer-use.git@main#subdirectory=modules/tool-computer-use
     config:
       target: ssh://user@host
       read_only: false        # gate_writes turns on automatically in the same step
 
 hooks:
   - module: hook-computer-use
+    source: git+https://github.com/microsoft/amplifier-bundle-computer-use.git@main#subdirectory=modules/hook-computer-use
     config:
       max_inline_screenshots: 3
 ```
 
 Run this one from a real terminal. Without a TTY every write is denied — by design.
+
+If you just want the bundle's own defaults with no customization, you do not need either
+of these — register the bundle itself (§0) and use `behaviors/computer-use.yaml` as shipped.
 
 ---
 
