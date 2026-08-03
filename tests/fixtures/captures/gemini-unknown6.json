@@ -1,0 +1,13 @@
+{
+  "calls": [
+    {
+      "name": "scroll_document",
+      "args": {
+        "magnitude": 999,
+        "direction": "down"
+      }
+    }
+  ],
+  "image_h": 720,
+  "screen_h": 2160
+}

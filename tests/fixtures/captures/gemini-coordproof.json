@@ -1,0 +1,33 @@
+{
+  "raw": {
+    "x": 311,
+    "y": 84
+  },
+  "image_space": [
+    1280,
+    720
+  ],
+  "monitor": [
+    3840,
+    2160
+  ],
+  "as_normalized": [
+    1194,
+    181
+  ],
+  "as_pixels": [
+    933,
+    252
+  ],
+  "real_cursor_after_normalized_move": [
+    1194,
+    181
+  ],
+  "function_call": {
+    "name": "move_to",
+    "args": {
+      "y": 84,
+      "x": 311
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "image_size": [
+    1280,
+    720
+  ],
+  "monitor": [
+    3840,
+    2160
+  ],
+  "batch_key": "actions",
+  "n_actions": 1,
+  "actions": [
+    {
+      "type": "screenshot"
+    }
+  ],
+  "pending_safety_checks_present": false,
+  "pending_safety_checks": null,
+  "coordinate_proof": null
+}

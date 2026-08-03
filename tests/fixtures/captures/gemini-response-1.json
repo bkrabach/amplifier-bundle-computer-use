@@ -1,0 +1,41 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {
+            "functionCall": {
+              "name": "move_to",
+              "args": {
+                "y": 84,
+                "x": 311
+              }
+            }
+          }
+        ],
+        "role": "model"
+      },
+      "finishReason": "STOP",
+      "index": 0,
+      "finishMessage": "Model generated function call(s)."
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 1847,
+    "candidatesTokenCount": 23,
+    "totalTokenCount": 1870,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 41
+      },
+      {
+        "modality": "IMAGE",
+        "tokenCount": 1806
+      }
+    ],
+    "serviceTier": "standard"
+  },
+  "modelVersion": "gemini-2.5-computer-use-preview-10-2025",
+  "responseId": "ihJwapvAOMefz7IPn9rv2A0"
+}

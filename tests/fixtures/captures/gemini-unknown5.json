@@ -1,0 +1,21 @@
+{
+  "image_space": [
+    1280,
+    720
+  ],
+  "probes": [
+    [
+      "far-right",
+      "hover_at",
+      999,
+      499
+    ],
+    [
+      "bottom-right",
+      "hover_at",
+      999,
+      999
+    ]
+  ],
+  "normalized_cap": 999
+}

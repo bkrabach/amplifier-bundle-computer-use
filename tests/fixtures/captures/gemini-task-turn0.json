@@ -1,0 +1,38 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {
+            "functionCall": {
+              "name": "open_web_browser",
+              "args": {}
+            }
+          }
+        ],
+        "role": "model"
+      },
+      "finishReason": "STOP",
+      "index": 0,
+      "finishMessage": "Model generated function call(s)."
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 1858,
+    "candidatesTokenCount": 12,
+    "totalTokenCount": 1870,
+    "promptTokensDetails": [
+      {
+        "modality": "TEXT",
+        "tokenCount": 52
+      },
+      {
+        "modality": "IMAGE",
+        "tokenCount": 1806
+      }
+    ],
+    "serviceTier": "standard"
+  },
+  "modelVersion": "gemini-2.5-computer-use-preview-10-2025",
+  "responseId": "kxNwasOvLfDQz7IP9bztKQ"
+}

@@ -1,0 +1,36 @@
+{
+  "model_space": [
+    1280,
+    720
+  ],
+  "captured": {
+    "scroll": [
+      {
+        "action": "scroll",
+        "coordinate": [
+          640,
+          360
+        ],
+        "scroll_direction": "down",
+        "scroll_amount": 3
+      }
+    ],
+    "modifier-click": [
+      {
+        "action": "left_click",
+        "coordinate": [
+          640,
+          360
+        ],
+        "text": "shift"
+      }
+    ],
+    "hold_key": [
+      {
+        "action": "hold_key",
+        "text": "a",
+        "duration": 2
+      }
+    ]
+  }
+}
