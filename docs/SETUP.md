@@ -1,0 +1,592 @@
+# Setup
+
+**This is not the usual Amplifier bundle install.** A typical bundle is an `--app`-level
+pointer at a behavior file, and you are done. This one is not, and pretending otherwise
+wastes your afternoon. It drives a *real desktop*, so the install has four moving parts
+that live outside this repository:
+
+| # | What you must get right | Fails how |
+|---|---|---|
+| 1 | **Upstream module versions** — `loop-streaming`, `provider-anthropic` / `provider-openai` | Bundle refuses to mount, or silently degrades to a weaker function tool |
+| 2 | **A model that supports native computer use** | Provider reports no capability; the tool is dead weight |
+| 3 | **A target machine, and its per-platform prerequisites** | Backend probe fails; tools never appear in the session |
+| 4 | **For remote targets: SSH, key auth, and `uv`/`python3` on the far end** | Connect-time error, or a Phase-2 `BackendError` on an unimplemented action |
+
+Work through them in that order. Each section tells you the exact check to run.
+
+---
+
+## 0. Which paths are proven, and which are rough
+
+Stated plainly so you can pick a path you can actually finish.
+
+| Path | Status |
+|---|---|
+| Anthropic provider driving a real desktop | **Proven live.** `claude-sonnet-4-5` / `claude-sonnet-5` / `claude-opus-5` verified against the real API (`providers.py` `ANTHROPIC.models`) |
+| OpenAI provider driving a real desktop | **Proven live.** `gpt-5.5` verified end-to-end through this bundle against a real remote desktop, 2026-08-03 (`providers.py` `OPENAI.models`) |
+| Windows target (WSL2 interop, local) | **Proven.** Capture and input both verified end to end — see `BACKLOG.md` |
+| macOS target — capture, `key`, `focus_window` | **Proven** on real hardware |
+| macOS target — `type_text` | **BROKEN. Known open defect.** Returns success, enters nothing. See [Known issues](#9-known-issues) |
+| Linux/X11 target (local) | Backend implemented; presence guard measured (`GUARD_MEASURED["linux-x11"] = True`) |
+| Remote target over SSH | Works for capture, move, click, `type_text`, `key`. **Nine actions are unimplemented Phase 2** — see [Remote action gaps](#remote-action-gaps) |
+| Gemini | A dialect record exists in `providers.py` (`gemini-2.5-computer-use` → `computer_use`), built from captured traffic. **No live end-to-end run through this bundle is claimed.** |
+
+A whole-session, end-to-end run with the hook, native tool promotion, screenshot
+rewriting and the write gate all executing *together* is still listed as not done in
+`BACKLOG.md` ("Run it as a real Amplifier session, end to end"). Component-level proof
+is not product-level proof.
+
+---
+
+## 1. Upstream module version floor
+
+Three Amplifier modules must carry recent changes, or this bundle either refuses to
+mount or quietly degrades.
+
+**The package version numbers are useless as a floor.** All three still declare
+`version = "1.0.0"` in their `pyproject.toml` and did not bump for these changes.
+Pin by commit or PR:
+
+| Module | Need at or after | What it gives you |
+|---|---|---|
+| `amplifier-module-loop-streaming` | `f8004e0` (PR **#36**) | Preserves a tool's `native_tool_spec` through `ToolSpec` construction, so the native form reaches the provider |
+| `amplifier-module-provider-anthropic` | `94a4354` (PR **#79**) | Provider derives the `anthropic-beta` header itself from native tool types; stops stamping `cache_control` on them |
+| `amplifier-module-provider-anthropic` | `e983a23` (PR **#81**) | Adds `supports_native_computer_use` + `computer_use_tool_type` to `ModelCapabilities` |
+| `amplifier-module-provider-openai` | `3af4ce1` (PR **#58**) | Emits the bare `{"type": "computer"}` declaration OpenAI requires |
+| `amplifier-module-provider-openai` | `2f44edc` (PR **#59**) | Adds `supports_native_computer_use` to `ModelCapabilities` |
+
+**How the bundle checks.** It does *not* trust a version string — manifests can lie and a
+shallow clone may not have one. `hook-computer-use` drives the actually-installed code
+with throwaway probes and reads the real output:
+
+- `_provider_derives_native_tool_betas` — calls the provider's own
+  `_derive_native_tool_betas([{"type": "computer_20251124"}])` and checks the returned
+  betas mention computer-use. (Anthropic convention.)
+- `_provider_recognizes_bare_computer_tool` — calls the provider's own
+  `_convert_tools_from_request(...)` and checks the emitted dict is *exactly*
+  `[{"type": "computer"}]` and nothing else. (OpenAI convention.)
+- `_orchestrator_preserves_native_tool_spec` — drives loop-streaming's own
+  `_build_tool_spec()` against a stub and checks the native `type` survives.
+
+If the orchestrator check fails, mount raises
+`ComputerUseNativeToolPassthroughUnsupportedError` and names the commits above. If the
+*provider* check fails, the hook wraps nothing and logs which integration points it
+tried — it does not raise, because a failed provider probe cannot distinguish "this
+build predates the fix" from "this provider was never meant to support computer-use."
+
+**Honest limitation, from the code's own docstring:** those two cases look identical from
+outside. If your provider probe fails, check the commit — the probe cannot tell you which
+it is.
+
+---
+
+## 2. The model must support native computer use
+
+A model without the capability cannot use this bundle. Both providers now gate on
+`ModelCapabilities.supports_native_computer_use`.
+
+### OpenAI
+
+Rule, from `_capabilities.py` (empirical, live-API basis 2026-08-03):
+
+```
+supports_computer_use = minor >= 4 and "-nano" not in model_id
+```
+
+| Model | Supported |
+|---|---|
+| `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-pro` | Yes |
+| `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.6` | Yes |
+| `gpt-5.4-nano` | **No** — size gates this tool, not just version |
+| anything below `gpt-5.4` | No |
+
+Note this is the inverse distribution from `supports_native_apply_patch`, where size made
+no difference. Do not reason across from one to the other.
+
+### Anthropic
+
+Anthropic's tool type is versioned per model generation, and a model paired with the wrong
+type is rejected with an HTTP 400 on *every* turn. `provider-anthropic` resolves it:
+
+| Family | Version | `computer_use_tool_type` |
+|---|---|---|
+| opus | 4.6+ | `computer_20251124` |
+| opus | 4.1 – 4.5 | `computer_20250124` |
+| opus | below 4.1 | `None` — unsupported |
+| sonnet | 4.6+ | `computer_20251124` |
+| sonnet | 4.5 | `computer_20250124` |
+| sonnet | below 4.5 | `None` — unsupported |
+| haiku | 4.5+ | `computer_20250124` |
+| haiku | below 4.5 | `None` — unsupported |
+
+This bundle keeps its own independently-verified table in
+`modules/tool-computer-use/.../providers.py`, keyed on the *undated* generation prefix:
+
+```
+claude-sonnet-4-5  -> computer_20250124
+claude-sonnet-5    -> computer_20251124
+claude-opus-5      -> computer_20251124
+gpt-5.5            -> computer
+```
+
+A model **absent** from that table is *unverified*, not unsupported. The bundle never
+invents a compatibility guess for it. Consequences at mount time
+(`tool_versions.require_static_pairing`):
+
+- You set `config.model` to a **known** model and a *conflicting* `tool_version` →
+  `ToolVersionError`, mount fails loud with the correct value in the message.
+- You set `config.model` to an **unverified** model with no `tool_version` →
+  `ToolVersionError`. Set `tool_version` explicitly to unblock.
+- You set neither → falls back to `computer_20251124`, then self-corrects at request
+  time from the live model (`resolve_tool_version`, never raises).
+
+**Recommendation: set neither `model` nor `tool_version`.** Request-time resolution reads
+the model actually about to receive the request and always wins over stale config — which
+also covers `provider-anthropic`'s own mid-session model fallback.
+
+---
+
+## 3. Pick a target
+
+One config key decides everything downstream: `target` on the **tool** module.
+
+```yaml
+tools:
+  - module: tool-computer-use
+    config:
+      target: ssh://user@host   # omit entirely for "this machine"
+```
+
+| `target` | Behaviour |
+|---|---|
+| absent | Local backends are probed **in order**: Windows(WSL2) → Linux X11 → macOS. First one available wins. If none is available, **nothing is mounted**, the reason is logged, and the session continues without the tools. |
+| `ssh://user@host` or `ssh://host` | `RemoteBackend` is the **only** candidate. No fall-through to local. An unreachable target raises `RemoteTargetUnavailable`, which mount does **not** catch — deliberately, so an agent can never silently drive your own desktop when you asked for someone else's. |
+| anything else (e.g. `user@host`) | Parse error. Logged at **ERROR**, tool not mounted. This used to escape silently and a session improvised its own `ssh` + `screencapture` workaround instead. |
+
+---
+
+## 4. Per-platform prerequisites
+
+Each backend's `probe()` is cheap and never raises — it reports a reason. That reason is
+what you will see in the log when the tools do not appear.
+
+### Windows (from WSL2)
+
+| Requirement | Probe check |
+|---|---|
+| Running under WSL2 | `wslpath` on `PATH` |
+| WSL↔Windows interop enabled (default in WSL2) | `powershell.exe` resolvable |
+
+`powershell.exe` is resolved **without depending on `PATH`** — a non-login SSH shell's
+`PATH` does not include `/mnt/c/...`. Override with tool config `powershell_path`.
+
+Every action spawns a fresh `powershell.exe` running `bridge.ps1` (Win32 P/Invoke via
+`Add-Type`). This is a known latency cost, tracked in `BACKLOG.md` under Performance.
+
+### macOS
+
+| Requirement | Where enforced |
+|---|---|
+| `sys.platform == "darwin"` | `probe()` |
+| `pyobjc-framework-Quartz` importable | `probe()` — installed by the tool module's `sys_platform == 'darwin'` marker |
+| At least one active display (`CGGetActiveDisplayList`) | `probe()` — zero means asleep screen, or clamshell with no external display |
+| **Screen Recording** TCC grant | Lazy, on capture. Missing → `CGDisplayCreateImage` returns `None`, reported as a named error |
+| **Accessibility** TCC grant | Lazy, on input. Checked via `AXIsProcessTrusted()` over ctypes |
+
+Screen Recording and Accessibility are **separately granted**. A process can capture the
+screen perfectly while every click and keystroke is silently discarded. Grant both:
+System Settings → Privacy & Security → Screen Recording / Accessibility, for the process
+actually running this code.
+
+> **Do not run two agent processes against the same macOS target.** Two concurrent agents
+> corrupt each other's Screen Recording grant: `CGDisplayCreateImage` then returns `None`
+> for **both** — including the one that was capturing successfully a moment earlier — with
+> no exception on either side. The transport is refcounted and shared per
+> `(ssh_path, host)` specifically to prevent this; do not route around it.
+
+### Linux / X11
+
+| Requirement | Probe check |
+|---|---|
+| `python-xlib` installed **in the running interpreter** | Reported *as a missing dependency* — this used to surface as "'NoneType' object has no attribute 'Display'", which reads like an X connection fault and sends you looking at `DISPLAY`/`xhost` instead of at `pip install python-xlib` |
+| `DISPLAY` set | `probe()` |
+| X server connectable, XTEST present | `probe()` |
+
+`XAUTHORITY` is resolved and set if absent.
+
+---
+
+## 5. Remote targets over SSH
+
+The claim is "if you can SSH to the box, you can drive its desktop." Concretely that means:
+
+| Requirement | Detail |
+|---|---|
+| **Key-based auth** | The transport runs `ssh -T -o BatchMode=yes`. `BatchMode` disables every interactive prompt — a passphrase-locked or password-only key **will fail to connect**, it will not prompt. |
+| **Host key already trusted** | `StrictHostKeyChecking=accept-new`. Never `no`. A host-key mismatch on a machine that types your passwords is refused. |
+| **`uv` or `python3` on the target** | `uv` is located by absolute path (`~/.local/bin/uv`, `/opt/homebrew/bin/uv`, `/usr/local/bin/uv`, then `which`) — never trusting `PATH`, because a non-login shell's `PATH` is not guaranteed. `uv run --with pillow --with python-xlib` provisions dependencies with no pre-existing venv and no pip. Falls back to bare `python3 -c`. |
+| **Nothing installed on the target** | The bundle's own files are tarred and pushed over the same stdin pipe as the protocol. No daemon, no new listening port, no agent to install. |
+| **A network** | Tailscale/WireGuard is the tested arrangement; native `sshd` on port 22, no new port opened. |
+
+One persistent `ssh -T` subprocess per target, shared and refcounted across every consumer
+in the controller process.
+
+**Remote defaults are deliberately stricter than local** (a remote machine is by
+definition one you are not looking at):
+
+| Key | Local default | Remote default |
+|---|---|---|
+| `read_only` | `false` | **`true`** |
+| `gate_writes` | off | **on**, whenever `read_only` is off |
+| `clipboard_read_policy` | `allow` | **`redact`** (length + digest, never the text) |
+
+Turning `read_only` off on a remote target therefore cannot silently produce "full write
+access, no gate" — the gate switches on in the same step unless you explicitly disable it,
+which is logged at WARNING.
+
+### WSL target reached over SSH
+
+A Windows target driven remotely means SSH → the WSL side → `powershell.exe` interop.
+`shutil.which("powershell.exe")` **fails** in that shell, because a non-login SSH shell's
+`PATH` does not contain `/mnt/c/...`. The absolute-path resolution in `windows.py` is
+load-bearing, not a wart. If you have a custom WSL mount root, set `powershell_path`.
+
+### Remote action gaps
+
+Nine actions raise `BackendError("... over the wire is Phase 2 - see design doc")` on a
+remote target. Verified in `remote_backend.py`:
+
+| Action | Remote |
+|---|---|
+| `screenshot` / `zoom`, `mouse_move`, clicks, `type`, `key`, `cursor_position`, monitor selection | Works |
+| `left_mouse_down`, `left_mouse_up`, `left_click_drag`, `scroll`, `hold_key` | **Phase 2 — not implemented** |
+| `desktop.list_windows`, `desktop.focus_window`, `desktop.get_clipboard`, `desktop.set_clipboard` | **Phase 2 — not implemented** |
+
+So: `desktop.focus_window` is a local-only capability today. On a remote target, focus the
+window with clicks and `key`, or drive the target locally.
+
+---
+
+## 6. Configuration reference
+
+Every key below is read by the code. Defaults are the code's actual defaults, not
+aspirations. `behaviors/computer-use.yaml` ships a minimal subset.
+
+### `tool-computer-use`
+
+| Key | Default | Meaning |
+|---|---|---|
+| `target` | *(absent)* | `ssh://user@host` for a remote desktop. Absent = probe local backends |
+| `max_edge` | `1280` | Long edge of the image the model sees |
+| `max_pixels` | `1150000` | Pixel-count ceiling, applied with `max_edge` |
+| `enable_zoom` | `true` | Advertise the `zoom` action in the native spec |
+| `read_only` | `false` local / **`true` remote** | Enforced in code — every mutating action is rejected before anything reaches the desktop. Screenshots still work |
+| `gate_writes` | `is_remote and not read_only` | Per-action human approval for mutating actions |
+| `tool_version` | *(auto)* | Native tool type override. Leave unset — see §2 |
+| `model` | *(unset)* | Static model hint used to validate `tool_version` at mount |
+| `target_monitor` | `"primary"` | A monitor id, `"primary"`, or `monitors.VIRTUAL_DESKTOP` for the whole bounding box |
+| `clipboard_read_policy` | `allow` local / `redact` remote | `allow` \| `redact` \| `block` |
+| `type_pacing_ms` | *(auto)* | Inter-character delay. Auto = wide enough to keep the presence guard unmasked when one is active; `0` forces full speed (logged at WARNING) |
+| `coexistence.enabled` | `true` | Whether a guard is built at all. **Does not** disable the halt once one exists |
+| `coexistence.drive_anyway` | `false` | Permit *beginning* to drive when a human is already detected present. Logged |
+| `powershell_path` | *(auto)* | Windows backend override |
+| `ssh_path` | `"ssh"` | Remote only |
+| `connect_timeout` | `30.0` | Remote only |
+| `deadman_seconds` | `5.0` | Remote agent self-terminates if the controller goes away |
+| `with_pillow` | `true` | Remote only — provision Pillow on the target via `uv` |
+
+### `hook-computer-use`
+
+| Key | Default | Meaning |
+|---|---|---|
+| `max_inline_screenshots` | `3` | Most-recent screenshots kept inline; older ones collapse to text so a long session stays affordable |
+| `priority` | `50` | Hook registration priority |
+| `unattended_writes_ok` | `false` | See below. Explicit, logged, never inferred |
+
+---
+
+## 7. The safety model
+
+Four distinct mechanisms. Know which one you are relying on.
+
+| Mechanism | Kind | Strength |
+|---|---|---|
+| `read_only: true` | Code | **Enforced.** Every mutating action rejected in `execute()` before it reaches the desktop |
+| Write gate (`gate_writes`) | Code + human | **Enforced.** Per-action `ask_user` approval, default **deny**, for 15 mutating actions |
+| Presence guard / halt | Code | **Enforced and unconditional.** No config key can disable the halt once a guard exists |
+| Stop Conditions in `agents/computer-operator.md` | Prompt | **Model judgment.** Nothing inspects the screen or blocks an action |
+
+### The write gate
+
+On a remote, non-read-only target, every one of these prompts for approval before it runs:
+`mouse_move`, `left_click`, `right_click`, `middle_click`, `double_click`, `triple_click`,
+`left_mouse_down`, `left_mouse_up`, `left_click_drag`, `scroll`, `key`, `hold_key`, `type`,
+`focus_window`, `set_clipboard`.
+
+"Destructive" is undecidable from a click — Delete looks like every other click — so the
+only two honest options are gate-every-write or gate-none. This gates every write.
+
+**If stdin is not a TTY** (a backgrounded run, a piped stdin, a service with no controlling
+terminal) the gate **denies** with a named reason and the write is not sent. It does *not*
+hand the prompt to the approval system, because that system's own `input()` hits immediate
+EOF and surfaces as `Tool computer failed: EOF when reading a line` — a message that names
+nothing, and which was once misread as "the remote write path was never wired up." It was
+not; writes work fine.
+
+### `unattended_writes_ok` — read this before you set it
+
+```yaml
+hooks:
+  - module: hook-computer-use
+    config:
+      unattended_writes_ok: true    # deliberate, logged, never a default
+```
+
+This is the **explicit opt-out** for a run you launched on purpose, against a target you
+already named, with nobody at the keyboard. It only changes the one path that used to
+crash instead of asking: no TTY available. The interactive path is unchanged and still
+prompts. Every auto-allow is logged at WARNING naming the tool, the action, and the
+backend.
+
+It is not a convenience toggle to make prompts go away. If you are running interactively
+and finding the prompts tedious, you want `read_only: true` (look, don't touch) or
+`gate_writes: false` (also logged at WARNING) — not this.
+
+### Presence guard and halt
+
+The guard reconciles the target's own idle-time counter against the agent's own injection
+timestamps, per elementary event, and **halts before the next write** the moment a human is
+detected at the machine. There is no configuration key that can disable that halt.
+
+A guard is only built for a backend that exposes `presence_idle_ms()` **and** resolves to a
+platform with a measured guard band. Never on a guessed number:
+
+| Platform | Guard band | Measured? |
+|---|---|---|
+| `linux-x11` | 5.0 ms | Yes — 98 samples, zero false positives |
+| `macos` | 10.0 ms | Yes — 300 samples on real hardware, 0/300 false positives |
+| `windows-wsl2` | 20.0 ms | Yes — 900 samples (3×300) on a live Win11 desktop, 0/900 false positives |
+
+For a remote target the guard uses the *remote machine's* measured band, from its own
+handshake — network latency is never folded into it.
+
+Two honest caveats recorded in the code:
+
+- Intra-`type_text` detection is **not viable on Windows** at any of these bands (masked
+  fraction 20/60 = 33% at production cadence).
+- An open question is recorded in `presence.py` about one live Windows halt at 297 ms idle
+  that may have been a false positive rather than a detection. It proves the halt *path*
+  executes; it is not yet proof of human detection on Windows.
+
+### Halt is durable across sessions
+
+Once halted, the guard is a **one-way latch** — nothing on the class can clear it. But an
+orchestrator can start a *new* session with a *new* guard that has no memory of the halt.
+That was observed for real: a sub-agent halted five times, control returned to the parent
+session, and its first click succeeded 80 s later, entirely automatically, with no human
+choosing to resume.
+
+So the halt is also written to disk and consulted whenever a new guard is built. It is
+cleared by exactly one path — a human running:
+
+```bash
+python scripts/resume_after_halt.py            # list halted backends
+python scripts/resume_after_halt.py linux-x11  # clear one
+python scripts/resume_after_halt.py --all      # clear every backend
+```
+
+There is **no time-based expiry**, on purpose. Resume requires an explicit signal, not the
+mere passage of time. Nothing on the automated tool-call path ever clears it.
+
+Separately, `hook-computer-use` injects a standing system reminder on every subsequent
+tool call for the rest of a session in which a halt fired, so the model cannot close out a
+turn reporting clean success without acknowledging the interruption.
+
+### Two risks that no mechanism here closes
+
+**On-screen content can manipulate the agent.** Anything the agent can read, it can be
+influenced by. A dialog, web page, or document saying "click OK to confirm" is
+indistinguishable from legitimate UI. Inherent to computer use, not a defect in this
+bundle. Do not point it at untrusted screens unsupervised.
+
+**The clipboard goes to your model provider.** `desktop.get_clipboard` returns content as
+tool output, which becomes part of the conversation sent to the API and lands in durable
+logs. Default policy is `allow` locally. If you just copied a secret, clear the clipboard
+first, or set `clipboard_read_policy: redact` / `block`.
+
+---
+
+## 8. Operational facts that cost real debugging time
+
+### A locked screen cannot be driven. On any platform.
+
+This is not a bug and it is not fixable. macOS and Windows both switch to a secure session
+that refuses synthetic input by design.
+
+**The requirement is an unlocked, logged-in GUI session — not merely "the screen is on."**
+A sleeping *display* is usually fine. A sleeping or locked *system* is not.
+
+The dangerous part is that a locked screen does not look like a failure. Measured against a
+real Mac (commit `7d98701`):
+
+```
+LOCKED    ioreg CGSSessionScreenIsLocked -> True    screencapture   144,435 bytes
+UNLOCKED  same                           -> False   screencapture   690,038 bytes
+```
+
+Both are real, plausible images. The tool previously handed that 144 KB **lock screen** to
+a model as if it were the desktop, and accepted keystrokes macOS silently discards —
+reporting success both times.
+
+**It now fails loud.** Detection:
+
+| Platform | Signal |
+|---|---|
+| macOS | `ioreg -n Root -d1 -a` → `CGSSessionScreenIsLocked` and/or `IOConsoleLocked`. Three states are distinguished: `locked`, `no_gui_session` (nobody logged in at the console), `unknown` |
+| Windows | `LogonUI.exe` process presence, dispatched inside the existing per-action bridge call. `bridge.ps1` throws `SESSION_LOCKED` for capture/write actions |
+
+An `ioreg` timeout returns `unknown` and **refuses** rather than guessing either way —
+neither silently "unlocked" (which lets a lock screen straight through) nor silently
+"locked" (which would block a healthy desktop on a transient hiccup).
+
+The Windows *unlocked* case is verified on real hardware (`LogonUI=0` while unlocked). The
+Windows *locked* case is **not verified on Windows hardware** — stated plainly rather than
+claimed.
+
+There is no lock check on the Linux/X11 backend.
+
+### A locked session and a missing macOS permission grant look identical
+
+This is the reason the check above exists. From outside, with no check:
+
+- `CGDisplayCreateImage` returns a real, plausible-looking image when locked — not `None`,
+  not an error.
+- `CGEventPost` silently drops every click and keystroke sent to a locked session, exactly
+  the way it drops them when Accessibility is not granted.
+
+That ambiguity produced a confidently-wrong diagnosis — *"the signature of Accessibility
+TCC not granted"* — which stood in the record as fact for days. It was a locked screen.
+
+The tool now checks, on **both** the capture and the input path, and the **lock check runs
+before the Accessibility check**, so a locked-and-untrusted session is diagnosed as
+LOCKED. The error text names the state, names the host, says what a human must do, and
+explicitly warns that a lock-screen capture is a real, plausible-looking image.
+
+When you see a macOS failure here, read which of the three it says. They are different
+problems with different fixes:
+
+| Diagnosis | Fix |
+|---|---|
+| `LOCKED` | Unlock the screen (sign back in) on the target host |
+| `no GUI session` | Log in at the physical console, or via Screen Sharing |
+| `Screen Recording permission is NOT granted` | Grant it in System Settings, to the process actually running this code |
+| `Accessibility permission not granted` | Same, under Accessibility |
+
+---
+
+## 9. Known issues
+
+### macOS `type_text` silently no-ops while returning success — OPEN
+
+**Status: open defect.** Logged in `BACKLOG.md` (found 2026-08-03).
+
+On an unlocked Mac, with the screen state confirmed by the presence guard:
+
+- `key` (e.g. `cmd+space`) works. Spotlight opened, verified by screenshot.
+- `type` returned `success: true` and **entered nothing**.
+
+This is **not** the lock defect — the screen was unlocked and capture returned real desktop
+content, so the lock guard correctly did not fire. `key` works and `type_text` does not,
+which localizes it to the type path. The current hypothesis, unconfirmed: the type path
+posts events to a specific app rather than the system-wide event tap.
+
+It is the same shape as every other defect this bundle keeps surfacing — **a write that
+fails while reporting success** — and by the project's own no-fallbacks rule it must fail
+loud rather than report success. It does not yet.
+
+**Impact:** `key`-only flows on macOS are unaffected. Any flow that depends on `type` on
+macOS is blocked. Windows and Linux `type` are unaffected.
+
+### Other stated gaps
+
+- No end-to-end whole-session run of all mechanisms together (`BACKLOG.md`).
+- Windows on-desktop indicator overlay is not built (Linux and macOS announce are).
+- Nine actions unimplemented over the remote wire — §5.
+- The held-input ledger has no release path if the agent process is `SIGKILL`ed or OOMs.
+
+---
+
+## 10. Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `computer` / `desktop` tools absent, no error | No backend available. Mount catches `NoBackendAvailable`, logs the reason, mounts nothing | Read the log line — it lists every candidate's own probe reason plus remediation |
+| `tool-computer-use: NOT MOUNTING - invalid configuration` | Malformed `target` (e.g. `user@host` instead of `ssh://user@host`) | Fix the config. Logged at ERROR because it is a mistake someone can fix |
+| `ComputerUseNativeToolPassthroughUnsupportedError` at mount | `loop-streaming` predates PR #36 | Upgrade — the error names the exact commit |
+| `ComputerUseHookIncompatibleProviderError` | Provider gained a `stream()` method. The hook only wraps `complete()`, and the orchestrator prefers `stream()` whenever present — wrapping would silently do nothing | Refuses to operate rather than degrade invisibly. Wrap both, or use an orchestrator that does not prefer `stream()` |
+| Log: `no provider found to wrap` | Provider lookup failed this turn; screenshots will not inline | Check the provider is mounted |
+| `'NoneType' object has no attribute 'Display'` | *(fixed)* Should now read "python-xlib is not installed" | `pip install python-xlib` into the **running** interpreter |
+| Tool works, targeting is noticeably poor | Native promotion silently degraded to a plain function tool | Check the trace (below) for a `markers=` line; check module commits |
+| `Tool computer failed: EOF when reading a line` | *(fixed)* Approval prompt with no TTY | Run interactively, or set `unattended_writes_ok: true` |
+| PowerShell banner text where JSON was expected | `bridge.ps1` missing from the deployed payload | Should not occur — it is in `PAYLOAD_MODULES`. File an issue |
+| `SESSION_LOCKED` / `this macOS session is LOCKED` | Target is locked | Unlock it. §8 |
+| `... over the wire is Phase 2` | Action not implemented for remote targets | §5. Drive that target locally, or use a different action |
+| `ToolVersionError` at mount | `model` / `tool_version` conflict, or an unverified model with no override | §2 |
+
+### Trace
+
+```bash
+AMPLIFIER_COMPUTER_USE_TRACE=/tmp/cu-trace.log amplifier run --bundle computer-use "..."
+```
+
+```
+MOUNTED max_inline=3
+WRAPPED provider=AnthropicProvider module=amplifier_module_provider_anthropic
+complete: markers=1 messages_with_blocks=3
+```
+
+No `markers=` line → screenshots are not reaching the model.
+
+---
+
+## 11. Minimal working config
+
+Local desktop, look-only — the safest first run:
+
+```yaml
+tools:
+  - module: tool-computer-use
+    config:
+      read_only: true
+
+hooks:
+  - module: hook-computer-use
+    config:
+      max_inline_screenshots: 3
+```
+
+Remote desktop, interactive, gated writes:
+
+```yaml
+tools:
+  - module: tool-computer-use
+    config:
+      target: ssh://user@host
+      read_only: false        # gate_writes turns on automatically in the same step
+
+hooks:
+  - module: hook-computer-use
+    config:
+      max_inline_screenshots: 3
+```
+
+Run this one from a real terminal. Without a TTY every write is denied — by design.
+
+---
+
+## See also
+
+- `CONTRIBUTING.md` — development environment, test suite, the evidence standard
+- `docs/designs/remote-transport.md` — the SSH transport design and its threat model
+- `docs/designs/coexistence.md` — presence detection, halt invariant, target binding
+- `BACKLOG.md` — what is known, wanted, and deliberately not done yet

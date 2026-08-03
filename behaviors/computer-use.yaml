@@ -7,12 +7,22 @@ tools:
   - module: tool-computer-use
     source: git+https://github.com/microsoft/amplifier-bundle-computer-use.git@main#subdirectory=modules/tool-computer-use
     config:
-      # Screenshots are downscaled to this long edge before Claude sees them.
+      # Full config reference + setup prerequisites: docs/SETUP.md
+      #
+      # Which desktop to drive. Omit entirely to probe THIS machine
+      # (Windows/WSL2 -> Linux X11 -> macOS, first available wins).
+      # target: ssh://user@host
+      #
+      # Screenshots are downscaled to this long edge before the model sees them.
       # Anthropic's guidance: at or below WXGA. Bigger is slower AND less accurate.
       max_edge: 1280
-      tool_version: computer_20251124
       enable_zoom: true
+      # true = screenshots only, all input blocked. Defaults to TRUE for a
+      # remote (ssh://) target even when unset here.
       read_only: false
+      # tool_version is deliberately unset: it is resolved from the live model on
+      # every request (Anthropic's type is versioned per model generation; OpenAI's
+      # is the bare `computer`). Setting it statically risks a stale pairing.
 
 hooks:
   - module: hook-computer-use
@@ -21,6 +31,10 @@ hooks:
       # How many of the most recent screenshots stay inline in the request.
       # Older ones collapse to text so a long session does not blow up cost.
       max_inline_screenshots: 3
+      # Allow writes on a gated target with NO human confirmation, when no
+      # interactive approval is possible (stdin is not a TTY). Deliberate,
+      # always logged at WARNING, never a default. See docs/SETUP.md section 7.
+      # unattended_writes_ok: true
 
 agents:
   include:

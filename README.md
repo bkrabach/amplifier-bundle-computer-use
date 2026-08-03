@@ -13,22 +13,51 @@ CLI, no browser extension required.
 "Fill this dialog in for me — I'm done pressing buttons."
 ```
 
+> ## ⚠️ Read `docs/SETUP.md` before you install
+>
+> **This is not the usual one-line, `--app`-level pointer at a behavior bundle.** It
+> drives a real desktop, so the install has four moving parts that live outside this
+> repository: a **version floor on three upstream modules**, a **model that supports
+> native computer use**, a **target machine with per-platform prerequisites** (WSL2
+> interop / macOS TCC grants / X11), and — for remote targets — **SSH key auth and
+> `uv` on the far end**.
+>
+> **[→ docs/SETUP.md](docs/SETUP.md)** has the exact checks, the proven-vs-rough
+> matrix, the full config reference, and the operational facts (a locked screen
+> cannot be driven, on any platform) that otherwise cost you an afternoon.
+
 ---
 
 ## What makes this the native thing
 
-Claude is post-trained on a specific server-side tool definition
-(`computer_20251124`). Sending it a lookalike function tool gets you noticeably worse
-targeting. This bundle sends the real one:
+Both Anthropic and OpenAI post-train their models on a **specific server-side tool
+definition**. Sending a lookalike function tool instead gets you noticeably worse
+targeting — or, on OpenAI, a hard 400. This bundle sends the real one, per vendor:
 
-```json
+```jsonc
+// Anthropic — versioned type, dimensions REQUIRED
 {"type": "computer_20251124", "name": "computer",
  "display_width_px": 1280, "display_height_px": 720, "enable_zoom": true}
+
+// OpenAI — bare type, every extra field is a 400
+{"type": "computer"}
 ```
 
-…with the `computer-use-2025-11-24` beta header, and returns screenshots as genuine
-base64 **image** content blocks inside `tool_result`, exactly as Anthropic's own loop
-does.
+Anthropic additionally needs the `computer-use-2025-11-24` beta header (derived by the
+provider itself). Screenshots come back as genuine base64 **image** content blocks
+inside the tool result, exactly as each vendor's own loop does.
+
+**Both providers have driven a real desktop through this bundle.** Anthropic:
+`claude-sonnet-4-5`, `claude-sonnet-5`, `claude-opus-5`. OpenAI: `gpt-5.5`, verified
+end-to-end against a real remote desktop. A Gemini dialect record exists
+(`gemini-2.5-computer-use`), transcribed from captured traffic — no live end-to-end run
+through this bundle is claimed for it.
+
+Model support is **capability-gated upstream**: `provider-openai` and
+`provider-anthropic` both expose `supports_native_computer_use` on `ModelCapabilities`,
+and a model without it cannot use this bundle. See `docs/SETUP.md` §2 for the exact
+rules (OpenAI: `minor >= 4` and not `-nano`; Anthropic: per-family version thresholds
+mapping to a specific `computer_YYYYMMDD` wire type).
 
 ## The one thing that had to be solved
 
@@ -49,7 +78,8 @@ promote it and inject the beta header itself. That is now handled upstream:
 `loop-streaming` preserves a tool's `native_tool_spec` through its own `ToolSpec`
 construction, and `provider-anthropic` derives the required `anthropic-beta` header
 itself. `hook-computer-use` now only verifies that support is present and refuses to
-mount if it isn't — see `mount()`'s `_fail_if_native_tool_passthrough_unsupported`.)
+mount if it isn't — see `_fail_if_orchestrator_native_tool_spec_unsupported`, and
+`docs/SETUP.md` §1 for the exact commits you need.)
 
 Remove the hook and the tool degrades cleanly to an ordinary function tool. Nothing is
 monkey-patched on disk; nothing rots when the orchestrator changes.
@@ -65,14 +95,21 @@ monkey-patched on disk; nothing rots when the orchestrator changes.
 
 ### Tools
 
-**`computer`** — Anthropic's action set: `screenshot`, `zoom`, `left_click`,
-`right_click`, `middle_click`, `double_click`, `triple_click`, `mouse_move`,
-`left_click_drag`, `left_mouse_down`, `left_mouse_up`, `scroll`, `key`, `hold_key`,
-`type`, `wait`, `cursor_position`.
+**`computer`** — the native action set: `screenshot`, `zoom`, `cursor_position`,
+`mouse_move`, `left_click`, `right_click`, `middle_click`, `double_click`,
+`triple_click`, `left_mouse_down`, `left_mouse_up`, `left_click_drag`, `scroll`, `key`,
+`hold_key`, `type`, `wait`, plus `screen_info`, `list_windows`, `focus_window`.
 
 **`desktop`** — what the native schema cannot express: `list_windows`, `focus_window`,
-`screen_info`, `get_clipboard`, `set_clipboard`. Focus a window before typing into it;
-use the clipboard to pull exact text out of an app.
+`screen_info`, `get_clipboard`, `set_clipboard`, `list_monitors`, `select_monitor`.
+Focus a window before typing into it; use the clipboard to pull exact text out of an app;
+use `select_monitor` to switch which monitor the model sees, mid-session.
+
+> **On a remote (`ssh://`) target, nine of these are not implemented yet.**
+> `left_mouse_down`, `left_mouse_up`, `left_click_drag`, `scroll`, `hold_key`,
+> `desktop.list_windows`, `desktop.focus_window`, `desktop.get_clipboard`, and
+> `desktop.set_clipboard` all raise `BackendError("... over the wire is Phase 2")`.
+> See `docs/SETUP.md` §5.
 
 ## Coordinates
 
@@ -85,37 +122,65 @@ less accurate. Raising `max_edge` is usually the wrong lever.
 
 ## Configuration
 
+The keys that matter most. **Full reference in [`docs/SETUP.md`](docs/SETUP.md) §6.**
+
 ```yaml
 tools:
   - module: tool-computer-use
     config:
+      target: ssh://user@host     # omit entirely to drive THIS machine
       max_edge: 1280              # long edge of the image the model sees
-      tool_version: computer_20251124
       enable_zoom: true
       read_only: false            # true = screenshots only, all input blocked
+      # tool_version: auto-resolved from the live model — leave unset
 
 hooks:
   - module: hook-computer-use
     config:
       max_inline_screenshots: 3   # older screenshots collapse to text
+      # unattended_writes_ok: true   # explicit, logged opt-out — see Safety
 ```
+
+**Remote defaults are stricter than local**, because a remote machine is by definition one
+you are not looking at:
+
+| Key | Local default | Remote (`ssh://`) default |
+|---|---|---|
+| `read_only` | `false` | **`true`** |
+| `gate_writes` | off | **on**, whenever `read_only` is off |
+| `clipboard_read_policy` | `allow` | **`redact`** |
 
 ## Requirements
 
-- WSL2 with Windows interop enabled (the default)
-- An Anthropic provider on a model that supports computer use (Opus 5, Sonnet 5, …)
-- Pillow (installed with the tool module)
+**See [`docs/SETUP.md`](docs/SETUP.md) — this is the part that is more involved than a
+typical bundle.** In brief:
 
-No admin rights, no agent installed on the Windows side, no extra service.
+- **A version floor on three upstream modules** — `loop-streaming` ≥ `f8004e0` (PR #36),
+  `provider-anthropic` ≥ `94a4354` (PR #79) and `e983a23` (PR #81), and/or
+  `provider-openai` ≥ `3af4ce1` (PR #58) and `2f44edc` (PR #59). Their package versions
+  are all still `1.0.0` and are useless as a floor; pin by commit. The bundle probes the
+  installed code rather than trusting a version string, and refuses to mount if the
+  orchestrator cannot carry the native tool form.
+- **A model with `supports_native_computer_use`** — OpenAI: `minor >= 4`, not `-nano`.
+  Anthropic: per-family version thresholds. §2 of the setup doc has the tables.
+- **A target machine** — local (WSL2+Windows / macOS / Linux X11) or remote over SSH.
+  Per-platform prerequisites differ: WSL interop, macOS **Screen Recording *and*
+  Accessibility** TCC grants (separately granted), X11 + `python-xlib`.
+- **For remote targets** — key-based SSH (`BatchMode=yes`; a passphrase-locked key will
+  not prompt, it will fail), a trusted host key, and `uv` or `python3` on the far end.
+- Pillow (installed with the tool module).
+
+No admin rights, no agent to install on the target, no extra service, no new listening port.
 
 ## Safety
 
-**There is exactly one hard control, and it is `read_only`.** Be clear about which of the
-two mechanisms below you are relying on:
+Four distinct mechanisms. Be clear which one you are relying on:
 
 | Control | Kind | Strength |
 |---|---|---|
-| `read_only: true` | Code | **Enforced.** Every input action is rejected in `execute()` before anything reaches the desktop. Screenshots still work. |
+| `read_only: true` | Code | **Enforced.** Every mutating action rejected in `execute()` before anything reaches the desktop. Screenshots still work. |
+| Write gate (`gate_writes`) | Code + human | **Enforced.** Per-action `ask_user` approval, default **deny**, across 15 mutating actions. On by default for a remote, non-read-only target. |
+| Presence guard / halt | Code | **Enforced and unconditional.** Halts before the next write the moment a human is detected at the machine. No config key can disable the halt once a guard exists; the halt is durable across sessions and cleared only by a human running `scripts/resume_after_halt.py`. |
 | Stop Conditions in `agents/computer-operator.md` | Prompt | **Model judgment.** Nothing inspects the screen or blocks an action. |
 
 The agent is instructed to stop and ask when it sees credential prompts, CAPTCHAs,
@@ -123,23 +188,50 @@ destructive confirmations, anything that would send or publish on your behalf, o
 that twice fails to match expectations. That instruction is followed well in practice —
 but it is guidance to a model, not a gate. Treat it as such.
 
+**`unattended_writes_ok` is a deliberate opt-out, not a convenience toggle.** With no TTY,
+the write gate denies rather than crashing on an unanswerable prompt. Setting
+`unattended_writes_ok: true` allows those writes with no human confirmation — always
+logged at WARNING, never a default, never inferred from the environment. If prompts are
+merely tedious in an interactive session, you want `read_only: true` instead.
+
+**A locked screen cannot be driven — on any platform.** macOS and Windows both switch to a
+secure session that refuses synthetic input by design. The requirement is an **unlocked,
+logged-in GUI session**, not merely "the screen is on." The tool now detects this and
+fails loud; previously it handed a lock-screen capture to the model as if it were the
+desktop. `docs/SETUP.md` §8 has the measurements and the three distinct macOS diagnoses.
+
 **On-screen content can try to manipulate the agent.** Anything the agent can read, it can
 be influenced by: a dialog, a web page, or a document saying "click OK to confirm" or
 "enter the password" is indistinguishable from a legitimate UI. This is an inherent risk of
 computer use, not a defect in this bundle. Do not point it at untrusted screens
 unsupervised, and use `read_only: true` when you only need it to look.
 
-**The clipboard goes to your model provider.** `desktop.get_clipboard` returns the full
-current Windows clipboard as tool output, which becomes part of the conversation sent to
-the API. If you have just copied a password, token, or other secret, clear the clipboard
-before letting the agent read it.
+**The clipboard goes to your model provider.** `desktop.get_clipboard` returns the target's
+clipboard as tool output, which becomes part of the conversation sent to the API and lands
+in durable logs. The default is `allow` locally and `redact` (length + digest, never the
+text) on a remote target; `clipboard_read_policy: block` refuses outright. If you have just
+copied a password or token, clear the clipboard before letting the agent read it.
 
-**Screenshots touch disk briefly.** Captures land in `%TEMP%\amplifier-computer-use\`
-(cleaned after 30 minutes) and `~/.amplifier/computer-use/shots/` (cleaned after 2 hours).
-On a shared machine, that is a window in which another user with filesystem access could
-read images of your screen.
+**Screenshots touch disk briefly.** Captures land in `%TEMP%\amplifier-computer-use\` on a
+Windows target (cleaned after 30 minutes) and in a per-session subdirectory of
+`~/.amplifier/computer-use/shots/` on the controller (cleaned after 2 hours). Directories
+are created `0700` and files `0600`.
+
+## Known issues
+
+- **macOS `type_text` silently no-ops while returning success — OPEN.** On an unlocked
+  Mac, `key` works and `type` returns `success: true` while entering nothing. Localized to
+  the type path; hypothesis (unconfirmed) is that it posts to a specific app rather than
+  the system-wide event tap. `key`-only flows on macOS are unaffected. Logged in
+  `BACKLOG.md`.
+- **Nine actions are unimplemented over the remote wire** — see Tools above.
+- **No whole-session end-to-end run** of the hook, native promotion, screenshot rewriting
+  and the write gate all executing together (`BACKLOG.md`).
+- **The Windows on-desktop indicator overlay is not built** (Linux and macOS announce are).
 
 ## Troubleshooting
+
+Full symptom→cause→fix table in [`docs/SETUP.md`](docs/SETUP.md) §10.
 
 Set a trace path and you get a plain-text record of what the hook actually did:
 
@@ -154,9 +246,12 @@ complete: markers=1 messages_with_blocks=3
 ```
 
 No `markers=` line → screenshots are not reaching the model. A mount-time
-`ComputerUseNativeToolPassthroughUnsupportedError` means the installed
-`loop-streaming`/`provider-anthropic` do not yet carry `computer`'s native tool form to
-the wire on their own — see that error's message for the exact commit to upgrade to.
+`ComputerUseNativeToolPassthroughUnsupportedError` means the installed `loop-streaming`
+does not yet carry `computer`'s native tool form to the wire on its own — see that
+error's message for the exact commit to upgrade to. A provider that fails its capability
+probe does **not** raise; the hook logs which integration points it tried
+(`_derive_native_tool_betas` for Anthropic's dated types, `_convert_tools_from_request`
+for OpenAI's bare `computer`) and wraps nothing.
 
 ## Tests
 
