@@ -267,3 +267,70 @@ case; this is a second, independent instance of the same shape and the
 
 Blocks: end-to-end `type` proof on macOS through the bundle. `key`-only flows
 are unaffected.
+
+## Local / open-weight model support (researched 2026-08-03, not started)
+
+**Why it's interesting:** every local serving stack (vLLM, Ollama, llama.cpp,
+LM Studio) exposes OpenAI-compatible chat-completions with `"type": "function"`
+only. No native computer-use tool type exists anywhere in that world —
+confirmed by reading vLLM's own Anthropic-Messages `AnthropicTool` model, which
+has `name / description / input_schema` and **no `type` field at all**, so
+`{"type": "computer_20250124", ...}` is structurally unrepresentable rather than
+merely unimplemented.
+
+That is the seam's `BREAK 1` (declaration must go in `tools[]`) — but NOT
+`BREAK 2`. Which matters, because of one exception:
+
+**Holo3.1** (H Company, Apache 2.0, 2026-06) is post-trained for **standard
+OpenAI function calling**: pass `tools=[...]` with `tool_choice="required"`,
+read `message.tool_calls`. The action comes back as a **parsed tool call**, not
+text to regex. From H's own agent-loop doc: *"Native function calling: the model
+returns OpenAI-style tool_calls. Holo3.1 only; Holo3 does not support it."*
+
+So it is a genuine third integration category — not a server-side computer-use
+tool type (you author the schema), but structurally compatible with the half of
+our seam that `BREAK 2` covers.
+
+### Two separate bets, do not conflate them
+
+| | Sizes | Hardware | Status |
+|---|---|---|---|
+| **A. General user** | Holo3.1 **4B / 9B** | consumer GPU / Apple Silicon | **quality at these sizes UNVERIFIED by us** |
+| **B. This box** | Holo3.1 **35B-A3B NVFP4** | DGX Spark specifically | H publishes a Spark launch line; 6.8s → 3.3s/step |
+
+(B) was the first thing found and is the more impressive demo. (A) is the one
+that matters for anyone else, and its central unknown is whether 4B is good
+enough to drive a desktop at all — H's blog gives AndroidWorld 4B/9B 58%→72%,
+but the per-size OSWorld table on the model card renders as an image and was not
+readable. **Verify before building.**
+
+### The coordinate trap, recorded now so it is not rediscovered
+
+Holo and GUI-Owl both say "0–1000" and **mean different things**:
+
+- **Holo3.1** — normalized to *the image you sent*. `abs_x = int(x/1000 * width)`.
+  No smart_resize.
+- **GUI-Owl-1.5** — normalized to the *smart_resize'd* dims. Error bounded ~±15px:
+  *"small, systematic, and exactly the kind of thing that reads as 'the model is
+  a bit imprecise.'"*
+
+Same family as the 261px miss. Verify against a known target empirically before
+trusting either doc.
+
+### Ruled out
+
+- **GUI-Owl-1.5** (MIT, best open OSWorld with released weights, 56.5 @32B) —
+  pure harness, both breaks apply. Its published PC driver also `NameError`s as
+  shipped (`dashscope` used but never imported).
+- **UI-TARS** — open weights frozen at 2025-04-18. UI-TARS-2 is paper + hosted
+  API only. Also has two contradictory coordinate conventions in one repo.
+- **Qwen-UI-Agent** — paper 2026-07-30, no weights.
+- **OS-Atlas / ShowUI / CogAgent** — dormant, grounding-only, no agent loop.
+- **Molmo/MolmoAct** — active but robotics VLA, wrong domain.
+
+### Also relevant
+
+`HoloDesktop CLI` (`github.com/hcompai/holo-desktop-cli`) already drives real
+desktops against a local model server and supports `--base-url`. Worth reading
+as prior art — and note its Linux constraint matches ours: *"Requires an X11
+session; Wayland is not supported by the input backend."*
