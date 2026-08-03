@@ -1,25 +1,20 @@
 # Support
 
-## How to file issues and get help
+## No Support Available
 
-This project uses GitHub Issues to track bugs and feature requests. Please search
-[existing issues](../../issues) before filing a new one to avoid duplicates.
+**This is currently a small experimental exploration project. No support is provided.**
 
-For new issues, file your bug or feature request as a new issue using the templates
-provided:
+- **No issue tracking**
+- **No feedback channels**
+- **No assistance available**
+- **Use at your own risk**
 
-- **Bug report** — something doesn't work the way this project says it should.
-- **Feature request** — a capability you'd like to see added.
+## Project Status
 
-Bug reports are far more actionable with the platform, deployment mode (local vs.
-remote), and the exact error text attached — see the bug report template for the
-specific fields. Several past defects in this project presented as one failure mode
-(e.g. an X server connection error) while the real cause was something else entirely
-(e.g. a missing Python dependency); the raw error text is what lets a maintainer tell
-those apart quickly, so please paste it rather than describing it from memory.
+**⚠️ EXPERIMENTAL EXPLORATION**
+
+This is experimental software shared openly but without any support infrastructure. See [README.md](README.md) for project details and warnings about using permissive AI tools.
 
 ## Microsoft Support Policy
 
-Support for this project is limited to the resources listed above. This is not a
-Microsoft-supported product with a formal SLA; it is maintained on a best-effort basis
-by the people credited in `README.md` and `.github/CODEOWNERS`.
+This experimental project is not covered by any Microsoft support plans or services.
