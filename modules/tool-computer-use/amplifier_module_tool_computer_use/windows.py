@@ -288,6 +288,39 @@ class WindowsBackend:
             raise BackendError(res.get("error", "presence_idle failed"))
         return float(res["idle_ms"])
 
+    def session_state(self) -> tuple[str, str]:
+        """Is this Windows session locked, has it no GUI session at all, or is
+        it normally usable? The Windows counterpart to
+        `MacOSBackend._macos_session_state` - see that method's docstring for
+        the real incident (a locked screen misdiagnosed as a missing
+        permission grant) this exists to prevent on the other platform.
+
+        `bridge.ps1`'s dispatcher already refuses `capture`/mutating actions
+        itself once locked/no-GUI is detected (`Get-SessionState`, checked
+        once per bridge invocation - no extra `powershell.exe` round trip
+        beyond the one every action already pays). This method exists for
+        direct introspection (tests, `desktop` diagnostics) via the same
+        `session_state` bridge action, dispatched through the identical
+        `raw()` call path every other read here uses.
+
+        NOT independently verified against a live Windows target for this
+        change (see the accompanying report - no Windows host was reachable
+        this session): `LogonUI.exe` presence-as-lock-signal and
+        `Get-VirtualScreen` failure-as-no-GUI-signal are both well-documented
+        techniques, not guesses, but neither has been exercised on real
+        hardware here.
+        """
+        res = self.raw("session_state", timeout=15)
+        if not res.get("ok"):
+            return "unknown", res.get("error", "session_state failed")
+        if res.get("no_gui_session"):
+            return "no_gui_session", str(
+                res.get("detail") or "Get-VirtualScreen failed"
+            )
+        if res.get("locked"):
+            return "locked", str(res.get("detail") or "LogonUI.exe process present")
+        return "unlocked", "no LogonUI.exe process; virtual screen reachable"
+
     def screen_geometry(self) -> ScreenGeometry:
         info = self.raw("screen_info", timeout=30)
         if not info.get("ok"):

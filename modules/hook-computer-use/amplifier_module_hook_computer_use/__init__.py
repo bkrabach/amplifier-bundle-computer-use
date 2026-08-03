@@ -811,7 +811,33 @@ _GATE_MUTATING_ACTIONS = {
 }
 
 
-def _make_gate_handler(coordinator: Any):
+def _interactive_approval_possible() -> bool:
+    """Can an `ask_user` approval prompt actually reach a human on THIS process?
+
+    The app-layer `ApprovalSystem` that answers `ask_user` (`amplifier_core.approval`,
+    implemented outside this bundle - CLI/web/API) is not something this hook can
+    inspect or wrap. What it CAN check, in the same process, is the one precondition
+    every known interactive implementation shares: a real terminal to prompt on.
+    `sys.stdin.isatty()` is False for exactly the case that used to crash silently -
+    a backgrounded run, a piped/redirected stdin, a service with no controlling
+    terminal - and True for a normal interactive session, unchanged.
+
+    This is a deliberate, named heuristic, not a certainty: an app layer that answers
+    `ask_user` some other way (e.g. a web UI polling a queue) would also read False
+    here and be denied - see `_make_gate_handler`'s docstring for why "deny with a
+    clear reason" is still the correct, honest default for that case, and how an
+    operator gets an explicit way around it.
+    """
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        # A closed/replaced stdin (some test harnesses, some service launchers)
+        # answers `isatty()` with one of these - treat exactly like "no TTY",
+        # never like "yes, interactive" (fail loud, never optimistic).
+        return False
+
+
+def _make_gate_handler(coordinator: Any, unattended_writes_ok: bool = False):
     """Build the `tool:pre` handler implementing the write-confirmation gate
     (`docs/designs/remote-transport.md` \u00a710.4): "Gate every WRITE, or gate
     none - anything finer is guesswork wearing a confidence costume."
@@ -825,6 +851,28 @@ def _make_gate_handler(coordinator: Any):
     into the kernel's own `ask_user` mechanism (`HOOKS_API.md`) - it invents
     no new confirmation system of its own, per the design doc's explicit
     guidance not to.
+
+    Real incident this closes: `ask_user`'s approval prompt is answered by an
+    app-layer `ApprovalSystem` this bundle does not own (see
+    `_interactive_approval_possible`'s docstring) - on a backgrounded run with
+    no TTY, that implementation's own `input()` hits immediate EOF and raises
+    `EOFError`, which propagates uncaught all the way to the operator as
+    `Tool computer failed: EOF when reading a line` - a message that names
+    NOTHING (not approval, not the missing terminal, not what to do about
+    it). That single line was previously misread as "the remote write path
+    was never wired up" - a full misdiagnosis cycle, and false: the write
+    path works fine. The fix does not - cannot - patch that external
+    approval system; it prevents ever reaching it when this process can
+    already tell the prompt cannot be answered, and substitutes a real,
+    actionable, named error instead of letting the EOF happen at all.
+
+    `unattended_writes_ok`: the deliberate, explicit, ALWAYS-LOGGED opt-in for
+    a run launched on purpose against a target the operator already named,
+    with nobody at the keyboard to answer a prompt. Never a default (`False`
+    unless a human sets `unattended_writes_ok: true` in this hook's own
+    config) and never inferred from the environment - the gate itself is not
+    weakened for the interactive case; this only changes what happens on the
+    ONE path that used to crash instead of asking or denying.
     """
 
     async def handler(event: str, data: dict[str, Any]) -> HookResult:
@@ -842,6 +890,40 @@ def _make_gate_handler(coordinator: Any):
         if action not in _GATE_MUTATING_ACTIONS:
             return HookResult(action="continue")
         backend_name = getattr(getattr(computer, "_backend", None), "name", "?")
+
+        if not _interactive_approval_possible():
+            # The EOF fix: never hand this to `ask_user` - the app-layer approval
+            # system's own `input()` would hit immediate EOF with no diagnostic at
+            # all (see this function's docstring). Decide here instead, with a
+            # real reason either way.
+            if unattended_writes_ok:
+                logger.warning(
+                    "computer-use: unattended_writes_ok=True - auto-ALLOWING "
+                    "%s.%s on backend %r with NO interactive approval available "
+                    "(stdin is not a TTY) and NO human confirmation. This is an "
+                    "explicit, logged config opt-in (hook-computer-use config "
+                    "'unattended_writes_ok') - not a default and not inferred.",
+                    tool_name,
+                    action,
+                    backend_name,
+                )
+                return HookResult(action="continue")
+            return HookResult(
+                action="deny",
+                reason=(
+                    f"action {tool_name}.{action!r} requires human approval "
+                    f"(gate_writes is enabled for backend {backend_name!r}), but "
+                    "no interactive session is available to ask (stdin is not a "
+                    "TTY - this looks like a backgrounded, piped, or otherwise "
+                    "non-interactive run). The write was NOT sent. To proceed: "
+                    "(1) run this session interactively so the approval prompt "
+                    "can be answered, or (2) set hook-computer-use config "
+                    "'unattended_writes_ok: true' to explicitly allow writes on "
+                    "this target with no human confirmation - a deliberate, "
+                    "logged opt-in, never a default."
+                ),
+            )
+
         return HookResult(
             action="ask_user",
             approval_prompt=(
@@ -933,6 +1015,11 @@ async def mount(
         "ignore", message=".*PydanticSerializationUnexpectedValue.*"
     )
     priority = int(cfg.get("priority", 50))
+    # Explicit, always-logged unattended-write opt-in (see `_make_gate_handler`'s
+    # docstring) - `False` unless a human sets this, never inferred from the
+    # environment. Read here, at mount, from THIS hook's own config - never
+    # from `tool-computer-use`'s config, which has no opinion on this.
+    unattended_writes_ok = bool(cfg.get("unattended_writes_ok", False))
 
     async def handler(event: str, data: dict[str, Any]) -> HookResult:
         # Providers are guaranteed mounted by the time the loop asks one to run.
@@ -970,7 +1057,7 @@ async def mount(
     )
     coordinator.hooks.register(
         TOOL_PRE,
-        _make_gate_handler(coordinator),
+        _make_gate_handler(coordinator, unattended_writes_ok=unattended_writes_ok),
         priority=priority,
         name="hook-computer-use-gate",
     )

@@ -177,12 +177,83 @@ function Get-Coord($req, [string]$name) {
   return @([int]$c[0], [int]$c[1])
 }
 
+# ---- session/lock detection (silent-failure fix) ------------------------------
+# A locked workstation and a genuinely-missing GUI session both used to leave
+# Get-VirtualScreen/CopyFromScreen/SendInput throwing an unrelated .NET exception -
+# or, worse for capture, "succeeding" against a lock screen that looks like a real
+# desktop from byte count alone (see MacOSBackend._macos_session_state's docstring
+# for the real incident this mirrors: a locked screen was misdiagnosed as a missing
+# permission grant, and that WRONG diagnosis stood as fact for days). Checked once,
+# up front, for every action that captures pixels or injects input - read-only
+# geometry/cursor/window-enumeration actions are left unaffected, matching the same
+# scoping MacOSBackend uses.
+function Get-SessionState {
+  # LogonUI.exe is the lock-screen host process Windows runs while the session is
+  # locked - its mere presence is the standard, documented signal (the Win32
+  # equivalent of macOS's CGSSessionScreenIsLocked: a fact you check for, not a
+  # value you read). NOT independently verified against a live Windows target for
+  # this change (see the accompanying report - no Windows host was reachable) but
+  # unlike the mac backend, this reuses Get-VirtualScreen, the SAME call every
+  # other action here already depends on, as the "no GUI session" probe - so a
+  # legitimate desktop that can already run screenshot/mouse_move today can never
+  # be newly blocked by this check.
+  $locked = @(Get-Process -Name logonui -ErrorAction SilentlyContinue).Count -gt 0
+  try {
+    $vs = Get-VirtualScreen
+    if ($null -eq $vs -or $vs.Width -le 0 -or $vs.Height -le 0) {
+      return @{ locked = $locked; no_gui_session = $true; vs = $vs
+        detail = "SystemInformation.VirtualScreen returned an empty/zero-size rectangle" }
+    }
+    return @{ locked = $locked; no_gui_session = $false; vs = $vs; detail = $null }
+  } catch {
+    return @{ locked = $locked; no_gui_session = $true; vs = $null
+      detail = "Get-VirtualScreen failed: $($_.Exception.Message)" }
+  }
+}
+
+#: Actions that either capture pixels or inject input - the two silent-failure
+#: paths this check exists to close. Read-only actions (cursor_position,
+#: screen_info, list_windows, presence_idle, get_clipboard) are deliberately
+#: excluded: they either still work correctly against a locked session (cursor
+#: position, geometry) or their own result already makes the state obvious
+#: (list_windows returns nothing) - narrowing scope here matches MacOSBackend's
+#: same-scoped distinction rather than blocking strictly more than proven necessary.
+$CAPTURE_OR_WRITE_ACTIONS = @(
+  'screenshot', 'zoom', 'mouse_move', 'left_click', 'right_click', 'middle_click',
+  'double_click', 'triple_click', 'left_mouse_down', 'left_mouse_up',
+  'left_click_drag', 'scroll', 'key', 'hold_key', 'type', 'focus_window', 'set_clipboard'
+)
+
 # ---- dispatch ----------------------------------------------------------------
 $out = @{ ok = $true }
 try {
   $req = Get-Content -Raw -LiteralPath $RequestFile | ConvertFrom-Json
   $action = "$($req.action)".ToLower()
-  $vs = Get-VirtualScreen
+  $state = Get-SessionState
+
+  if ($action -eq 'session_state') {
+    $out.locked = $state.locked; $out.no_gui_session = $state.no_gui_session
+    if ($state.detail) { $out.detail = $state.detail }
+    $out | ConvertTo-Json -Depth 6 -Compress
+    return
+  }
+  if ($state.no_gui_session -and ($action -in $CAPTURE_OR_WRITE_ACTIONS)) {
+    throw ("NO_GUI_SESSION: no interactive GUI session is available on this " +
+      "Windows host to capture or drive ($($state.detail)). This is NOT a lock - " +
+      "the session itself has no desktop attached (e.g. a disconnected RDP/console " +
+      "session, or a Server Core / session-0 host). Reconnect to the console (RDP, " +
+      "or physically) before retrying.")
+  }
+  if ($state.locked -and ($action -in $CAPTURE_OR_WRITE_ACTIONS)) {
+    throw ("SESSION_LOCKED: the Windows session is LOCKED (LogonUI.exe is running - " +
+      "the lock-screen host process). A locked screen and a missing capture/input " +
+      "permission look identical from a screenshot's byte size alone; this check " +
+      "confirms it is the LOCK, not a permission problem. Unlock the session (sign " +
+      "back in at the keyboard, or via RDP) before retrying - screenshots of the " +
+      "lock screen are refused, never returned as if they were the real desktop, " +
+      "and no input is sent to a locked session.")
+  }
+  $vs = $state.vs
 
   switch ($action) {
     'screenshot' {

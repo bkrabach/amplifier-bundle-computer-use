@@ -498,7 +498,7 @@ class _FakeGuard:
 def test_type_text_posts_one_event_pair_per_character(monkeypatch):
     fake = _FakeTypeQuartz()
     monkeypatch.setattr(macos, "Quartz", fake)
-    monkeypatch.setattr(MacOSBackend, "_ensure_input_trusted", lambda self: None)
+    monkeypatch.setattr(MacOSBackend, "_ensure_ready_for_input", lambda self: None)
     backend = MacOSBackend({})
 
     backend.type_text("ab")
@@ -512,7 +512,7 @@ def test_type_text_posts_one_event_pair_per_character(monkeypatch):
 def test_type_text_calls_guard_before_and_after_each_character(monkeypatch):
     fake = _FakeTypeQuartz()
     monkeypatch.setattr(macos, "Quartz", fake)
-    monkeypatch.setattr(MacOSBackend, "_ensure_input_trusted", lambda self: None)
+    monkeypatch.setattr(MacOSBackend, "_ensure_ready_for_input", lambda self: None)
     backend = MacOSBackend({})
     guard = _FakeGuard()
 
@@ -533,9 +533,298 @@ def test_type_text_with_no_guard_skips_every_guard_call(monkeypatch):
     existing callers with no guard are unaffected."""
     fake = _FakeTypeQuartz()
     monkeypatch.setattr(macos, "Quartz", fake)
-    monkeypatch.setattr(MacOSBackend, "_ensure_input_trusted", lambda self: None)
+    monkeypatch.setattr(MacOSBackend, "_ensure_ready_for_input", lambda self: None)
     backend = MacOSBackend({})
 
     backend.type_text("hi")  # guard=None (default) - must not raise
 
     assert fake.posted_strings == ["h", "h", "i", "i"]
+
+
+# -- session/lock detection (D-locked-screen): _macos_session_state ------------
+#
+# Real ioreg output captured live against `macos-host` (unlocked,
+# see the accompanying report) is the "unlocked" fixture below - byte-for-byte
+# the shape actually returned by `ioreg -n Root -d1 -a` on a real Mac, not a
+# guessed structure. `plistlib` is used to parse it, exactly as production code
+# does - no fake plist parser, only a faked `subprocess.run`.
+
+_IOREG_UNLOCKED_PLIST = b"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>IOConsoleLocked</key>
+\t<false/>
+\t<key>IOConsoleUsers</key>
+\t<array>
+\t\t<dict>
+\t\t\t<key>kCGSSessionUserNameKey</key>
+\t\t\t<string>user</string>
+\t\t\t<key>kCGSessionLoginDoneKey</key>
+\t\t\t<true/>
+\t\t</dict>
+\t</array>
+</dict>
+</plist>
+"""
+
+_IOREG_LOCKED_PLIST = b"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>CGSSessionScreenIsLocked</key>
+\t<true/>
+\t<key>IOConsoleLocked</key>
+\t<true/>
+\t<key>IOConsoleUsers</key>
+\t<array>
+\t\t<dict>
+\t\t\t<key>kCGSSessionUserNameKey</key>
+\t\t\t<string>user</string>
+\t\t\t<key>kCGSessionLoginDoneKey</key>
+\t\t\t<true/>
+\t\t</dict>
+\t</array>
+</dict>
+</plist>
+"""
+
+_IOREG_NO_CONSOLE_USER_PLIST = b"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>IOConsoleLocked</key>
+\t<false/>
+\t<key>IOConsoleUsers</key>
+\t<array/>
+</dict>
+</plist>
+"""
+
+
+class _FakeIoregProc:
+    def __init__(self, stdout: bytes, returncode: int = 0, stderr: str = "") -> None:
+        self.stdout = stdout.decode("utf-8")
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+def test_session_state_unlocked_from_real_captured_ioreg_output(monkeypatch):
+    monkeypatch.setattr(
+        macos.subprocess,
+        "run",
+        lambda *a, **k: _FakeIoregProc(_IOREG_UNLOCKED_PLIST),
+    )
+    state, detail = macos._macos_session_state()
+    assert state == "unlocked"
+    assert detail
+
+
+def test_session_state_locked_when_cgs_key_present_true(monkeypatch):
+    """The proven signature: CGSSessionScreenIsLocked present and True - this
+    is the exact key/value the real locked-vs-unlocked measurement against
+    macos-host distinguished (see the report)."""
+    monkeypatch.setattr(
+        macos.subprocess,
+        "run",
+        lambda *a, **k: _FakeIoregProc(_IOREG_LOCKED_PLIST),
+    )
+    state, detail = macos._macos_session_state()
+    assert state == "locked"
+    assert "CGSSessionScreenIsLocked" in detail
+
+
+def test_session_state_no_gui_session_when_no_console_user(monkeypatch):
+    monkeypatch.setattr(
+        macos.subprocess,
+        "run",
+        lambda *a, **k: _FakeIoregProc(_IOREG_NO_CONSOLE_USER_PLIST),
+    )
+    state, detail = macos._macos_session_state()
+    assert state == "no_gui_session"
+    assert detail
+
+
+def test_session_state_unknown_when_ioreg_fails_to_exec(monkeypatch):
+    def _boom(*a, **k):
+        raise OSError("ioreg: command not found")
+
+    monkeypatch.setattr(macos.subprocess, "run", _boom)
+    state, detail = macos._macos_session_state()
+    assert state == "unknown"
+    assert "ioreg" in detail.lower()
+
+
+def test_session_state_unknown_when_ioreg_exits_nonzero(monkeypatch):
+    monkeypatch.setattr(
+        macos.subprocess,
+        "run",
+        lambda *a, **k: _FakeIoregProc(b"", returncode=1, stderr="permission denied"),
+    )
+    state, detail = macos._macos_session_state()
+    assert state == "unknown"
+    assert "permission denied" in detail
+
+
+def test_session_state_unknown_when_plist_unparseable(monkeypatch):
+    monkeypatch.setattr(
+        macos.subprocess,
+        "run",
+        lambda *a, **k: _FakeIoregProc(b"not a plist at all"),
+    )
+    state, detail = macos._macos_session_state()
+    assert state == "unknown"
+
+
+# -- capture() refuses a locked/no-GUI/unknown session (FAILS WITHOUT THE FIX) --
+#
+# Before this pass, capture() never consulted session state at all - it went
+# straight to _active_display_ids()/CGDisplayCreateImage, which succeed
+# perfectly well against a LOCKED screen (a real, plausible-looking image is
+# returned). These tests fail on the pre-fix code because no BackendError is
+# raised at all before Quartz is ever touched.
+
+
+def test_capture_refuses_when_locked(monkeypatch):
+    monkeypatch.setattr(
+        macos,
+        "_macos_session_state",
+        lambda: ("locked", "CGSSessionScreenIsLocked=True"),
+    )
+    backend = MacOSBackend({})
+
+    with pytest.raises(BackendError, match="LOCKED"):
+        backend.capture()
+
+
+def test_capture_refuses_when_no_gui_session(monkeypatch):
+    monkeypatch.setattr(
+        macos, "_macos_session_state", lambda: ("no_gui_session", "no console user")
+    )
+    backend = MacOSBackend({})
+
+    with pytest.raises(BackendError, match="no GUI session"):
+        backend.capture()
+
+
+def test_capture_refuses_when_session_state_unknown(monkeypatch):
+    monkeypatch.setattr(
+        macos, "_macos_session_state", lambda: ("unknown", "ioreg timed out")
+    )
+    backend = MacOSBackend({})
+
+    with pytest.raises(BackendError, match="could not determine"):
+        backend.capture()
+
+
+def test_capture_proceeds_when_unlocked(monkeypatch):
+    """Sanity check: an "unlocked" state must not block capture - the
+    pre-existing Quartz path still runs exactly as before."""
+    fake = _FakeQuartz(
+        [
+            {
+                "id": 1,
+                "bounds": (0, 0, 1440, 900),
+                "pixel_w": 2880,
+                "pixel_h": 1800,
+                "main": True,
+            }
+        ]
+    )
+    monkeypatch.setattr(macos, "Quartz", fake)
+    monkeypatch.setattr(
+        macos, "_macos_session_state", lambda: ("unlocked", "console user logged in")
+    )
+    backend = MacOSBackend({})
+
+    # Reaches real Quartz capture machinery - CGDisplayCreateImage isn't faked
+    # on _FakeQuartz, so this call itself would raise AttributeError if the
+    # lock check were somehow still blocking; getting past that line proves
+    # the "unlocked" path is unaffected.
+    with pytest.raises(AttributeError):
+        backend.capture()
+
+
+# -- discrete input refuses a locked/no-GUI session (FAILS WITHOUT THE FIX) ----
+#
+# Before this pass, every discrete-input method (move, click, key, ...) checked
+# ONLY _ensure_input_trusted() (Accessibility TCC) - a locked session silently
+# swallows CGEventPost calls exactly the same way a missing TCC grant does,
+# with no error either way. These tests fail on the pre-fix code because
+# click()/key() proceed all the way to Quartz.CGEventPost (which the fakes
+# below do not implement) instead of raising BackendError first.
+
+
+def test_click_refuses_when_locked(monkeypatch):
+    monkeypatch.setattr(
+        macos,
+        "_macos_session_state",
+        lambda: ("locked", "CGSSessionScreenIsLocked=True"),
+    )
+    backend = MacOSBackend({})
+
+    with pytest.raises(BackendError, match="LOCKED"):
+        backend.click(10, 10)
+
+
+def test_key_refuses_when_locked(monkeypatch):
+    monkeypatch.setattr(
+        macos,
+        "_macos_session_state",
+        lambda: ("locked", "CGSSessionScreenIsLocked=True"),
+    )
+    backend = MacOSBackend({})
+
+    with pytest.raises(BackendError, match="LOCKED"):
+        backend.key("Return")
+
+
+def test_type_text_refuses_when_locked(monkeypatch):
+    monkeypatch.setattr(
+        macos,
+        "_macos_session_state",
+        lambda: ("locked", "CGSSessionScreenIsLocked=True"),
+    )
+    backend = MacOSBackend({})
+
+    with pytest.raises(BackendError, match="LOCKED"):
+        backend.type_text("hello")
+
+
+def test_input_refuses_when_no_gui_session(monkeypatch):
+    monkeypatch.setattr(
+        macos, "_macos_session_state", lambda: ("no_gui_session", "no console user")
+    )
+    backend = MacOSBackend({})
+
+    with pytest.raises(BackendError, match="no GUI session"):
+        backend.move(0, 0)
+
+
+def test_input_still_gated_by_accessibility_when_unlocked(monkeypatch):
+    """The lock check must not bypass the existing Accessibility gate - both
+    still apply, lock-state first (see _ensure_ready_for_input's docstring)."""
+    monkeypatch.setattr(
+        macos, "_macos_session_state", lambda: ("unlocked", "console user logged in")
+    )
+    monkeypatch.setattr(macos, "_ax_is_process_trusted", lambda: False)
+    backend = MacOSBackend({})
+
+    with pytest.raises(BackendError, match="Accessibility"):
+        backend.click(10, 10)
+
+
+def test_lock_check_runs_before_accessibility_check(monkeypatch):
+    """Order matters: a locked-AND-untrusted session must be diagnosed as
+    LOCKED, not as a missing Accessibility grant - this is the exact
+    ambiguity that produced the wrong diagnosis in the real incident."""
+    monkeypatch.setattr(
+        macos,
+        "_macos_session_state",
+        lambda: ("locked", "CGSSessionScreenIsLocked=True"),
+    )
+    monkeypatch.setattr(macos, "_ax_is_process_trusted", lambda: False)
+    backend = MacOSBackend({})
+
+    with pytest.raises(BackendError, match="LOCKED"):
+        backend.click(10, 10)

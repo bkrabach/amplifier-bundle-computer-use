@@ -64,6 +64,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import logging
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -288,6 +289,135 @@ def _ax_is_process_trusted() -> bool:
     return bool(lib.AXIsProcessTrusted())
 
 
+#: A locked screen and a missing TCC grant look IDENTICAL from the outside on
+#: this platform: `CGDisplayCreateImage` returns a real, plausible-looking
+#: image of the lock screen (not `None`, not an error) when locked, and
+#: `CGEventPost` silently drops every click/keystroke sent to a locked
+#: session exactly the way it drops them when Accessibility is not granted.
+#: A prior real incident sat on a WRONG diagnosis ("Accessibility TCC not
+#: granted") for days because nothing checked which of the two it actually
+#: was - see `_macos_session_state()` and its two call sites (`capture()`,
+#: `_ensure_not_locked()`) for the fix.
+def _macos_session_state() -> tuple[str, str]:
+    """Determine whether THIS host's console session is locked, has no GUI
+    session at all, or is normally usable - via `ioreg -n Root -d1 -a`, the
+    one property source proven live against a real target (see the
+    accompanying report): unlocked, this command's plist output contains
+    NEITHER `CGSSessionScreenIsLocked` nor a true `IOConsoleLocked`, and
+    `IOConsoleUsers` holds one entry for the logged-in console user; locked,
+    `CGSSessionScreenIsLocked` appears in the top-level dict as `True` (it is
+    a key that is PRESENT only while locked, not present-and-`False` while
+    unlocked) and/or `IOConsoleLocked` reads `True`. Both are consulted - an
+    honest disjunction of two independently-sourced signals, not one
+    guessed proxy for the other.
+
+    `Quartz`/PyObjC's own session-property APIs are NOT importable on the
+    real target this was verified against - `ioreg` is - so this shells out
+    rather than depend on a module this host does not have (the same
+    reasoning `focus_window`'s `osascript` shell-out already documents for a
+    different capability).
+
+    Returns `(state, detail)`:
+      state: `"locked"` | `"unlocked"` | `"no_gui_session"` | `"unknown"`
+      detail: the raw evidence the conclusion is based on - always surfaced
+              to the caller (see the `_*_error` builders below) so a human
+              or agent can verify THIS call's reasoning, not just trust its
+              one-word label. This is the whole point: the previous silent
+              failure was not merely "wrong", it was UNVERIFIABLE from the
+              tool's own output.
+
+    Never guesses when it cannot tell: an `ioreg` exec/parse failure returns
+    `"unknown"` with the reason, never silently defaulting to `"unlocked"`
+    (which would let a locked screen straight through - the exact bug this
+    function exists to close) or to `"locked"` (which would block a healthy
+    desktop on a transient tooling hiccup).
+    """
+    exe = shutil.which("ioreg") or "/usr/sbin/ioreg"
+    try:
+        proc = subprocess.run(
+            [exe, "-n", "Root", "-d1", "-a"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "unknown", f"ioreg invocation failed: {exc}"
+    if proc.returncode != 0:
+        return "unknown", (
+            f"ioreg -n Root -d1 -a exited {proc.returncode}: "
+            f"{proc.stderr.strip()[:300]}"
+        )
+    try:
+        data = plistlib.loads(proc.stdout.encode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - malformed plist -> unknown, not a guess
+        return "unknown", f"could not parse ioreg -a plist output: {exc}"
+    if not isinstance(data, dict):
+        return "unknown", f"ioreg -a plist root was {type(data).__name__}, not a dict"
+
+    screen_locked = data.get("CGSSessionScreenIsLocked")
+    console_locked = data.get("IOConsoleLocked")
+    if bool(screen_locked) or bool(console_locked):
+        return "locked", (
+            f"CGSSessionScreenIsLocked={screen_locked!r} "
+            f"IOConsoleLocked={console_locked!r} (ioreg -n Root -d1 -a)"
+        )
+    console_users = data.get("IOConsoleUsers")
+    if not (isinstance(console_users, list) and console_users):
+        return "no_gui_session", (
+            "IOConsoleUsers is empty/absent in ioreg -n Root -d1 -a - no "
+            "user is logged into the console at all"
+        )
+    return "unlocked", (
+        "no lock indicators present (CGSSessionScreenIsLocked absent, "
+        "IOConsoleLocked=False) and a console user is logged in "
+        "(ioreg -n Root -d1 -a)"
+    )
+
+
+def _session_state_error(state: str, detail: str, doing: str) -> str:
+    """Compose the fail-loud message for a non-`\"unlocked\"` session state,
+    shared by `capture()` and `_ensure_not_locked()` so a human/agent sees
+    the exact same diagnostic vocabulary for both - the previous incident's
+    root cause was precisely that the two silent-failure modes (capture,
+    input) gave NO diagnostic at all, forcing a guess that landed on the
+    wrong one. `doing` names the refused action in the caller's own words
+    (e.g. `\"capture a screenshot\"`, `\"send input\"`).
+    """
+    if state == "locked":
+        return (
+            f"refusing to {doing}: this macOS session is LOCKED ({detail}). "
+            "A locked screen and a missing permission grant (Screen "
+            "Recording for capture, Accessibility for input) are "
+            "INDISTINGUISHABLE from the outside otherwise - a screenshot of "
+            "the lock screen is a real, plausible-looking image, and "
+            "keystrokes/clicks sent to a locked session are silently "
+            "discarded by macOS with no error. That ambiguity previously "
+            'produced a wrong diagnosis ("Accessibility TCC not granted") '
+            "that stood as fact for days; this check exists so it never has "
+            "to be guessed again. Fix: unlock the screen (sign back in) on "
+            "the target host, then retry."
+        )
+    if state == "no_gui_session":
+        return (
+            f"refusing to {doing}: no GUI session is available on this host "
+            f"at all ({detail}) - this is NOT a lock; nobody is logged into "
+            "the console. Fix: log in at the physical console (or via "
+            "Screen Sharing) before retrying."
+        )
+    # "unknown"
+    return (
+        f"refusing to {doing}: could not determine whether this macOS "
+        f"session is locked or has no GUI session at all ({detail}). "
+        "Refusing rather than guessing - a locked screen returned as a real "
+        "screenshot, or input silently sent to a locked session, is exactly "
+        "the failure this check exists to prevent. Verify "
+        "`ioreg -n Root -d1 -a` runs successfully on this host, then retry."
+    )
+
+
 #: `CGEventFlags` bit masks (from CoreGraphics's public `CGEventTypes.h`), hardcoded as
 #: plain ints rather than read off `Quartz.kCGEventFlagMask*`. This is a deliberate,
 #: pure-logic seam: `_combo_flags_and_keycode` below does real work (combo parsing,
@@ -410,6 +540,36 @@ class MacOSBackend:
                 "cursor position are unaffected by this permission and remain usable."
             )
             raise BackendError(self._input_blocked_reason)
+
+    # -- lazy lock-state gate (D1 companion to the Accessibility gate above) ------
+    def _ensure_not_locked(self) -> None:
+        """Refuse to send input to a locked session, or one with no GUI session
+        at all - checked FRESH on every call, never cached.
+
+        Unlike Accessibility TCC (stable for the life of a session, so
+        `_ensure_input_trusted` checks it once and remembers), lock state changes
+        constantly - a session unlocked at mount can lock seconds later - so a
+        cached answer here would get the exact case this check exists for wrong.
+        See `_macos_session_state()`'s module-level docstring for the real
+        incident (a locked screen misdiagnosed as a missing TCC grant) this
+        refusal exists to prevent.
+        """
+        state, detail = _macos_session_state()
+        if state != "unlocked":
+            raise BackendError(_session_state_error(state, detail, "send input"))
+
+    def _ensure_ready_for_input(self) -> None:
+        """The full discrete-input gate: not locked, AND Accessibility-trusted.
+
+        Order matters and is deliberate: a locked session silently swallows
+        `CGEventPost` calls exactly like a missing Accessibility grant does (see
+        `_macos_session_state()`'s docstring) - checking lock state FIRST means a
+        locked-but-otherwise-trusted process gets the correct diagnosis (\"the
+        screen is locked\") instead of the previous incident's wrong one (\"TCC not
+        granted\"), which is precisely the ambiguity this pass closes.
+        """
+        self._ensure_not_locked()
+        self._ensure_input_trusted()
 
     # -- geometry helpers ----------------------------------------------------------
     def _active_display_ids(self) -> list[int]:
@@ -663,7 +823,17 @@ class MacOSBackend:
         reference display's scale factor when displays disagree, an approximation for
         genuinely mixed-DPI setups (not exercised on this backend's single-display
         verification machine).
+
+        Checked BEFORE any Quartz capture call, every time (never cached): a locked
+        screen produces a real, plausible-looking `CGDisplayCreateImage` result, not
+        `None` and not an exception - see `_macos_session_state()`'s module-level
+        docstring for the real incident this refusal exists to prevent.
         """
+        state, detail = _macos_session_state()
+        if state != "unlocked":
+            raise BackendError(
+                _session_state_error(state, detail, "capture a screenshot")
+            )
         ids = self._active_display_ids()
         if not ids:
             raise BackendError("no active displays; cannot capture the screen")
@@ -736,7 +906,7 @@ class MacOSBackend:
         return self._point_to_pixel(loc.x, loc.y)
 
     def move(self, x: int, y: int) -> None:
-        self._ensure_input_trusted()
+        self._ensure_ready_for_input()
         point = self._pixel_to_point(x, y)
         event = Quartz.CGEventCreateMouseEvent(
             None, Quartz.kCGEventMouseMoved, point, Quartz.kCGMouseButtonLeft
@@ -755,7 +925,7 @@ class MacOSBackend:
     def click(
         self, x: int | None, y: int | None, button: str = "left", count: int = 1
     ) -> None:
-        self._ensure_input_trusted()
+        self._ensure_ready_for_input()
         btn_const = _BUTTON_CONST.get(button)
         if btn_const is None:
             raise BackendError(f"unsupported click button {button!r}")
@@ -779,7 +949,7 @@ class MacOSBackend:
                 _time.sleep(0.05)
 
     def mouse_down(self, x: int | None, y: int | None, button: str = "left") -> None:
-        self._ensure_input_trusted()
+        self._ensure_ready_for_input()
         btn_const = _BUTTON_CONST.get(button)
         if btn_const is None:
             raise BackendError(f"unsupported button {button!r}")
@@ -793,7 +963,7 @@ class MacOSBackend:
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
 
     def mouse_up(self, x: int | None, y: int | None, button: str = "left") -> None:
-        self._ensure_input_trusted()
+        self._ensure_ready_for_input()
         btn_const = _BUTTON_CONST.get(button)
         if btn_const is None:
             raise BackendError(f"unsupported button {button!r}")
@@ -807,7 +977,7 @@ class MacOSBackend:
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
 
     def drag(self, start: tuple[int, int] | None, end: tuple[int, int]) -> None:
-        self._ensure_input_trusted()
+        self._ensure_ready_for_input()
         import time as _time
 
         if start is not None:
@@ -823,7 +993,7 @@ class MacOSBackend:
         self.mouse_up(*end, "left")
 
     def scroll(self, x: int | None, y: int | None, direction: str, amount: int) -> None:
-        self._ensure_input_trusted()
+        self._ensure_ready_for_input()
         if x is not None and y is not None:
             self.move(x, y)
         vertical = {"up": 1, "down": -1}.get(direction)
@@ -839,7 +1009,7 @@ class MacOSBackend:
 
     # -- keyboard --------------------------------------------------------------
     def key(self, combo: str) -> None:
-        self._ensure_input_trusted()
+        self._ensure_ready_for_input()
         flags, keycode = _combo_flags_and_keycode(combo)
         down = Quartz.CGEventCreateKeyboardEvent(None, keycode, True)
         Quartz.CGEventSetFlags(down, flags)
@@ -849,7 +1019,7 @@ class MacOSBackend:
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
 
     def hold_key(self, combo: str, duration: float) -> None:
-        self._ensure_input_trusted()
+        self._ensure_ready_for_input()
         import time as _time
 
         flags, keycode = _combo_flags_and_keycode(combo)
@@ -885,7 +1055,7 @@ class MacOSBackend:
         whole string, which WindowServer already delivered to the focused field
         identically either way.
         """
-        self._ensure_input_trusted()
+        self._ensure_ready_for_input()
         for ch in text:
             if guard is not None:
                 guard.before_event()
@@ -951,7 +1121,7 @@ class MacOSBackend:
         the same Accessibility TCC gate as direct `CGEventPost` input, gated the same
         way here.
         """
-        self._ensure_input_trusted()
+        self._ensure_ready_for_input()
         try:
             wid = int(handle)
         except ValueError as exc:
