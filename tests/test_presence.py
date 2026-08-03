@@ -1,5 +1,5 @@
 """Unit tests for the presence detector (`presence.py`) - the mechanism behind
-`docs/designs/coexistence.md` \u00a75, proven empirically by O5/U1c in
+`docs/coexistence.md` \u00a75, proven empirically by O5/U1c in
 `coexistence-probes.md`.
 
 No X server, no subprocess, no real desktop - `idle_source` is a plain

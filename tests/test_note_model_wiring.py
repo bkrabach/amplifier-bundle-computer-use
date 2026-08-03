@@ -1,6 +1,6 @@
 """Unit tests proving `note_model()` is actually wired from hook-computer-use's
 `provider.complete()` wrapper into the mounted `computer` tool (Plan A1,
-`docs/designs/phase2-plans.md`).
+`docs/phase2-plans.md`).
 
 `ComputerTool.note_model()` existed with zero callers before this fix - its own
 docstring and a comment in tool-computer-use's `__init__.py` (~line 190) both

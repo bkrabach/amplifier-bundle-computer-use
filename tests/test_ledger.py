@@ -1,5 +1,5 @@
 """Unit tests for the held-input ledger (`ledger.py`) - the day-one safety
-mechanism behind docs/designs/remote-transport.md \u00a710.2.
+mechanism behind docs/remote-transport.md \u00a710.2.
 
 No remote host, no subprocess, no real input injection - `release_fn` is a
 plain recording callable. This is what proves "held-input ledger releases on

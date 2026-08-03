@@ -653,7 +653,7 @@ def _note_model_on_computer_tool(coordinator: Any, model: str | None) -> None:
     tool's `note_model()`, so `ComputerTool._tool_version` never drifts out of
     sync with the model actually in use this turn (see `tool_versions.py`).
 
-    This is Plan A1 (`docs/designs/phase2-plans.md`): `note_model()` existed with
+    This is Plan A1 (`docs/phase2-plans.md`): `note_model()` existed with
     zero callers - both its own docstring and a comment in tool-computer-use's
     `__init__.py` asserted hook-computer-use already called it on every
     `provider:request`. It never did. `request` (a `ChatRequest`) is the seam:
@@ -744,7 +744,7 @@ def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
     original = provider.complete
 
     async def complete(request: Any, **kwargs: Any):
-        # Plan A1 (docs/designs/phase2-plans.md): keep `computer`'s resolved
+        # Plan A1 (docs/phase2-plans.md): keep `computer`'s resolved
         # tool_version current for the model actually about to receive THIS
         # request - see `_note_model_on_computer_tool` for the full rationale.
         _note_model_on_computer_tool(coordinator, getattr(request, "model", None))
@@ -839,7 +839,7 @@ def _interactive_approval_possible() -> bool:
 
 def _make_gate_handler(coordinator: Any, unattended_writes_ok: bool = False):
     """Build the `tool:pre` handler implementing the write-confirmation gate
-    (`docs/designs/remote-transport.md` \u00a710.4): "Gate every WRITE, or gate
+    (`docs/remote-transport.md` \u00a710.4): "Gate every WRITE, or gate
     none - anything finer is guesswork wearing a confidence costume."
 
     This hook is pure POLICY sitting on top of a MECHANISM `ComputerTool`
@@ -940,7 +940,7 @@ def _make_gate_handler(coordinator: Any, unattended_writes_ok: bool = False):
 
 def _make_halt_notice_handler(coordinator: Any):
     """Build the `tool:post` handler that closes defect 1
-    (`docs/designs/coexistence.md` \u00a76.0): a halted session must not be able
+    (`docs/coexistence.md` \u00a76.0): a halted session must not be able
     to reach a final response without the interruption in front of the
     model.
 
@@ -990,7 +990,7 @@ def _make_halt_notice_handler(coordinator: Any):
                 f"{len(notices)} human-detected interruption(s) occurred during "
                 "this driving session - a person at the machine produced input "
                 "the agent did not generate, and writes were halted before the "
-                f"next one (docs/designs/coexistence.md \u00a76.0). Most recent: "
+                f"next one (docs/coexistence.md \u00a76.0). Most recent: "
                 f"{latest['message']} You MUST explicitly acknowledge this "
                 "interruption in any summary, report, or completion claim you "
                 "give the user - never report unqualified success or that the "

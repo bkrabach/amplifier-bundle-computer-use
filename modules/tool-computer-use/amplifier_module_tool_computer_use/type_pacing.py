@@ -1,5 +1,5 @@
 """Type-text pacing - the fix for a measured masking defect adjacent to
-`docs/designs/coexistence.md` \u00a75.2/\u00a75.5.
+`docs/coexistence.md` \u00a75.2/\u00a75.5.
 
 The defect, measured
 --------------------

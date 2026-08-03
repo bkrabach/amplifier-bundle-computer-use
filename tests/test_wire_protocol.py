@@ -71,7 +71,7 @@ def test_read_ops_are_retryable(op: str):
 )
 def test_write_ops_are_never_retryable(op: str):
     """The single most load-bearing assertion in this module: a lost response
-    to a WRITE must never be replayed - see docs/designs/remote-transport.md
+    to a WRITE must never be replayed - see docs/remote-transport.md
     \u00a76.3."""
     assert classify_op(op) == "write"
     assert is_retryable(op) is False

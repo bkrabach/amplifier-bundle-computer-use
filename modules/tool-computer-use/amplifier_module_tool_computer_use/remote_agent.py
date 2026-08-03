@@ -6,7 +6,7 @@ has ONE job: read one JSON request per line from stdin, execute it against
 whichever platform `Backend` `registry.select_backend()` picks for THIS
 machine (the exact same `MacOSBackend`/`LinuxX11Backend`/`WindowsBackend` that
 already back the local path and its 83 tests - see
-`docs/designs/remote-transport.md` \u00a72, "one implementation, two deployment
+`docs/remote-transport.md` \u00a72, "one implementation, two deployment
 shapes"), and write one JSON response per line to stdout.
 
 Deployment note: this module is designed to be `runpy.run_module()`'d after a
@@ -231,7 +231,7 @@ class RemoteAgent:
                 ok=False,
                 error_type="BackendError",
                 error_message=f"op {req.op!r} blocked: agent enforces read_only "
-                "(defence in depth - see docs/designs/remote-transport.md \u00a710.4)",
+                "(defence in depth - see docs/remote-transport.md \u00a710.4)",
             )
         handler = self._HANDLERS.get(req.op)
         if handler is None:
@@ -295,7 +295,7 @@ class RemoteAgent:
 
     def _op_presence_idle(self, _args: dict[str, Any]) -> dict[str, Any]:
         """Forward a presence-idle read to whichever real platform backend
-        this agent is running (`docs/designs/coexistence.md` \u00a75) - the
+        this agent is running (`docs/coexistence.md` \u00a75) - the
         controller-side `RemoteBackend.presence_idle_ms()` calls this over
         the already-open NDJSON channel rather than duplicating any presence
         logic on the controller. `UnsupportedOpError` (not a guessed value)
@@ -373,7 +373,7 @@ class RemoteAgent:
         live desktop: a bare modifier key-down cannot click, type, or move
         anything, so it is safe to demonstrate on a machine a human is
         actively using. Matches the mechanic already proven in
-        docs/designs/remote-transport.md \u00a73.3 (`{"op":"hold","held":["ctrl"]}`
+        docs/remote-transport.md \u00a73.3 (`{"op":"hold","held":["ctrl"]}`
         ... `RELEASED:ctrl`).
         """
         name = str(args["key"]).lower()
@@ -399,7 +399,7 @@ class RemoteAgent:
         "type_text": _op_type_text,
         "key": _op_key,
         "hold": _op_hold,
-        # Coexistence presence read (docs/designs/coexistence.md §5). Missing
+        # Coexistence presence read (docs/coexistence.md §5). Missing
         # this entry is why a real SSH session got
         # `UnsupportedOpError: op 'presence_idle' not implemented in Phase 1`
         # on every remote presence read: `_op_presence_idle` was fully

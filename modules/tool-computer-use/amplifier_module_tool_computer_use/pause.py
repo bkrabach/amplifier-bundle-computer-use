@@ -1,4 +1,4 @@
-"""Pause/cancel semantics - `docs/designs/coexistence.md` \u00a78.1-\u00a78.5.
+"""Pause/cancel semantics - `docs/coexistence.md` \u00a78.1-\u00a78.5.
 
 The central property (\u00a78.1, U7): **the injector owns and enforces pause
 state. The controller may only observe it.** There is no `pause`/`resume` op

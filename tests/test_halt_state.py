@@ -1,5 +1,5 @@
 """Unit tests for `halt_state.py` - the durable, cross-session halt memory
-that closes defect 2 (`docs/designs/coexistence.md` \u00a713 D3): resume after a
+that closes defect 2 (`docs/coexistence.md` \u00a713 D3): resume after a
 human-detected halt must require an explicit signal, not the mere passage
 of time.
 """

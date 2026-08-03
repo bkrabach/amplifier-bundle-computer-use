@@ -15,11 +15,11 @@ line declared in `modules/tool-computer-use/pyproject.toml` and
 - Human/agent coexistence mechanism: presence detection, an unconditional halt that
   stops the agent's writes the moment a human is detected at the machine (not
   configurable off, on any platform), and target binding that aborts a multi-event
-  operation if focus changes mid-op. Design record in `docs/designs/coexistence.md`.
+  operation if focus changes mid-op. Design record in the design notes.
 - SSH-based remote transport: drive a desktop on a different machine across a private
   network (e.g. Tailscale), with a single persistent remote agent process per session
   and screenshots downscaled to model space on the target before crossing the wire.
-  Design record in `docs/designs/remote-transport.md`.
+  Design record in the design notes.
 - macOS backend for the `computer` and `desktop` tools, alongside the existing Windows
   and Linux X11 backends.
 - Per-monitor display targeting, fixing coordinate scaling on multi-monitor setups.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Layer 3 of the anti-regression scheme (docs/designs/multi-provider-design.md
+"""Layer 3 of the anti-regression scheme (docs/multi-provider-design.md
 Sec 11.2): a dated, real wire attestation for each provider's native `computer`
 tool declaration.
 
@@ -15,7 +15,7 @@ ship-gate tool in the same family as `scripts/verify_coexistence.py`
 (CONTRIBUTING.md, "The ship gate"): real, live, needs real credentials, NOT
 run in default CI, and run manually/periodically by a human before shipping.
 
-The six-lens review (docs/designs/phase2-plans.md, "Council items still
+The six-lens review (docs/phase2-plans.md, "Council items still
 open") found the ORIGINAL design for this layer advisory: "it records; it
 does not assert... CI prints its age" - a human is expected to notice a
 printed number and act on it, which is the exact class of failure ("393

@@ -559,7 +559,7 @@ GEMINI = Dialect(
 # Qwen (Alibaba DashScope): OUT-OF-SAMPLE EXTENSIBILITY PROBE - NOT SHIPPED
 #
 # DELIBERATELY ABSENT FROM `DIALECTS`. This record is a measuring instrument for
-# the claim in `docs/designs/multi-provider-design.md` Sec 18 ("adding provider
+# the claim in `docs/multi-provider-design.md` Sec 18 ("adding provider
 # N+1 is bounded work"), not a provider this bundle supports. Qwen was dropped
 # in Phase 0 BEFORE this module existed (`tests/fixtures/captures/qwen-verdict.md`),
 # so its shape informed nothing here - which is exactly what makes it a valid

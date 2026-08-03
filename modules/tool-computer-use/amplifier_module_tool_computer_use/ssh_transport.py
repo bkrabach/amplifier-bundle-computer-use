@@ -1,6 +1,6 @@
 """SSH transport: one persistent `ssh -T` subprocess per session, carrying both
 the one-time code deployment and the NDJSON protocol session on the same
-stdin/stdout pipe pair - `docs/designs/remote-transport.md` \u00a77-8.
+stdin/stdout pipe pair - `docs/remote-transport.md` \u00a77-8.
 
 No network daemon, no new listening port, no bespoke auth: "if you can SSH to
 the box, you can drive its desktop" (\u00a72). This module owns exactly the

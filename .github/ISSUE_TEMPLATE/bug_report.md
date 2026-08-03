@@ -23,7 +23,7 @@ raw text is what lets us tell these apart quickly.
 ## Local or remote?
 
 - [ ] Local (agent and target desktop are the same machine)
-- [ ] Remote (agent connects to a different machine over SSH — see `docs/designs/remote-transport.md`)
+- [ ] Remote (agent connects to a different machine over SSH)
 
 If remote: what is the target's OS, and is it reachable directly or via Tailscale/another
 overlay network?

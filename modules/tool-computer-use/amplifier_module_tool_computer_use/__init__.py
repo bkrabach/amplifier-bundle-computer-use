@@ -82,7 +82,7 @@ _PRIVATE_FILE_MODE = 0o600
 def _text_digest(text: str) -> str:
     """A short, stable, non-reversible fingerprint for an audit log line -
     never the plaintext itself. Matches the discipline
-    `docs/designs/remote-transport.md` \u00a710 specifies for `type_text`
+    `docs/remote-transport.md` \u00a710 specifies for `type_text`
     (`args_digest`, not `args`) - this bundle previously did not actually
     implement that logging for ANY action; this is the shared primitive
     behind extending it to every write op that carries free-form text
@@ -205,7 +205,7 @@ class ComputerTool:
         read_only_cfg = cfg.get("read_only")
         if read_only_cfg is None:
             # Unconfigured default: ON for remote (a machine you are, by
-            # definition, not looking at - see docs/designs/remote-transport.md
+            # definition, not looking at - see docs/remote-transport.md
             # \u00a714), unchanged (OFF) for local - preserves every existing
             # local-mode caller's behavior exactly.
             self._read_only = self._is_remote
@@ -260,7 +260,7 @@ class ComputerTool:
         self._session_id: str = uuid.uuid4().hex
 
         # -- security hardening: clipboard read policy ------------------------
-        # `get_clipboard` (docs/designs/DesktopTool) previously had no gate
+        # `get_clipboard` (docs/DesktopTool) previously had no gate
         # beyond `read_only` - a full clipboard read flows verbatim into
         # `ToolResult.output`, then the model provider's API, then a durable
         # transcript, and a clipboard can carry things a screenshot never
@@ -293,7 +293,7 @@ class ComputerTool:
                     f"'allow'/'redact'/'block', got {clipboard_policy_cfg!r}"
                 )
 
-        # -- human/agent coexistence (docs/designs/coexistence.md) -----------
+        # -- human/agent coexistence (docs/coexistence.md) -----------
         # Built by `mount()` (`_build_coexistence_guard`), never constructed
         # here directly - it needs the concrete backend instance, which does
         # not exist yet at `__init__` time (`ComputerTool.__init__` receives
@@ -698,7 +698,7 @@ class ComputerTool:
     @contextmanager
     def _guard_write(self, *, coord: tuple[int, int] | None = None):
         """Wrap one mutating action in the coexistence guard's before/after
-        discipline (`docs/designs/coexistence.md` \u00a75.2/\u00a78.6), extended in
+        discipline (`docs/coexistence.md` \u00a75.2/\u00a78.6), extended in
         this pass from `type_text` (the only action guarded before) to every
         action in `MUTATING`.
 
@@ -974,7 +974,7 @@ class ComputerTool:
                     "the inter-character gap wider than the guard band, "
                     "making the presence detector structurally blind for "
                     "the duration of this type_text call "
-                    "(docs/designs/coexistence.md \u00a75.2). A deliberate, "
+                    "(docs/coexistence.md \u00a75.2). A deliberate, "
                     "logged choice, not a default.",
                     backend.name,
                     guard.presence.guard_ms,
@@ -1003,7 +1003,7 @@ class ComputerTool:
                 backend.type_text(body)
             # §3 audit hardening: a digest, never the plaintext - typed
             # content frequently includes credentials (the same rationale
-            # `docs/designs/remote-transport.md` §10 already gives for
+            # `docs/remote-transport.md` §10 already gives for
             # `type_text`'s `args_digest`; this is where that discipline is
             # actually implemented, and where `set_clipboard` below matches it).
             logger.info(
@@ -1125,7 +1125,7 @@ class ComputerTool:
         """Shared halt bookkeeping for both `execute()`'s single-action path
         and `_execute_openai_action_batch()`'s per-item loop - see
         `execute()`'s original inline comment (Defect 1 + defect 2,
-        docs/designs/coexistence.md \u00a76.0/\u00a713 D3) for the full rationale;
+        docs/coexistence.md \u00a76.0/\u00a713 D3) for the full rationale;
         moved here unchanged so both callers hit the exact same recording
         logic rather than two copies drifting apart."""
         self.halt_notices.append(
@@ -1384,7 +1384,7 @@ class DesktopTool:
                         "message": (
                             f"action {action!r} requires confirmation "
                             "(gate_writes) but no gate hook is registered to "
-                            "grant it - see docs/designs/remote-transport.md "
+                            "grant it - see docs/remote-transport.md "
                             "\u00a710.4"
                         )
                     },
@@ -1406,14 +1406,14 @@ def _build_coexistence_guard(
     backend: Backend, cfg: dict[str, Any]
 ) -> CoexistenceGuard | None:
     """Build the `CoexistenceGuard` for `backend`, or `None` if this backend
-    has no proven presence-detector wiring yet (`docs/designs/coexistence.md`).
+    has no proven presence-detector wiring yet (`docs/coexistence.md`).
 
     Deliberately conservative: a guard is only ever constructed for a backend
     that exposes `presence_idle_ms()` (today: `LinuxX11Backend`, `MacOSBackend`
     since `presence.GUARD_MS["macos"]` was measured by O4, `WindowsBackend`
     (via `bridge.ps1`'s `presence_idle` action), and `RemoteBackend` (forwards
     the read to the SAME method on the target's own backend, \u00a75 of
-    `docs/designs/remote-transport.md`) - see each method's docstring). A
+    `docs/remote-transport.md`) - see each method's docstring). A
     backend with no such method gets no coexistence layer at all, rather than
     one built on a guessed/unmeasured `GUARD` band - the same "do not claim a
     guarantee you do not have" principle \u00a75.5 applies to Windows `type_text`.
@@ -1481,7 +1481,7 @@ def _build_coexistence_guard(
         presence.guard_ms,
         presence.guard_measured,
     )
-    # \u00a75.7 (measured safety gap, docs/designs/coexistence.md): a remote
+    # \u00a75.7 (measured safety gap, docs/coexistence.md): a remote
     # backend's presence_idle_ms() is an SSH round trip (plus, on Windows, a
     # per-op powershell.exe spawn) - not the in-process microsecond call
     # `guard_ms` was measured against. Measured on windows-host (n=80,
@@ -1520,7 +1520,7 @@ def _build_coexistence_guard(
             "coexistence: backend %r has a durable halt record from a prior "
             "session (reason=%r) - this session starts already HALTED; run "
             "scripts/resume_after_halt.py to clear it explicitly "
-            "(docs/designs/coexistence.md \u00a713 D3)",
+            "(docs/coexistence.md \u00a713 D3)",
             backend.name,
             persisted.reason,
         )
@@ -1574,7 +1574,7 @@ async def mount(
     # D2: resolve display once, here, before the tool ever answers a provider
     # request - not lazily on the first `native_tool_spec` read.
     computer.resolve_display()
-    # Human/agent coexistence (docs/designs/coexistence.md) - only built for
+    # Human/agent coexistence (docs/coexistence.md) - only built for
     # backends with a proven presence-detector wiring (see
     # `_build_coexistence_guard`). `None` on every other backend, unchanged
     # from before this feature existed.

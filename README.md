@@ -34,14 +34,11 @@ Registering this bundle is ordinary Amplifier bundle management:
 
 ```bash
 # 1. Register it (the name "computer-use" comes from this repo's own bundle.md)
-amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-computer-use.git@main
+amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-computer-use@main#subdirectory=behaviors/computer-use.yaml --app
 
 # 2. Use it for a session
 amplifier run --bundle computer-use "What's on my screen right now?"
 
-# ...or make it your active bundle so you don't need --bundle every time
-amplifier bundle use computer-use
-amplifier run "What's on my screen right now?"
 ```
 
 Confirm it registered correctly with `amplifier bundle show computer-use` — it should
@@ -304,7 +301,7 @@ git history and its copyright is retained in `LICENSE`.
 
 This fork extends it to a platform-backend architecture (Windows, macOS, Linux
 X11), per-monitor targeting, and remote operation over a private network. See
-`BACKLOG.md` for what is known and not yet done, and `docs/designs/` for the
+`BACKLOG.md` for what is known and not yet done, and `docs/` for the
 design record.
 
 ## Contributing

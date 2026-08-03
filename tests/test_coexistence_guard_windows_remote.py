@@ -181,7 +181,7 @@ def test_backend_with_no_presence_idle_ms_still_gets_no_guard():
 
 
 # -- the halt invariant is unconditional by construction, regardless of which
-#    backend built the guard (docs/designs/coexistence.md \u00a76.0) -------------
+#    backend built the guard (docs/coexistence.md \u00a76.0) -------------
 
 
 def test_halt_invariant_signature_has_no_disable_knob_for_any_backend():

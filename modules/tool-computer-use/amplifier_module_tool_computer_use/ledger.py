@@ -1,5 +1,5 @@
 """The held-input ledger: the most important safety property in the remote
-transport (`docs/designs/remote-transport.md` \u00a710.2).
+transport (`docs/remote-transport.md` \u00a710.2).
 
 A synthetic keydown/mousedown with no matching up leaves a real human's
 desktop broken, and the whole point of a remote agent is that the controller
@@ -98,7 +98,7 @@ class HeldInputLedger:
         """Release every currently-held token. Returns the tokens actually
         released (for logging/audit - "RELEASED:<token>" per token, matching
         the already-verified bootstrap mechanic in
-        docs/designs/remote-transport.md \u00a73.3). Safe to call from a signal
+        docs/remote-transport.md \u00a73.3). Safe to call from a signal
         handler, a `finally` block, EOF detection, or the deadman timer -
         multiple concurrent callers only ever release each token once.
         """

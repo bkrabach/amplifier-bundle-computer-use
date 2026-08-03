@@ -68,7 +68,7 @@ apply safe auto-fixes, before committing.
 ### The ship gate
 
 `scripts/verify_coexistence.py` is the pre-release gate for the human/agent coexistence
-mechanism (`docs/designs/coexistence.md`) — a statistical, real-process evidence run (not
+mechanism — a statistical, real-process evidence run (not
 a mock, not a unit test) that proves the presence detector still catches a human touching
 the input devices mid-injection, at production cadence, across a large sample of trials.
 It needs a real (if headless) X server:
@@ -85,7 +85,7 @@ presence detector, or the input backends it depends on. See the script's own doc
 for what evidence it produces and how to read the result.
 
 `scripts/wire_check.py` is the same kind of gate for the multi-provider wire-format
-anti-regression scheme (`docs/designs/multi-provider-design.md` §11.2, layer 3): it sends
+anti-regression scheme (the design notes §11.2, layer 3): it sends
 one minimal, real, declaration-only request per provider (the exact shape
 `providers.py`'s `Dialect.declare()` emits) and records the result in
 `tests/fixtures/wire-check.json`. It needs real credentials and the network, so it is

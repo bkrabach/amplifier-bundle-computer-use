@@ -1,10 +1,10 @@
 """Gate test for layer 3 of the anti-regression scheme
-(docs/designs/multi-provider-design.md Sec 11.2) - the dated wire attestation
+(docs/multi-provider-design.md Sec 11.2) - the dated wire attestation
 `scripts/wire_check.py` produces in `tests/fixtures/wire-check.json`.
 
 The design doc originally specified this layer as advisory: "it records; it
 does not assert" - CI prints the attestation's age and a human is expected to
-notice. The six-lens review (docs/designs/phase2-plans.md, "Council items
+notice. The six-lens review (docs/phase2-plans.md, "Council items
 still open") named this as reproducing, by a different name, the exact
 failure the layer exists to catch: 393 green unit tests and a green 4-stage
 chain test, all sitting on a wire nobody had actually exercised, while the
@@ -45,7 +45,7 @@ MAX_AGE_DAYS = 30
 
 #: Providers this bundle ships native support for TODAY (see providers.py's
 #: DIALECTS) and therefore must carry a live attestation for. Gemini/Qwen are
-#: deliberately out of scope (docs/designs/phase2-plans.md Sec "Gemini and
+#: deliberately out of scope (docs/phase2-plans.md Sec "Gemini and
 #: Qwen") - the deferral is a decision already made and dated, not a gap.
 REQUIRED_PROVIDERS = ("anthropic", "openai")
 

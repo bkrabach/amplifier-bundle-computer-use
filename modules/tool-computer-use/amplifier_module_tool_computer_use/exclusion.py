@@ -1,4 +1,4 @@
-"""Geometric exclusion zones - `docs/designs/coexistence.md` \u00a77.5.
+"""Geometric exclusion zones - `docs/coexistence.md` \u00a77.5.
 
 The Linux overlay's status band is input-transparent (X `SHAPE`/`ShapeInput` -
 see `overlay_linux.py`); only its Pause/Cancel button rectangles actually take

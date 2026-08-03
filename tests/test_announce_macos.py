@@ -1,5 +1,5 @@
 """Unit tests for the macOS announcement (`announce_macos.py`) -
-`docs/designs/coexistence.md` \u00a77.3: `osascript display dialog`, disclosed
+`docs/coexistence.md` \u00a77.3: `osascript display dialog`, disclosed
 timeout, and the rule that `gave up:true` is never consent.
 
 `subprocess.run` is monkeypatched throughout - **no real `osascript` is ever

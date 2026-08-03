@@ -1044,7 +1044,7 @@ class MacOSBackend:
 
         Per-character, not one `CGEvent` for the whole string - this is what makes
         `guard` (`coexistence_guard.CoexistenceGuard`, \u00a75.2/\u00a78.6 of
-        `docs/designs/coexistence.md`) meaningful here at all. `GUARD_MS["macos"]`
+        `docs/coexistence.md`) meaningful here at all. `GUARD_MS["macos"]`
         is now measured (O4 - see `presence.py`), so this backend claims the same
         intra-`type_text` detection Linux already does (\u00a75.2): a human keystroke
         landing MID-STRING must be able to interrupt between characters, which a
@@ -1214,7 +1214,7 @@ class MacOSBackend:
                 f"pbcopy failed: {proc.stderr.strip() or proc.returncode}"
             )
 
-    # -- coexistence: presence + target binding (docs/designs/coexistence.md) ----
+    # -- coexistence: presence + target binding (docs/coexistence.md) ----
     def presence_idle_ms(self) -> float:
         """Milliseconds since the last input event (real OR synthetic) reached
         this machine, via `CGEventSourceSecondsSinceLastEventType` against the

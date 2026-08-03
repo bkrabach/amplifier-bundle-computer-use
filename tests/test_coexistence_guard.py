@@ -1,5 +1,5 @@
 """Unit tests for `CoexistenceGuard` (`coexistence_guard.py`) - the combined
-per-event check from `docs/designs/coexistence.md` \u00a78.6: halt, pause,
+per-event check from `docs/coexistence.md` \u00a78.6: halt, pause,
 geometric exclusion, and target binding in one call site, plus \u00a76.0's
 release-on-abort behavior.
 """

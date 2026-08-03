@@ -29,7 +29,7 @@ bundle (`bundle.md` at the repo root, name `computer-use`), so the standard
    name below is not something you invent:
 
    ```bash
-   amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-computer-use.git@main
+   amplifier bundle add git+https://github.com/microsoft/amplifier-bundle-computer-use@main#subdirectory=behaviors/computer-use.yaml --app
    ```
 
    Verified against this exact repo — the command reports back `Bundle's canonical name:
@@ -651,6 +651,6 @@ of these — register the bundle itself (§0) and use `behaviors/computer-use.ya
 ## See also
 
 - `CONTRIBUTING.md` — development environment, test suite, the evidence standard
-- `docs/designs/remote-transport.md` — the SSH transport design and its threat model
-- `docs/designs/coexistence.md` — presence detection, halt invariant, target binding
+- the design notes — the SSH transport design and its threat model
+- the design notes — presence detection, halt invariant, target binding
 - `BACKLOG.md` — what is known, wanted, and deliberately not done yet

@@ -34,11 +34,11 @@ security-relevant, not merely functional bugs:
 - Anything that lets input reach the desktop, or a screenshot/clipboard leave it, **while
   `read_only: true` is configured** (the one hard code-enforced control this bundle has).
 - Anything that defeats, delays, or disables the human/agent coexistence halt described in
-  `docs/designs/coexistence.md` — this mechanism is intentionally **not configurable off**,
+  the design notes — this mechanism is intentionally **not configurable off**,
   on any platform, and a report showing it can be bypassed or silenced is a security report.
 - Anything that lets the remote (SSH) transport execute actions against a target the
   operator did not establish a connection to, or that widens the trust boundary described
-  in `docs/designs/remote-transport.md` beyond "if you can SSH to the box, you can drive
+  in the design notes beyond "if you can SSH to the box, you can drive
   its desktop."
 - Anything that causes synthetic input (held keys, in-flight clicks) to persist or repeat
   after the controlling session disconnects or crashes.

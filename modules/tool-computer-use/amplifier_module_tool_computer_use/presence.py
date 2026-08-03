@@ -1,4 +1,4 @@
-"""The presence detector - `docs/designs/coexistence.md` \u00a75.
+"""The presence detector - `docs/coexistence.md` \u00a75.
 
 Answers one question, cheaply and per elementary event: *did a human just touch
 this machine?* The mechanism is idle-time reconciliation (O5, U1c): the agent
@@ -11,7 +11,7 @@ else touched the machine - a human.
 Why this shape, specifically
 -----------------------------
 Revision 1 of the design recorded one timestamp per *operation* and used
-`GUARD = 250ms`. Both were wrong, and O5 (`docs/designs/coexistence-probes.md`)
+`GUARD = 250ms`. Both were wrong, and O5 (`docs/coexistence-probes.md`)
 proved it: at 250ms, a human keystroke landing mid-`type_text` (60ms injection
 cadence) is invisible for the *entire* duration of the operation, because the
 guard band never clears between the agent's own injections. The fix proven
@@ -233,7 +233,7 @@ class PresenceSnapshot:
 
     `transport_latency_ms` / `effective_staleness_ms` (\u00a75.7): a measured safety
     gap, not a hypothetical one. Over a remote backend (`RemoteBackend`,
-    `docs/designs/remote-transport.md`), `idle_source()` is not an in-process
+    `docs/remote-transport.md`), `idle_source()` is not an in-process
     syscall - it is an SSH round trip plus (on Windows) a fresh
     `powershell.exe` spawn per read. Measured on `windows-host` (n=80,
     `key("shift")`, 80/80 registration): min=296.0 p50=781.0 p90=828.0

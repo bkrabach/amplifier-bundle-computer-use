@@ -7,7 +7,7 @@ line-length = 88
 target-version = "py311"
 
 # Ruff's formatter also reformats fenced ```python code blocks inside Markdown files.
-# This repo's docs (docs/designs/*.md, BACKLOG.md, README.md, ...) contain illustrative
+# This repo's docs (docs/*.md, BACKLOG.md, README.md, ...) contain illustrative
 # snippets that are not meant to be lint-checked or reflowed, so Markdown is out of
 # scope for this config entirely -- this is a Python formatter/linter, not a docs one.
 extend-exclude = ["*.md"]

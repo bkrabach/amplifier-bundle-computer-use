@@ -1,5 +1,5 @@
 """Unit tests for geometric exclusion zones (`exclusion.py`) -
-`docs/designs/coexistence.md` \u00a77.5: the overlay's own Pause/Cancel button
+`docs/coexistence.md` \u00a77.5: the overlay's own Pause/Cancel button
 rects are excluded at the injection call site so the agent cannot click its
 own controls.
 """

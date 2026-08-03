@@ -40,7 +40,7 @@ public static class CU {
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    // Coexistence presence detector (docs/designs/coexistence.md \u00a75.5): GetLastInputInfo's
+    // Coexistence presence detector (docs/coexistence.md \u00a75.5): GetLastInputInfo's
     // dwTime and GetTickCount share the same coarse (~10-16ms) system clock, so both must be
     // read via this same P/Invoke pair - never mixed with a .NET/managed clock - for the
     // reconciliation math (idle = GetTickCount() - dwTime) to be meaningful.
@@ -85,7 +85,7 @@ $VK = @{
 function Get-VirtualScreen { [System.Windows.Forms.SystemInformation]::VirtualScreen }
 
 function Get-IdleMs {
-  # docs/designs/coexistence.md \u00a75.5: milliseconds since the last input event
+  # docs/coexistence.md \u00a75.5: milliseconds since the last input event
   # (real OR synthetic) reached this machine - GetTickCount() - dwTime, both read
   # via the SAME P/Invoke pair so they share one clock (the \u007e10-16ms GetTickCount
   # tick this bundle's measured GUARD_MS["windows-wsl2"]=20.0 already accounts for).
@@ -351,7 +351,7 @@ try {
         })
     }
     'presence_idle' {
-      # docs/designs/coexistence.md \u00a75.5 - a dedicated, lightweight action reusing
+      # docs/coexistence.md \u00a75.5 - a dedicated, lightweight action reusing
       # this SAME bridge script/dispatcher (no new mechanism, no new transport) rather
       # than a standalone tool. Deliberately does nothing else (no CopyFromScreen, no
       # SendInput) - the cheapest possible action this bridge can perform.

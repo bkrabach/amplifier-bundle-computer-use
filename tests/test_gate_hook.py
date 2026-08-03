@@ -1,5 +1,5 @@
 """Unit tests for the write-confirmation gate hook (`_make_gate_handler` in
-hook-computer-use) - `docs/designs/remote-transport.md` \u00a710.4: "gate every
+hook-computer-use) - `docs/remote-transport.md` \u00a710.4: "gate every
 WRITE, or gate none". No real coordinator, no real backend, no network.
 """
 

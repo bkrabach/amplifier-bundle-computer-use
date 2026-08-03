@@ -1,4 +1,4 @@
-"""Target binding - `docs/designs/coexistence.md` \u00a78.6.
+"""Target binding - `docs/coexistence.md` \u00a78.6.
 
 Closes a gap no indicator speed and no detector speed can fix: if the human
 switches window focus mid-`type_text`, the remaining keystrokes land in the

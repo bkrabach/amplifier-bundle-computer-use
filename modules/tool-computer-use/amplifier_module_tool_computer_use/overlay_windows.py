@@ -1,4 +1,4 @@
-"""The Windows on-desktop coexistence overlay - `docs/designs/coexistence.md` \u00a77.
+"""The Windows on-desktop coexistence overlay - `docs/coexistence.md` \u00a77.
 
 An always-on-top status band with Pause/Cancel buttons, matching
 `overlay_linux.py`'s shape and semantics as closely as the two platforms'
@@ -30,7 +30,7 @@ for the real-hardware proof of this, and the honest caveat: unlike X11's
 own WSL2-side process does not automatically kill this Windows-side PID
 today (there is no live handle spanning that boundary) - killing it
 requires an explicit `hide()` call. Tying the two together is exactly what
-`docs/designs/coexistence.md` \u00a77's Phase C5 (folded into transport Phase 4,
+`docs/coexistence.md` \u00a77's Phase C5 (folded into transport Phase 4,
 one persistent process serving injection + presence + overlay together)
 is for; this module is the overlay half, built and proven standalone ahead
 of that integration, matching this codebase's existing pattern of shipping

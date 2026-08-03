@@ -43,7 +43,6 @@ to build, it doesn't belong on this list.
     `test_negative_origin_monitor_survives_the_full_remote_round_trip` and
     `test_live_monitor_switch_between_negative_origin_monitors_over_the_remote_round_trip`,
     using the exact real-hardware layout as the fixture.
-  - See `docs/MICROSOFT_PROPOSAL.md` \u00a710.5 for the full evidence.
 
 - **Run it as a real Amplifier session, end to end.** Component-level proof is
   not product-level proof. The hook, native tool promotion, the screenshot
@@ -92,8 +91,7 @@ to build, it doesn't belong on this list.
 ## Human/agent coexistence
 
 Both items below come from the same observation: this tool drives a desktop a
-human may also be sitting at. Both are now **largely built and verified** —
-see `docs/designs/coexistence.md` for the design and evidence base
+human may also be sitting at. Both are now **largely built and verified**.md` for the design and evidence base
 (`coexistence-probes.md`: U1b, U1c, U3, U4, U5, U6, U7, O1, O2, O5).
 
 ### Human-presence signal to the agent, with a handoff protocol — built and proven
@@ -126,8 +124,7 @@ Evidence:
   Windows regardless (masked fraction `20/60 = 33%` at production
   cadence) — see `presence.py`'s `GUARD_MS` comment for the full sweep.
 
-What shipped alongside detection: the halt invariant (`docs/designs/
-coexistence.md` §6.0, unconditional — no config key disables it); target
+What shipped alongside detection: the halt invariant (the design notes §6.0, unconditional — no config key disables it); target
 binding (abort on focus change mid-operation, §8.6); pause/cancel with
 held-input release via the existing ledger; and, as of this pass, `type_text`
 pacing (`type_pacing.py`) — a measured full-speed `type_text` run (202
@@ -142,7 +139,7 @@ active.
   figure in `GUARD_MS` is a sound inference from documented `GetLastInputInfo`
   quantisation, not evidence, and must not be presented as proven.
 - Per-action `request`/auto-takeover consent protocol was deliberately cut
-  from v1 (`docs/designs/coexistence.md` §13, D1) — it never traced back to
+  from v1 (the design notes §13, D1) — it never traced back to
   the incident that motivated this feature; re-open only on a demonstrated
   need.
 
@@ -211,7 +208,7 @@ Evidence:
 
 ## Security hardening
 
-Findings from the adversarial review of `docs/designs/remote-transport.md` not
+Findings from the adversarial review of the design notes not
 yet closed:
 
 - Name prompt-injection-via-screen-content as a first-class threat in the design

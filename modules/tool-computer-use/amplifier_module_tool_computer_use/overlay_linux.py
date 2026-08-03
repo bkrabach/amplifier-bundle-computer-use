@@ -1,4 +1,4 @@
-"""The Linux announcement overlay - `docs/designs/coexistence.md` \u00a77.4-\u00a77.5.
+"""The Linux announcement overlay - `docs/coexistence.md` \u00a77.4-\u00a77.5.
 
 An X11 override-redirect window (proven ghost-free and non-focus-stealing by
 U4/U5/U6 in `coexistence-probes.md`): it appears without the window manager's

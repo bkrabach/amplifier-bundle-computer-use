@@ -14,8 +14,8 @@ Describe what you want to be able to do that you currently can't.
 
 - [ ] `modules/tool-computer-use` (the `computer` / `desktop` tools, platform backends)
 - [ ] `modules/hook-computer-use` (the provider wire-format seam)
-- [ ] Remote transport (`docs/designs/remote-transport.md`)
-- [ ] Human/agent coexistence (`docs/designs/coexistence.md`)
+- [ ] Remote transport
+- [ ] Human/agent coexistence
 - [ ] Something else / not sure
 
 ## Platform relevance

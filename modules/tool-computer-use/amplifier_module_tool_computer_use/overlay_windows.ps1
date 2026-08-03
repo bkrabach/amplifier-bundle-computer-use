@@ -1,7 +1,7 @@
 #requires -Version 5.1
 <#
   Amplifier computer-use : Windows on-desktop coexistence overlay.
-  docs/designs/coexistence.md \u00a77. See overlay_windows.py for the full design
+  docs/coexistence.md \u00a77. See overlay_windows.py for the full design
   rationale (why this looks different from the Linux X11 overlay, the
   click-without-activate technique, and why geometry is passed in rather than
   recomputed here).
