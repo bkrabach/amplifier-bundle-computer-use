@@ -611,11 +611,17 @@ class ComputerTool:
     def note_model(self, model: str | None) -> None:
         """Re-resolve `tool_version` for the model about to receive THIS request.
 
-        Called by hook-computer-use on every `provider:request`, before it reads
-        `native_tool_spec`/`native_beta_header` - see `tool_versions.py` module
-        docstring. Never raises: a mid-session exception here would take down
-        the whole request, the exact class of bug D3 already fixed once for
-        `native_tool_spec` itself.
+        Called by hook-computer-use's wrapped `provider.complete()`
+        (`_note_model_on_computer_tool`, `hook-computer-use/__init__.py`) with
+        `request.model` on every request, before forwarding the request to the
+        real provider - see `tool_versions.py` module docstring. This corrects
+        `_tool_version` for the *next* time `native_tool_spec` is read (that
+        property is read earlier in the same turn, by the orchestrator's own
+        `ToolSpec` construction, before `provider.complete()` is ever called -
+        so a correction here lands one turn ahead of the read it protects, not
+        retroactively inside the same turn). Never raises: a mid-session
+        exception here would take down the whole request, the exact class of
+        bug D3 already fixed once for `native_tool_spec` itself.
         """
         resolved, corrected = resolve_tool_version(
             model, self._configured_tool_version, previous=self._tool_version
