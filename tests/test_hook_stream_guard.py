@@ -52,8 +52,9 @@ class _AnthropicProviderNoStream:
 
 
 class _AnthropicProviderWithStream:
-    """Tomorrow's shape: `stream()` has been added. Must be refused, not silently
-    wrapped."""
+    """Tomorrow's shape: still has a working `_derive_native_tool_betas()` (so the
+    new capability gate, `_provider_supports_native_computer_tool`, confirms it),
+    but `stream()` has been added. Must be refused, not silently wrapped."""
 
     __module__ = "amplifier_module_provider_anthropic"
 
@@ -63,15 +64,16 @@ class _AnthropicProviderWithStream:
     async def stream(self, request, **kwargs):
         yield "chunk"
 
+    def _derive_native_tool_betas(self, tools):
+        return ["computer-use-2025-11-24"] if tools else []
+
 
 class _OtherVendorProviderWithStream:
-    """A provider that isn't Anthropic at all, and happens to have `stream()`. The
-    guard must not fire here - this hook never wraps non-Anthropic providers in the
-    first place, so there is nothing to be silently inert about.
-
-    Note: neither this class name nor its `__module__` may contain the substring
-    "anthropic" (case-insensitive) - `_is_anthropic()` does a plain substring match,
-    so a test double named e.g. `_NonAnthropicProvider` would (ironically) match it.
+    """A provider with no native-computer-tool capability at all (neither
+    `_derive_native_tool_betas` nor `_convert_tools_from_request`), that happens to
+    have `stream()`. The guard must not fire here - `_provider_supports_native_computer_tool`
+    already short-circuits `_wrap_provider` before the stream check ever runs, so
+    there is nothing to be silently inert about.
     """
 
     __module__ = "some_other_vendor.provider"

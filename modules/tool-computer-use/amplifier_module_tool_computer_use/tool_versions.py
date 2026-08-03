@@ -84,6 +84,17 @@ KNOWN_MODEL_TOOL_VERSIONS: dict[str, str] = {
     "claude-sonnet-4-5": "computer_20250124",
     "claude-sonnet-5": "computer_20251124",
     "claude-opus-5": "computer_20251124",
+    # OpenAI's Responses API native `computer` tool type is bare - no date,
+    # no version suffix (unlike Anthropic's per-generation `computer_YYYYMMDD`
+    # scheme above; see amplifier-module-provider-openai's own
+    # `_convert_tools_from_request`, which accepts ONLY `{"type": "computer"}`
+    # verbatim - any other field 400s "Unknown parameter"). Verified live
+    # end-to-end through this bundle against gpt-5.5 (2026-08-03): a real
+    # `computer_call` batch (`{"actions": [{"type": "screenshot"}]}`) against
+    # a real remote desktop, correctly returned a `computer_call_output` the
+    # model then read and reasoned over (reported the on-screen clock
+    # changing between two screenshots taken 15s apart).
+    "gpt-5.5": "computer",
 }
 
 #: Used only when neither an explicit `tool_version` config value nor any

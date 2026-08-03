@@ -145,6 +145,91 @@ _CLICK_ACTIONS = {
     "triple_click": ("left", 3),
 }
 
+#: OpenAI's Responses API `computer_call` action `type` -> this tool's own
+#: `action` name, for the shapes translated 1:1 by `_normalize_openai_action`
+#: (click's target action depends on `button`, handled separately).
+_OPENAI_BUTTON_TO_ACTION = {
+    "left": "left_click",
+    "right": "right_click",
+    "middle": "middle_click",
+    "wheel": "middle_click",
+    "back": "left_click",
+    "forward": "left_click",
+}
+
+
+def _normalize_openai_action(raw: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Translate ONE OpenAI `computer_call` action (`{"type": ..., "x": ...,
+    "y": ..., ...}`) into this tool's own `(action, params)` vocabulary
+    (`{"coordinate": [x, y], ...}`, matching what `_run()` already expects).
+
+    OpenAI's Responses API batches one or more of these under a single
+    `computer_call`'s `actions` list - a fundamentally different wire shape
+    from Anthropic's one-action-per-call `{"action": ..., "coordinate":
+    [...]}` form this module was originally built for (live capture,
+    `tests/fixtures/captures/openai-turn0.json` / `openai-turn1.json`):
+    flat `x`/`y` fields instead of a `coordinate` pair, `type` instead of
+    `action` as the discriminator, and per-action-type fields (`button`,
+    `keys`, `scroll_x`/`scroll_y`, `path`) with no Anthropic equivalent
+    name. This is the one seam that does that translation - callers
+    (`ComputerTool._execute_openai_action_batch`) run the *normalized*
+    result through the exact same `_run()` every other caller uses.
+
+    Raises `ValueError` for a `type` this tool has no equivalent action
+    for, or a well-known type missing a field it requires - surfaced to the
+    model as an ordinary tool error, never silently dropped or guessed at.
+    """
+    action_type = str(raw.get("type") or "").strip()
+
+    def xy() -> list[float]:
+        x, y = raw.get("x"), raw.get("y")
+        if x is None or y is None:
+            raise ValueError(f"openai action {action_type!r} is missing x/y")
+        return [float(x), float(y)]
+
+    if action_type == "screenshot":
+        return "screenshot", {}
+    if action_type == "wait":
+        return "wait", {}
+    if action_type == "move":
+        return "mouse_move", {"coordinate": xy()}
+    if action_type == "click":
+        button = str(raw.get("button") or "left")
+        return _OPENAI_BUTTON_TO_ACTION.get(button, "left_click"), {"coordinate": xy()}
+    if action_type == "double_click":
+        return "double_click", {"coordinate": xy()}
+    if action_type == "drag":
+        path = raw.get("path") or []
+        if len(path) < 2:
+            raise ValueError("openai 'drag' action requires a path of >= 2 points")
+        start, end = path[0], path[-1]
+        return "left_click_drag", {
+            "start_coordinate": [float(start["x"]), float(start["y"])],
+            "coordinate": [float(end["x"]), float(end["y"])],
+        }
+    if action_type == "scroll":
+        dx = int(raw.get("scroll_x") or 0)
+        dy = int(raw.get("scroll_y") or 0)
+        if dy != 0:
+            direction, amount = ("down" if dy > 0 else "up"), abs(dy)
+        elif dx != 0:
+            direction, amount = ("right" if dx > 0 else "left"), abs(dx)
+        else:
+            direction, amount = "down", 0
+        params: dict[str, Any] = {
+            "scroll_direction": direction,
+            "scroll_amount": amount,
+        }
+        if raw.get("x") is not None and raw.get("y") is not None:
+            params["coordinate"] = xy()
+        return "scroll", params
+    if action_type == "keypress":
+        keys = raw.get("keys") or []
+        return "key", {"text": "+".join(str(k) for k in keys)}
+    if action_type == "type":
+        return "type", {"text": str(raw.get("text") or "")}
+    raise ValueError(f"unsupported OpenAI computer-use action type {action_type!r}")
+
 
 def _prune_shots() -> None:
     """Delete expired screenshot files across every per-session subdirectory.
@@ -964,6 +1049,21 @@ class ComputerTool:
         raise ValueError(f"unsupported action {action!r}")
 
     async def execute(self, input: dict[str, Any]) -> ToolResult:
+        # OpenAI's Responses API `computer_call` batches one or more actions
+        # under an "actions" list, each shaped `{"type": ..., "x": ..., ...}`
+        # - fundamentally different from the one-action-per-call
+        # `{"action": ..., "coordinate": [...]}` shape Anthropic's
+        # `computer_use` tool speaks and this method was originally built
+        # for. `amplifier-module-provider-openai`'s own `ToolCall` carries
+        # that batch straight through as `arguments={"actions": [...]}`
+        # (see its `_extract_computer_actions`) - detecting it here, by
+        # actual shape, is the honest seam: translate to this tool's own
+        # action vocabulary and run each one through the SAME `_run()`
+        # every other caller uses, never a second, parallel dispatcher.
+        raw_actions = input.get("actions")
+        if isinstance(raw_actions, list):
+            return await self._execute_openai_action_batch(raw_actions)
+
         action = str(input.get("action") or "").strip()
         if action not in ACTIONS:
             return ToolResult(
@@ -990,34 +1090,7 @@ class ComputerTool:
             # X11/Quartz call costs a thread-pool round trip, not a network one.
             summary, image_b64 = await asyncio.to_thread(self._run, action, input)
         except HaltedError as exc:
-            # Defect 1 + defect 2 (docs/designs/coexistence.md \u00a76.0/\u00a713 D3):
-            # a halt must (a) be impossible for the model to silently drop
-            # from its final report, and (b) survive past this session's own
-            # lifetime rather than resuming on the next mount with no human
-            # ever choosing to resume anything. Both start here, at the one
-            # place every `HaltedError` - from any action, any code path -
-            # is guaranteed to surface.
-            self.halt_notices.append(
-                {
-                    "at": time.time(),
-                    "action": action,
-                    "message": str(exc),
-                    "margin_ms": exc.snapshot.margin_ms,
-                    "guard_ms": exc.snapshot.guard_ms,
-                    "last_human_input_ago_ms": exc.snapshot.last_human_input_ago_ms,
-                    # \u00a75.7 (measured safety gap): declared alongside guard_ms,
-                    # not silently folded into it or omitted - see
-                    # presence.PresenceSnapshot's own docstring. ~0 for a
-                    # local backend; real and large for a remote one.
-                    "transport_latency_ms": exc.snapshot.transport_latency_ms,
-                    "effective_staleness_ms": exc.snapshot.effective_staleness_ms,
-                }
-            )
-            backend_name = getattr(self._backend, "name", "unknown")
-            record_halt(backend_name, exc.snapshot, reason=str(exc))
-            return ToolResult(
-                success=False, error={"message": str(exc), "type": type(exc).__name__}
-            )
+            return self._record_halt_result(action, exc)
         except (BackendError, ValueError) as exc:
             return ToolResult(
                 success=False, error={"message": str(exc), "type": type(exc).__name__}
@@ -1030,20 +1103,57 @@ class ComputerTool:
 
         if image_b64 is None:
             return ToolResult(success=True, output=summary)
+        return self._screenshot_tool_result(summary, image_b64)
 
-        # Screenshots live on disk; only a path travels in the transcript. The hook
-        # inlines the bytes at request time, so the transcript never carries base64.
-        # (Marker protocol unchanged - see hook-computer-use.)
-        #
-        # Security hardening: previously one flat directory shared by every
-        # session, relying entirely on the inherited umask for permissions -
-        # on a shared/multi-user controller box that can leave screenshots of
-        # a driven desktop world- or group-readable for the full TTL window.
-        # Now: a per-session subdirectory (`self._session_id`, set once in
-        # `__init__`), and BOTH the directory and the file get an explicit
-        # `os.chmod` after creation - umask only affects the mode requested
-        # at creation time, it is not itself a guarantee, so this is what
-        # actually enforces owner-only access regardless of umask.
+    def _record_halt_result(self, action: str, exc: HaltedError) -> ToolResult:
+        """Shared halt bookkeeping for both `execute()`'s single-action path
+        and `_execute_openai_action_batch()`'s per-item loop - see
+        `execute()`'s original inline comment (Defect 1 + defect 2,
+        docs/designs/coexistence.md \u00a76.0/\u00a713 D3) for the full rationale;
+        moved here unchanged so both callers hit the exact same recording
+        logic rather than two copies drifting apart."""
+        self.halt_notices.append(
+            {
+                "at": time.time(),
+                "action": action,
+                "message": str(exc),
+                "margin_ms": exc.snapshot.margin_ms,
+                "guard_ms": exc.snapshot.guard_ms,
+                "last_human_input_ago_ms": exc.snapshot.last_human_input_ago_ms,
+                # \u00a75.7 (measured safety gap): declared alongside guard_ms,
+                # not silently folded into it or omitted - see
+                # presence.PresenceSnapshot's own docstring. ~0 for a
+                # local backend; real and large for a remote one.
+                "transport_latency_ms": exc.snapshot.transport_latency_ms,
+                "effective_staleness_ms": exc.snapshot.effective_staleness_ms,
+            }
+        )
+        backend_name = getattr(self._backend, "name", "unknown")
+        record_halt(backend_name, exc.snapshot, reason=str(exc))
+        return ToolResult(
+            success=False, error={"message": str(exc), "type": type(exc).__name__}
+        )
+
+    def _screenshot_tool_result(self, summary: str, image_b64: str) -> ToolResult:
+        """Package a successful `_run()` outcome that produced an image into
+        the marker `ToolResult` `hook-computer-use` looks for - unchanged
+        logic, extracted out of `execute()` so `_execute_openai_action_batch()`
+        can reuse it instead of re-implementing screenshot persistence.
+
+        Screenshots live on disk; only a path travels in the transcript. The hook
+        inlines the bytes at request time, so the transcript never carries base64.
+        (Marker protocol unchanged - see hook-computer-use.)
+
+        Security hardening: previously one flat directory shared by every
+        session, relying entirely on the inherited umask for permissions -
+        on a shared/multi-user controller box that can leave screenshots of
+        a driven desktop world- or group-readable for the full TTL window.
+        Now: a per-session subdirectory (`self._session_id`, set once in
+        `__init__`), and BOTH the directory and the file get an explicit
+        `os.chmod` after creation - umask only affects the mode requested
+        at creation time, it is not itself a guarantee, so this is what
+        actually enforces owner-only access regardless of umask.
+        """
         SHOT_DIR.mkdir(parents=True, exist_ok=True)
         os.chmod(SHOT_DIR, _PRIVATE_DIR_MODE)
         # Prune BEFORE creating this call's own session directory - not
@@ -1071,6 +1181,90 @@ class ComputerTool:
                 }
             ),
         )
+
+    async def _execute_openai_action_batch(self, raw_actions: list[Any]) -> ToolResult:
+        """Execute an OpenAI-shaped `computer_call` action batch in order,
+        returning exactly ONE `ToolResult` - matching what
+        `amplifier-module-provider-openai` needs to build ONE
+        `computer_call_output` per `call_id`, regardless of how many actions
+        were batched into the call (see its `_extract_computer_actions`
+        docstring: \"Live Responses API traffic ... returns a batched
+        actions array\").
+
+        Each item is translated via `_normalize_openai_action` into this
+        tool's own `(action, params)` vocabulary and run through the exact
+        same `_run()` every other caller (Anthropic's single-action path,
+        `DesktopTool`) uses - no second, parallel action-dispatch
+        implementation. `read_only`/`MUTATING` gating and halt/error
+        handling apply per-item, identically to the single-action path.
+
+        A `computer_call_output` always needs an image (OpenAI's own
+        `_extract_computer_screenshot_data_url` raises without one) - if the
+        batch's last action was not itself a screenshot, one more is taken
+        so the model always sees the result of what it just did.
+        """
+        last_summary = ""
+        last_image_b64: str | None = None
+        for raw in raw_actions:
+            if not isinstance(raw, dict):
+                return ToolResult(
+                    success=False,
+                    error={"message": f"unsupported action entry {raw!r}"},
+                )
+            try:
+                action, params = _normalize_openai_action(raw)
+            except ValueError as exc:
+                return ToolResult(
+                    success=False,
+                    error={"message": str(exc), "type": "ValueError"},
+                )
+            if action not in ACTIONS:
+                return ToolResult(
+                    success=False,
+                    error={
+                        "message": f"unknown action {action!r}; expected one of {', '.join(ACTIONS)}"
+                    },
+                )
+            if self._read_only and action in MUTATING:
+                return ToolResult(
+                    success=False,
+                    error={
+                        "message": f"action {action!r} blocked: computer-use is mounted read_only"
+                    },
+                )
+            try:
+                summary, image_b64 = await asyncio.to_thread(self._run, action, params)
+            except HaltedError as exc:
+                return self._record_halt_result(action, exc)
+            except (BackendError, ValueError) as exc:
+                return ToolResult(
+                    success=False,
+                    error={"message": str(exc), "type": type(exc).__name__},
+                )
+            except Exception as exc:
+                logger.exception("computer action %s failed", action)
+                return ToolResult(
+                    success=False,
+                    error={"message": str(exc), "type": type(exc).__name__},
+                )
+            last_summary = summary
+            if image_b64 is not None:
+                last_image_b64 = image_b64
+
+        if last_image_b64 is None:
+            try:
+                last_summary, last_image_b64 = await asyncio.to_thread(
+                    self._run, "screenshot", {}
+                )
+            except (BackendError, ValueError) as exc:
+                return ToolResult(
+                    success=False,
+                    error={"message": str(exc), "type": type(exc).__name__},
+                )
+        # `_run("screenshot", ...)` always returns image bytes (never None) -
+        # see its own branch - so this is a real invariant, not a defensive guess.
+        assert last_image_b64 is not None
+        return self._screenshot_tool_result(last_summary, last_image_b64)
 
 
 DESKTOP_ACTIONS = [

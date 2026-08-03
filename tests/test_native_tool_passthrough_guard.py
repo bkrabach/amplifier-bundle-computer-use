@@ -3,18 +3,33 @@
 hook-computer-use used to promote `computer`'s `native_tool_spec` to the wire itself
 and inject the matching `anthropic-beta` header ("job 1"). That is now redundant and
 has been removed: amplifier-module-loop-streaming PR #36 (commit f8004e0) preserves a
-tool's `native_tool_spec` through its own `ToolSpec` construction, and
+tool's `native_tool_spec` through its own `ToolSpec` construction, and each supported
+provider carries the native form the rest of the way in its own idiom -
 amplifier-module-provider-anthropic PR #79 (commit 94a4354) derives the required beta
-header itself.
+header itself; amplifier-module-provider-openai PR #58 (commit 3af4ce1) recognises the
+tool's bare `computer` type and emits it verbatim.
 
-If EITHER upstream module predates its fix, `computer`'s native definition silently
-degrades to a plain function tool - the request is still valid, the tool still
-appears, and the model just gets the weaker definition, with no error and no log
-line. These tests prove the fix: `_provider_derives_native_tool_betas`,
+If the mounted provider or orchestrator predates its fix, `computer`'s native
+definition silently degrades to a plain function tool - the request is still valid,
+the tool still appears, and the model just gets the weaker definition, with no error
+and no log line. These tests prove the fix: `_provider_derives_native_tool_betas`,
+`_provider_recognizes_bare_computer_tool`, `_provider_supports_native_computer_tool`,
 `_orchestrator_preserves_native_tool_spec`, and
-`_fail_if_native_tool_passthrough_unsupported` detect that condition by driving the
-real, installed code with throwaway probes - not by trusting a version string - and
-refuse loudly instead of degrading.
+`_fail_if_orchestrator_native_tool_spec_unsupported` detect that condition by driving
+the real, installed code with throwaway probes - not by trusting a class name or
+module path.
+
+Honest, deliberate scope note (see `_provider_supports_native_computer_tool`'s
+docstring): a pure capability probe cannot distinguish "this provider was never meant
+to support computer-use at all" from "this IS a supported vendor, but the installed
+build predates the exact fix being probed for" - both look identical from the
+outside. The old `_is_anthropic()` module-name check COULD tell those apart by
+trusting a claimed identity; removing it (the point of this change) means that
+specific distinction is gone too. What remains loud, provably, is: a provider that
+DOES demonstrate a working integration point but computes the wrong answer for it
+(`_ProviderWithBrokenBetaDerivation`, `_ProviderWithBrokenBareComputerConversion`
+below), and the orchestrator-side check (unaffected by any of this - the orchestrator
+identity check was never in scope here).
 """
 
 from __future__ import annotations
@@ -30,7 +45,8 @@ import amplifier_module_hook_computer_use as hook_mod
 import pytest
 
 # ---------------------------------------------------------------------------
-# Provider-side fakes (amplifier-module-provider-anthropic PR #79)
+# Provider-side fakes: Anthropic's dated-type convention
+# (amplifier-module-provider-anthropic PR #79)
 # ---------------------------------------------------------------------------
 
 
@@ -48,7 +64,10 @@ class _ProviderWithWorkingBetaDerivation:
 
 
 class _ProviderPredatingPR79:
-    """Pre-PR-#79 shape: no `_derive_native_tool_betas()` at all."""
+    """Pre-PR-#79 shape: no `_derive_native_tool_betas()` at all, and no
+    OpenAI-style `_convert_tools_from_request()` either - indistinguishable,
+    to a pure capability probe, from a provider that never supported
+    computer-use in the first place. See the module docstring."""
 
     __module__ = "amplifier_module_provider_anthropic"
 
@@ -58,7 +77,8 @@ class _ProviderPredatingPR79:
 
 class _ProviderWithBrokenBetaDerivation:
     """Has the method, but it does not actually derive anything - a broken or
-    downgraded implementation, not merely an absent one."""
+    downgraded implementation, not merely an absent one. This IS distinguishable
+    from "wrong vendor": the integration point exists and answers wrong."""
 
     __module__ = "amplifier_module_provider_anthropic"
 
@@ -67,6 +87,56 @@ class _ProviderWithBrokenBetaDerivation:
 
     def _derive_native_tool_betas(self, tools):
         return []
+
+
+# ---------------------------------------------------------------------------
+# Provider-side fakes: OpenAI's bare-type convention
+# (amplifier-module-provider-openai PR #58)
+# ---------------------------------------------------------------------------
+
+
+class _ProviderWithWorkingBareComputerConversion:
+    """Today's shape: `_convert_tools_from_request` emits `computer` bare."""
+
+    __module__ = "amplifier_module_provider_openai"
+
+    async def complete(self, request, **kwargs):
+        return "ok"
+
+    def _convert_tools_from_request(self, tools, model_name=None):
+        out = []
+        for tool in tools:
+            if getattr(tool, "type", None) == "computer":
+                out.append({"type": "computer"})
+                continue
+            out.append({"type": "function", "name": getattr(tool, "name", "?")})
+        return out
+
+
+class _ProviderPredatingPR58:
+    """Pre-PR-#58 shape: no `_convert_tools_from_request()` at all - same
+    "indistinguishable from wrong vendor" honesty note as `_ProviderPredatingPR79`."""
+
+    __module__ = "amplifier_module_provider_openai"
+
+    async def complete(self, request, **kwargs):
+        return "ok"
+
+
+class _ProviderWithBrokenBareComputerConversion:
+    """Has `_convert_tools_from_request`, but it degrades `computer` into a
+    function tool instead of emitting it bare - a real, observable bug."""
+
+    __module__ = "amplifier_module_provider_openai"
+
+    async def complete(self, request, **kwargs):
+        return "ok"
+
+    def _convert_tools_from_request(self, tools, model_name=None):
+        return [
+            {"type": "function", "name": getattr(t, "name", "?"), "parameters": {}}
+            for t in tools
+        ]
 
 
 def test_provider_derives_native_tool_betas_true_for_working_provider():
@@ -79,9 +149,10 @@ def test_provider_derives_native_tool_betas_true_for_working_provider():
 
 
 def test_provider_derives_native_tool_betas_false_when_method_absent():
-    """No middle ground here: this probe only ever runs on a provider already
-    confirmed to be Anthropic (see `_is_anthropic`), so an absent method IS the
-    pre-PR-#79 shape, not an ambiguous signal."""
+    """A pure capability probe cannot tell "predates the fix" apart from "wrong
+    vendor entirely" - both simply lack the integration point. See module
+    docstring for why that is an accepted, honest trade-off of removing the
+    module-name check."""
     assert (
         hook_mod._provider_derives_native_tool_betas(_ProviderPredatingPR79()) is False
     )
@@ -96,8 +167,91 @@ def test_provider_derives_native_tool_betas_false_when_broken():
     )
 
 
+def test_provider_recognizes_bare_computer_tool_true_for_working_provider():
+    assert (
+        hook_mod._provider_recognizes_bare_computer_tool(
+            _ProviderWithWorkingBareComputerConversion()
+        )
+        is True
+    )
+
+
+def test_provider_recognizes_bare_computer_tool_false_when_method_absent():
+    assert (
+        hook_mod._provider_recognizes_bare_computer_tool(_ProviderPredatingPR58())
+        is False
+    )
+
+
+def test_provider_recognizes_bare_computer_tool_false_when_broken():
+    assert (
+        hook_mod._provider_recognizes_bare_computer_tool(
+            _ProviderWithBrokenBareComputerConversion()
+        )
+        is False
+    )
+
+
 # ---------------------------------------------------------------------------
-# Orchestrator-side fakes (amplifier-module-loop-streaming PR #36)
+# _provider_supports_native_computer_tool - the _is_anthropic() replacement
+# ---------------------------------------------------------------------------
+
+
+def test_provider_supports_native_computer_tool_true_for_anthropic_shape():
+    assert (
+        hook_mod._provider_supports_native_computer_tool(
+            _ProviderWithWorkingBetaDerivation(), "computer_20251124"
+        )
+        is True
+    )
+
+
+def test_provider_supports_native_computer_tool_true_for_openai_shape():
+    assert (
+        hook_mod._provider_supports_native_computer_tool(
+            _ProviderWithWorkingBareComputerConversion(), "computer"
+        )
+        is True
+    )
+
+
+def test_provider_supports_native_computer_tool_false_for_neither_shape():
+    class _TotallyUnrelatedProvider:
+        __module__ = "some_other_vendor.provider"
+
+        async def complete(self, request, **kwargs):
+            return "ok"
+
+    assert (
+        hook_mod._provider_supports_native_computer_tool(
+            _TotallyUnrelatedProvider(), "computer_20251124"
+        )
+        is False
+    )
+
+
+def test_provider_supports_native_computer_tool_false_when_type_mismatched():
+    """A real Anthropic-shaped provider asked about OpenAI's bare type (or vice
+    versa) correctly reports no support - the probe is honest about which
+    exact type it verified, never conflating the two conventions."""
+    assert (
+        hook_mod._provider_supports_native_computer_tool(
+            _ProviderWithWorkingBetaDerivation(), "computer"
+        )
+        is False
+    )
+    assert (
+        hook_mod._provider_supports_native_computer_tool(
+            _ProviderWithWorkingBareComputerConversion(), "computer_20251124"
+        )
+        is False
+    )
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator-side fakes (amplifier-module-loop-streaming PR #36) - unchanged,
+# `_is_loop_streaming` staying a module-name check is deliberate (out of scope
+# here - see `_is_loop_streaming`'s docstring).
 # ---------------------------------------------------------------------------
 
 
@@ -198,34 +352,38 @@ def test_orchestrator_preserves_native_tool_spec_none_for_unrelated_orchestrator
 
 
 # ---------------------------------------------------------------------------
-# End-to-end: _fail_if_native_tool_passthrough_unsupported / _wrap_provider
+# End-to-end: _fail_if_orchestrator_native_tool_spec_unsupported / _wrap_provider
 # ---------------------------------------------------------------------------
 
 
+class _FakeComputerTool:
+    """Minimal stand-in exposing only what `_resolve_native_tool_type` reads:
+    a `native_tool_spec` dict carrying the `type` this session's `computer`
+    tool is actually configured to declare (Anthropic-versioned, or OpenAI's
+    bare `"computer"`)."""
+
+    def __init__(self, tool_type: str) -> None:
+        self._tool_type = tool_type
+
+    @property
+    def native_tool_spec(self) -> dict[str, object]:
+        return {"type": self._tool_type, "name": "computer"}
+
+
 class _FakeCoordinatorWithOrchestrator:
-    def __init__(self, orchestrator) -> None:
+    def __init__(self, orchestrator, tool_type: str | None = None) -> None:
         self._orchestrator = orchestrator
+        self._computer_tool = _FakeComputerTool(tool_type) if tool_type else None
 
     def get(self, mount_point, name=None):
         if mount_point == "orchestrator":
             return self._orchestrator
+        if mount_point == "tools" and name == "computer":
+            return self._computer_tool
         return None
 
 
-def test_fail_if_native_tool_passthrough_unsupported_raises_for_old_provider():
-    coord = _FakeCoordinatorWithOrchestrator(orchestrator=None)
-    with pytest.raises(
-        hook_mod.ComputerUseNativeToolPassthroughUnsupportedError
-    ) as excinfo:
-        hook_mod._fail_if_native_tool_passthrough_unsupported(
-            coord, _ProviderPredatingPR79()
-        )
-    message = str(excinfo.value)
-    assert "94a4354" in message
-    assert "provider-anthropic" in message.lower()
-
-
-def test_fail_if_native_tool_passthrough_unsupported_raises_for_old_orchestrator():
+def test_fail_if_orchestrator_native_tool_spec_unsupported_raises_for_old_orchestrator():
     _register_fake_orchestrator_module(
         "_fake_loop_streaming_old_e2e", build_tool_spec=_old_build_tool_spec
     )
@@ -237,15 +395,13 @@ def test_fail_if_native_tool_passthrough_unsupported_raises_for_old_orchestrator
     with pytest.raises(
         hook_mod.ComputerUseNativeToolPassthroughUnsupportedError
     ) as excinfo:
-        hook_mod._fail_if_native_tool_passthrough_unsupported(
-            coord, _ProviderWithWorkingBetaDerivation()
-        )
+        hook_mod._fail_if_orchestrator_native_tool_spec_unsupported(coord)
     message = str(excinfo.value)
     assert "f8004e0" in message
     assert "loop-streaming" in message.lower()
 
 
-def test_fail_if_native_tool_passthrough_unsupported_is_a_noop_when_compatible():
+def test_fail_if_orchestrator_native_tool_spec_unsupported_is_a_noop_when_compatible():
     _register_fake_orchestrator_module(
         "_fake_loop_streaming_fixed_e2e", build_tool_spec=_new_build_tool_spec
     )
@@ -255,29 +411,58 @@ def test_fail_if_native_tool_passthrough_unsupported_is_a_noop_when_compatible()
 
     coord = _FakeCoordinatorWithOrchestrator(orchestrator=_FixedOrchestrator())
     # Must not raise.
-    hook_mod._fail_if_native_tool_passthrough_unsupported(
-        coord, _ProviderWithWorkingBetaDerivation()
-    )
+    hook_mod._fail_if_orchestrator_native_tool_spec_unsupported(coord)
 
 
-def test_fail_if_native_tool_passthrough_unsupported_is_a_noop_with_no_orchestrator():
+def test_fail_if_orchestrator_native_tool_spec_unsupported_is_a_noop_with_no_orchestrator():
     """No orchestrator mounted (e.g. still starting up) must not be confused with
     an incompatible one - nothing to probe means nothing to fail on."""
     coord = _FakeCoordinatorWithOrchestrator(orchestrator=None)
     # Must not raise.
-    hook_mod._fail_if_native_tool_passthrough_unsupported(
-        coord, _ProviderWithWorkingBetaDerivation()
-    )
+    hook_mod._fail_if_orchestrator_native_tool_spec_unsupported(coord)
 
 
-def test_wrap_provider_raises_for_provider_predating_pr79():
-    """Full integration through `_wrap_provider`, the actual mount-time seam."""
+def test_wrap_provider_skips_quietly_for_provider_predating_pr79():
+    """Full integration through `_wrap_provider`, the actual mount-time seam.
+
+    Behavior change from the old `_is_anthropic()`-gated design, deliberate and
+    documented (see module docstring and `_provider_supports_native_computer_tool`):
+    a provider indistinguishable from "wrong vendor" is skipped quietly, logged,
+    not raised. Loud failure is reserved for a provider that demonstrates a real,
+    working integration point but computes the wrong answer, or an orchestrator
+    that positively fails its own probe (see the other tests in this file)."""
     coord = _FakeCoordinatorWithOrchestrator(orchestrator=None)
     provider = _ProviderPredatingPR79()
 
-    with pytest.raises(hook_mod.ComputerUseNativeToolPassthroughUnsupportedError):
-        hook_mod._wrap_provider(provider, coord, max_inline=3)
+    wrapped = hook_mod._wrap_provider(provider, coord, max_inline=3)
 
-    # And it must NOT have been mounted as wrapped - a partial wrap is just as
-    # dangerous as a fully silent one.
+    assert wrapped is False
     assert not getattr(provider, hook_mod._WRAPPED_FLAG, False)
+
+
+def test_wrap_provider_skips_quietly_for_provider_predating_pr58():
+    coord = _FakeCoordinatorWithOrchestrator(orchestrator=None)
+    provider = _ProviderPredatingPR58()
+
+    wrapped = hook_mod._wrap_provider(provider, coord, max_inline=3)
+
+    assert wrapped is False
+    assert not getattr(provider, hook_mod._WRAPPED_FLAG, False)
+
+
+def test_wrap_provider_wraps_openai_shaped_provider():
+    """Regression guard for the whole point of this change: an OpenAI-shaped
+    provider with working bare-computer-tool passthrough gets wrapped, exactly
+    like an Anthropic-shaped one already does elsewhere in this suite.
+
+    Registers a fake `computer` tool declaring the bare `"computer"` type -
+    `_resolve_native_tool_type` reads that real, mounted type rather than
+    falling back to the Anthropic-shaped default, so the probe checks
+    against the type this session actually declares."""
+    coord = _FakeCoordinatorWithOrchestrator(orchestrator=None, tool_type="computer")
+    provider = _ProviderWithWorkingBareComputerConversion()
+
+    wrapped = hook_mod._wrap_provider(provider, coord, max_inline=3)
+
+    assert wrapped is True
+    assert getattr(provider, hook_mod._WRAPPED_FLAG, False) is True

@@ -1,4 +1,5 @@
-"""Amplifier hook module: make Anthropic's NATIVE computer-use tool work end to end.
+"""Amplifier hook module: make the NATIVE `computer` tool work end to end,
+across whichever provider (Anthropic, OpenAI, ...) is actually mounted.
 
 One thing used to stand between a mounted `computer` tool and real computer use,
 and it lived in the orchestrator, which we did not want to fork: tool results are
@@ -14,15 +15,20 @@ it and, on the way through:
 Nothing is forked, nothing is patched on disk, and removing the hook degrades the
 tool cleanly back to an ordinary function tool.
 
-Tool-spec promotion (rewriting ``computer`` into Anthropic's native wire form and
-injecting the ``anthropic-beta`` header) used to live here too, but is now handled
-upstream: `amplifier-module-loop-streaming` preserves a tool's ``native_tool_spec``
-through its own `ToolSpec` construction, and `amplifier-module-provider-anthropic`
-derives the required beta header itself from the native tool types present on the
-request. This hook now only *verifies* that support is present
-(`_fail_if_native_tool_passthrough_unsupported`) rather than doing the work itself -
-see that function's docstring for why a silent version mismatch is not acceptable
-here.
+Tool-spec promotion (rewriting ``computer`` into a provider's native wire form and
+injecting whatever header/shape that provider requires) used to live here too, but
+is now handled upstream: `amplifier-module-loop-streaming` preserves a tool's
+``native_tool_spec`` through its own `ToolSpec` construction, and each supported
+provider carries the native form the rest of the way in its own idiom -
+`amplifier-module-provider-anthropic` derives the required `anthropic-beta` header
+from the native tool types present on the request; `amplifier-module-provider-openai`
+recognises the tool's bare `computer` type and emits it verbatim. This hook now only
+*verifies* that support is present for whichever provider is actually in play
+(`_provider_supports_native_computer_tool`,
+`_fail_if_orchestrator_native_tool_spec_unsupported`) rather than doing the work
+itself - see those functions' docstrings for why a silent degradation is not
+acceptable here, and why this gate no longer asks a provider's name before asking
+what it can actually do.
 """
 
 from __future__ import annotations
@@ -78,12 +84,6 @@ def _trace(msg: str) -> None:
             )
     except OSError:
         pass
-
-
-def _is_anthropic(provider: Any) -> bool:
-    return (
-        "anthropic" in f"{type(provider).__module__}.{type(provider).__name__}".lower()
-    )
 
 
 class ComputerUseHookIncompatibleProviderError(RuntimeError):
@@ -155,22 +155,36 @@ class ComputerUseNativeToolPassthroughUnsupportedError(RuntimeError):
     """
 
 
-def _provider_derives_native_tool_betas(provider: Any) -> bool:
-    """Probe whether `provider` self-derives `anthropic-beta` headers for native
-    tool types (amplifier-module-provider-anthropic PR #79).
+#: Representative native `computer` tool type strings, used as the fallback
+#: probe value when no real, mounted `computer` tool is available to ask
+#: (see `_resolve_native_tool_type`). Picking this as a *default* is
+#: arbitrary; picking the tool's own, currently-resolved `_tool_version`
+#: (when available) never is - see that function's docstring.
+_DEFAULT_PROBE_TOOL_TYPE = "computer_20251124"
 
-    Only called after `_is_anthropic(provider)` has already confirmed this IS
-    the provider brand this hook depends on - unlike the orchestrator probe
-    below, there is no "unknown vendor, cannot judge" case to consider here.
-    A real provider-anthropic unconditionally has a working
-    `_derive_native_tool_betas()` from PR #79 onward, so an absent or broken
-    one is exactly the pre-PR-#79 shape, not an ambiguous signal.
+
+def _provider_derives_native_tool_betas(
+    provider: Any, tool_type: str = _DEFAULT_PROBE_TOOL_TYPE
+) -> bool:
+    """Real capability probe for Anthropic's wire convention: does `provider`
+    self-derive the `anthropic-beta` header required to opt `tool_type` into
+    native tool_use (amplifier-module-provider-anthropic PR #79)?
+
+    Drives the provider's own `_derive_native_tool_betas()` (if present) with
+    a throwaway `{"type": tool_type}` tool list and checks that the returned
+    beta header actually mentions computer-use - never trusts the provider's
+    class name or module path to answer this. A provider with no such method,
+    or one that does not recognise `tool_type`, returns `False` here exactly
+    like a provider that was never Anthropic-shaped at all: this probe has no
+    way to tell those two apart, and does not claim to (see
+    `_provider_supports_native_computer_tool`'s docstring for why that is an
+    acceptable, honest trade-off).
     """
     derive = getattr(provider, "_derive_native_tool_betas", None)
     if not callable(derive):
         return False
     try:
-        betas = derive([{"type": "computer_20251124"}])
+        betas = derive([{"type": tool_type}])
     except Exception:
         logger.exception(
             "computer-use: _derive_native_tool_betas probe raised on %s",
@@ -180,12 +194,131 @@ def _provider_derives_native_tool_betas(provider: Any) -> bool:
     return isinstance(betas, list) and any("computer-use" in str(b) for b in betas)
 
 
+def _provider_recognizes_bare_computer_tool(
+    provider: Any, tool_type: str = "computer"
+) -> bool:
+    """Real capability probe for OpenAI's wire convention: does `provider`
+    place a native `computer` tool declaration on the wire completely bare -
+    no `name`/`description`/`parameters` - rather than falling through to its
+    ordinary function-tool branch (amplifier-module-provider-openai PR #58)?
+
+    Live Responses API traffic proved OpenAI's `computer` tool accepts *zero*
+    declaration fields beyond `type`: `{"type": "computer"}` -> 200;
+    `display_width_px`/`display_height_px`/`display_width`/`environment`
+    (any of them, alone) -> 400 "Unknown parameter". A degraded declaration
+    here is not a weaker-but-working tool the way it can be with Anthropic -
+    it is a hard, immediate request failure, which makes this probe's job
+    slightly different in kind from `_provider_derives_native_tool_betas`:
+    it exercises the provider's own `_convert_tools_from_request()` (if
+    present) against a stub carrying exactly the `.type`/`.name` shape
+    amplifier-module-loop-streaming's `_build_tool_spec` produces for a tool's
+    `native_tool_spec`, and checks the emitted tool dict is the bare form and
+    nothing else - never trusts a class name or module path.
+    """
+    convert = getattr(provider, "_convert_tools_from_request", None)
+    if not callable(convert):
+        return False
+
+    class _NativeComputerToolProbe:
+        name = "__computer_use_native_computer_probe__"
+        type = tool_type
+
+    try:
+        converted = convert([_NativeComputerToolProbe()])
+    except Exception:
+        logger.exception(
+            "computer-use: bare-computer-tool probe raised on %s",
+            type(provider).__name__,
+        )
+        return False
+    return converted == [{"type": tool_type}]
+
+
+def _provider_supports_native_computer_tool(
+    provider: Any, tool_type: str = _DEFAULT_PROBE_TOOL_TYPE
+) -> bool:
+    """Replaces the old `_is_anthropic()` module-name sniff as the gate for
+    whether `_wrap_provider` even attempts to wrap `provider`.
+
+    A module-name match answers "what is this object called"; it says
+    nothing about what the object actually *does* - and the moment a second
+    vendor (OpenAI) shipped its OWN, differently-shaped native `computer`
+    tool support, "not named anthropic" stopped meaning "not compatible".
+    This checks the only thing that actually matters: will `provider` place
+    `tool_type` on the wire as a genuine native tool, or silently degrade it
+    to an ordinary function tool? Two real, independent, behavioural probes,
+    either of which is sufficient - see their docstrings:
+
+      * `_provider_derives_native_tool_betas` - Anthropic's dated
+        `computer_YYYYMMDD` convention.
+      * `_provider_recognizes_bare_computer_tool` - OpenAI's bare `computer`
+        convention.
+
+    Honest limitation, stated plainly rather than papered over: neither probe
+    can distinguish "this provider was never meant to support computer-use at
+    all" from "this IS a supported vendor, but the installed build predates
+    the exact fix being probed for" - both look identical from the outside
+    (the integration point this probe drives simply does not exist yet). A
+    module-name check could have told those apart by trusting a claimed
+    identity; a real capability check, by construction, cannot - it only
+    reports what the code in front of it actually does. `False` here means
+    "wrap nothing, log why, move on" (see `_wrap_provider`), not a raised
+    error - the loud failure this bundle still guarantees is reserved for a
+    provider that DOES demonstrate a working integration point but computes
+    the wrong answer for it (a real, observable bug, not a guess about
+    identity) and for the orchestrator-side check in
+    `_fail_if_orchestrator_native_tool_spec_unsupported`, which does not have
+    this ambiguity (see that function's docstring).
+    """
+    return _provider_derives_native_tool_betas(
+        provider, tool_type
+    ) or _provider_recognizes_bare_computer_tool(provider, tool_type)
+
+
+def _resolve_native_tool_type(coordinator: Any) -> str:
+    """The native tool `type` the mounted `computer` tool is actually about
+    to declare this turn, read from its own `native_tool_spec` - never
+    guessed from provider identity or hardcoded to one vendor's convention.
+
+    Falls back to `_DEFAULT_PROBE_TOOL_TYPE` only when no real answer is
+    available: `computer` is not mounted this session (lookup fails,
+    returns `None`, or - in unit tests - a fake coordinator never registers
+    one), or the mounted object under that name does not expose
+    `native_tool_spec` at all. That fallback is not a guess about which
+    vendor is in play; it is the same representative value this module used
+    before per-tool-type resolution existed, kept as the default so a
+    provider capability probe run with no tool context still means
+    something (see the direct `_provider_supports_native_computer_tool`/
+    `_provider_derives_native_tool_betas` calls in this module's test suite).
+    """
+    tool = None
+    try:
+        tool = coordinator.get("tools", "computer")
+    except Exception:
+        logger.debug("computer-use: 'computer' tool lookup failed", exc_info=True)
+    if tool is not None and getattr(type(tool), "native_tool_spec", None) is not None:
+        try:
+            native = tool.native_tool_spec
+        except Exception:
+            logger.exception(
+                "computer-use: reading native_tool_spec from the mounted "
+                "'computer' tool raised"
+            )
+        else:
+            if isinstance(native, dict):
+                resolved = native.get("type")
+                if isinstance(resolved, str) and resolved:
+                    return resolved
+    return _DEFAULT_PROBE_TOOL_TYPE
+
+
 def _is_loop_streaming(orchestrator: Any) -> bool:
-    """Same module-name heuristic `_is_anthropic()` uses for providers, applied
-    to the orchestrator. Needed because - unlike the provider, already
-    confirmed Anthropic before `_provider_derives_native_tool_betas` runs - the
-    mounted orchestrator could be anything, including one this hook has no
-    opinion about at all."""
+    """Module-name heuristic applied to the ORCHESTRATOR only - out of scope
+    for this pass (see module docstring): loop-streaming is the only
+    orchestrator this bundle has ever run against, so there is no second
+    implementation motivating a capability check here the way there now is
+    for providers. Needed because the mounted orchestrator could be
+    anything, including one this hook has no opinion about at all."""
     identity = f"{type(orchestrator).__module__}.{type(orchestrator).__name__}"
     return "loop_streaming" in identity.lower().replace("-", "_")
 
@@ -240,32 +373,27 @@ def _orchestrator_preserves_native_tool_spec(orchestrator: Any) -> bool | None:
     return dumped.get("type") == "computer_20251124"
 
 
-def _fail_if_native_tool_passthrough_unsupported(
-    coordinator: Any, provider: Any
-) -> None:
-    """Refuse to mount if `computer`'s native tool form cannot reach the wire
-    without this hook promoting it itself. See
+def _fail_if_orchestrator_native_tool_spec_unsupported(coordinator: Any) -> None:
+    """Refuse to mount if the mounted orchestrator's `ToolSpec` construction
+    would drop `computer`'s native tool form on the floor. See
     `ComputerUseNativeToolPassthroughUnsupportedError` for the full rationale.
+
+    Provider-side compatibility is no longer checked here: by the time
+    `_wrap_provider` calls this, `_provider_supports_native_computer_tool`
+    has already gated on it (see that function's docstring for why an
+    incompatible provider is a quiet skip there, not a raise here) - this
+    function is purely about the orchestrator.
 
     The orchestrator probe returns `None` when it cannot be run at all (some
     orchestrator other than loop-streaming is mounted) - that is "not this
     check's concern", not "confirmed compatible", and is intentionally NOT
     treated as a failure: we only refuse to mount when the probe positively
-    identified loop-streaming AND it came back negative. The provider probe
-    has no such middle state - see its docstring.
+    identified loop-streaming AND it came back negative. Unlike the provider
+    side, `_is_loop_streaming` staying a module-name check is deliberate and
+    unchanged (see its own docstring) - there is exactly one orchestrator
+    this bundle has ever run against, so there is no second implementation
+    motivating a capability check the way a second provider now does.
     """
-    if not _provider_derives_native_tool_betas(provider):
-        raise ComputerUseNativeToolPassthroughUnsupportedError(
-            f"computer-use: provider {type(provider).__name__} "
-            f"({type(provider).__module__}) does not derive anthropic-beta headers "
-            "from native tool types (no working _derive_native_tool_betas()). "
-            "hook-computer-use no longer injects this header itself - upgrade "
-            "amplifier-module-provider-anthropic to at least commit 94a4354 (PR #79, "
-            "'fix: cache_control targets last function tool; derive betas from "
-            "native tool types'), or the `computer` tool's native definition will "
-            "silently degrade to a plain function tool."
-        )
-
     orchestrator = None
     try:
         orchestrator = coordinator.get("orchestrator")
@@ -487,10 +615,16 @@ def _note_model_on_computer_tool(coordinator: Any, model: str | None) -> None:
 def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
     if getattr(provider, _WRAPPED_FLAG, False):
         return False
-    if not _is_anthropic(provider):
+    tool_type = _resolve_native_tool_type(coordinator)
+    if not _provider_supports_native_computer_tool(provider, tool_type):
         logger.info(
-            "computer-use: provider %s is not Anthropic; native tool not enabled",
+            "computer-use: provider %s (%s) does not carry native tool type "
+            "%r to the wire (checked via its own real tool-conversion "
+            "behavior - see _provider_supports_native_computer_tool); native "
+            "tool not enabled",
             type(provider).__name__,
+            type(provider).__module__,
+            tool_type,
         )
         return False
     # Fail loud (see ComputerUseHookIncompatibleProviderError) BEFORE wrapping, not
@@ -498,11 +632,12 @@ def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
     # "wrapped provider ... for native computer use" while the wrap is never
     # actually exercised on the request hot path.
     _fail_if_stream_incompatible(provider)
-    # Same reasoning, different failure mode: if the mounted orchestrator/provider
-    # cannot carry `computer`'s native tool form to the wire on their own, wrapping
+    # Same reasoning, different failure mode: if the mounted orchestrator
+    # cannot carry `computer`'s native tool form to the wire on its own, wrapping
     # would still "succeed" while the tool silently degrades to a plain function
-    # tool. See ComputerUseNativeToolPassthroughUnsupportedError.
-    _fail_if_native_tool_passthrough_unsupported(coordinator, provider)
+    # tool. See ComputerUseNativeToolPassthroughUnsupportedError. (Provider-side
+    # compatibility was already confirmed above.)
+    _fail_if_orchestrator_native_tool_spec_unsupported(coordinator)
     if not hasattr(provider, "complete"):
         return False
 
