@@ -30,23 +30,26 @@ targeting. This bundle sends the real one:
 base64 **image** content blocks inside `tool_result`, exactly as Anthropic's own loop
 does.
 
-## The two things that had to be solved
+## The one thing that had to be solved
 
-Amplifier's orchestrator stands between a mounted tool and native computer use:
+Amplifier's orchestrator used to stand between a mounted tool and native computer use:
+tool results are collapsed to `str` before reaching the provider, so a screenshot could
+never travel back as an image.
 
-| Blocker | Where | Effect |
-|---|---|---|
-| `ToolSpec` is built from `name`/`description`/`parameters` only | `loop-streaming` | A tool cannot declare itself a server-side tool type |
-| Tool results are collapsed to `str` before reaching the provider | `loop-streaming` | A screenshot can never travel back as an image |
+That is fixed at **one seam** — the provider's `complete()` call — by
+`hook-computer-use`, which:
 
-Neither is forked or patched. Both are fixed at **one seam** — the provider's
-`complete()` call — by `hook-computer-use`, which:
-
-- promotes any mounted tool exposing `native_tool_spec` to its native wire form,
-- adds the required `anthropic-beta` header,
 - unwraps the orchestrator's `ToolResult` envelope and expands screenshot markers into
   real image blocks,
 - keeps only the **N most recent** screenshots inline so long sessions stay affordable.
+
+(`ToolSpec` used to be built from `name`/`description`/`parameters` only, so a tool
+couldn't declare itself a server-side tool type either — `hook-computer-use` used to
+promote it and inject the beta header itself. That is now handled upstream:
+`loop-streaming` preserves a tool's `native_tool_spec` through its own `ToolSpec`
+construction, and `provider-anthropic` derives the required `anthropic-beta` header
+itself. `hook-computer-use` now only verifies that support is present and refuses to
+mount if it isn't — see `mount()`'s `_fail_if_native_tool_passthrough_unsupported`.)
 
 Remove the hook and the tool degrades cleanly to an ordinary function tool. Nothing is
 monkey-patched on disk; nothing rots when the orchestrator changes.
@@ -147,12 +150,13 @@ AMPLIFIER_COMPUTER_USE_TRACE=/tmp/cu-trace.log amplifier run --bundle computer-u
 ```
 MOUNTED max_inline=3
 WRAPPED provider=AnthropicProvider module=amplifier_module_provider_anthropic
-complete: tools=['computer', ...] promoted_betas=['computer-use-2025-11-24']
 complete: markers=1 messages_with_blocks=3
 ```
 
-`promoted_betas` empty → the tool was not promoted. No `markers=` line → screenshots are
-not reaching the model.
+No `markers=` line → screenshots are not reaching the model. A mount-time
+`ComputerUseNativeToolPassthroughUnsupportedError` means the installed
+`loop-streaming`/`provider-anthropic` do not yet carry `computer`'s native tool form to
+the wire on their own — see that error's message for the exact commit to upgrade to.
 
 ## Tests
 
@@ -160,10 +164,11 @@ not reaching the model.
 python tests/test_wire_format.py
 ```
 
-Asserts the real bytes: native tool type present, no `parameters` key on the wire, beta
-header set, screenshot markers expanded to image blocks that survive `model_dump()`
-without an API-rejected `visibility` key, recency window enforced, and graceful
-degradation when a screenshot file is gone.
+Asserts the real bytes: screenshot markers expanded to image blocks that survive
+`model_dump()` without an API-rejected `visibility` key, recency window enforced, and
+graceful degradation when a screenshot file is gone. (Native tool-spec passthrough is no
+longer done by this hook — it's verified at mount time instead; see
+`tests/test_native_tool_passthrough_guard.py`.)
 
 ---
 

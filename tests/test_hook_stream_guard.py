@@ -25,20 +25,30 @@ import pytest
 
 
 class _FakeCoordinator:
-    """Not exercised by these tests - `_wrap_provider` only needs it for
-    `_promote_tools`, which never runs before the stream-detection guard fires."""
+    """`_wrap_provider` also needs this for `_fail_if_native_tool_passthrough_unsupported`
+    (the orchestrator lookup). Returning `None` for every mount point - including
+    `"orchestrator"` - means that check finds no orchestrator to probe and skips
+    it, so it never interferes with what these tests are actually about: the
+    stream-detection guard."""
 
     def get(self, mount_point, name=None):
         return None
 
 
 class _AnthropicProviderNoStream:
-    """Today's shape: only `complete()`. Must wrap successfully (regression guard)."""
+    """Today's shape: `complete()` plus a working `_derive_native_tool_betas()`
+    (amplifier-module-provider-anthropic PR #79). Must wrap successfully
+    (regression guard) - the native-tool-passthrough compatibility check (see
+    `_fail_if_native_tool_passthrough_unsupported`) must not block a provider
+    these tests intend to be fully compatible."""
 
     __module__ = "amplifier_module_provider_anthropic"
 
     async def complete(self, request, **kwargs):
         return "ok"
+
+    def _derive_native_tool_betas(self, tools):
+        return ["computer-use-2025-11-24"] if tools else []
 
 
 class _AnthropicProviderWithStream:

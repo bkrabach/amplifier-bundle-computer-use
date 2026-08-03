@@ -1,23 +1,28 @@
 """Amplifier hook module: make Anthropic's NATIVE computer-use tool work end to end.
 
-Two things stand between a mounted `computer` tool and real computer use, and both
-live in the orchestrator, which we do not want to fork:
+One thing used to stand between a mounted `computer` tool and real computer use,
+and it lived in the orchestrator, which we did not want to fork: tool results are
+collapsed to ``str`` before they reach the provider, so a screenshot can never
+travel back as an image content block.
 
-1. The orchestrator builds every `ToolSpec` as ``name``/``description``/``parameters``,
-   so a tool cannot declare itself as a *server-side* Anthropic tool type.
-2. Tool results are collapsed to ``str`` before they reach the provider, so a
-   screenshot can never travel back as an image content block.
+That is fixed at a single seam: the provider's ``complete()`` call. This hook wraps
+it and, on the way through:
 
-Both are fixed at a single seam: the provider's ``complete()`` call. This hook wraps it
-and, on the way through:
-
-* promotes any mounted tool exposing ``native_tool_spec`` to its native wire form,
-* adds the required ``anthropic-beta`` header,
 * expands screenshot markers in tool results into real base64 image blocks,
 * keeps only the most recent screenshots inline, so long sessions stay affordable.
 
 Nothing is forked, nothing is patched on disk, and removing the hook degrades the
 tool cleanly back to an ordinary function tool.
+
+Tool-spec promotion (rewriting ``computer`` into Anthropic's native wire form and
+injecting the ``anthropic-beta`` header) used to live here too, but is now handled
+upstream: `amplifier-module-loop-streaming` preserves a tool's ``native_tool_spec``
+through its own `ToolSpec` construction, and `amplifier-module-provider-anthropic`
+derives the required beta header itself from the native tool types present on the
+request. This hook now only *verifies* that support is present
+(`_fail_if_native_tool_passthrough_unsupported`) rather than doing the work itself -
+see that function's docstring for why a silent version mismatch is not acceptable
+here.
 """
 
 from __future__ import annotations
@@ -26,14 +31,13 @@ import base64
 import json
 import logging
 import os
+import sys
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from amplifier_core import HookResult
-from amplifier_core.message_models import ToolSpec
-from pydantic import Field
 
 try:  # event name is a plain constant, but tolerate kernels that move it
     from amplifier_core.events import PROVIDER_REQUEST  # type: ignore[attr-defined]
@@ -76,22 +80,6 @@ def _trace(msg: str) -> None:
         pass
 
 
-class NativeToolSpec(ToolSpec):
-    """A ToolSpec that serialises to a provider-native tool definition.
-
-    The Anthropic provider passes any tool whose ``.type`` is not ``"function"``
-    straight through via ``model_dump(exclude_none=True)``. Overriding ``model_dump``
-    lets us emit exactly the server-side shape (no ``parameters`` key, which the API
-    would reject) while remaining a genuine ``ToolSpec`` for anything upstream.
-    """
-
-    native_payload: dict[str, Any] = Field(default_factory=dict)
-    type: str | None = None
-
-    def model_dump(self, **_kwargs: Any) -> dict[str, Any]:  # type: ignore[override]
-        return dict(self.native_payload)
-
-
 def _is_anthropic(provider: Any) -> bool:
     return (
         "anthropic" in f"{type(provider).__module__}.{type(provider).__name__}".lower()
@@ -123,11 +111,178 @@ def _fail_if_stream_incompatible(provider: Any) -> None:
             f"computer-use: provider {type(provider).__name__} "
             f"({type(provider).__module__}) now exposes stream() - hook-computer-use "
             "only wraps complete(), and the orchestrator prefers stream() whenever it "
-            "is present. Wrapping this provider would silently do nothing: no native "
-            "tool promotion, no screenshot inlining, no error, no log line. Refusing "
-            "to operate rather than degrade invisibly. Fix: either wrap complete() AND "
-            "stream() in this hook, or route computer-use through an orchestrator that "
-            "does not prefer stream()."
+            "is present. Wrapping this provider would silently do nothing: no "
+            "screenshot inlining, no error, no log line. Refusing to operate rather "
+            "than degrade invisibly. Fix: either wrap complete() AND stream() in this "
+            "hook, or route computer-use through an orchestrator that does not prefer "
+            "stream()."
+        )
+
+
+class ComputerUseNativeToolPassthroughUnsupportedError(RuntimeError):
+    """Raised when the mounted orchestrator/provider cannot carry `computer`'s
+    native tool form to the wire without this hook doing it for them.
+
+    hook-computer-use used to promote `computer`'s `native_tool_spec` to the wire
+    itself and inject the matching `anthropic-beta` header (see CHANGELOG /
+    module docstring - "job 1"). That is now redundant and has been removed:
+
+    * `amplifier-module-loop-streaming` (commit f8004e0, PR #36 - "feat: preserve
+      model-native tool form through ToolSpec construction") makes its
+      `_build_tool_spec()` preserve a tool's `native_tool_spec` through `ToolSpec`
+      construction - `ToolSpec` is `extra="allow"`, so the native keys ride along
+      as extras and reach the provider intact.
+    * `amplifier-module-provider-anthropic` (commit 94a4354, PR #79 - "fix:
+      cache_control targets last function tool; derive betas from native tool
+      types") makes the provider derive the required `anthropic-beta` header
+      itself from the native tool types present on the request, and stop
+      stamping `cache_control` onto them.
+
+    If EITHER upstream module predates its fix, `computer`'s native definition
+    silently degrades to a plain function tool: the request is still valid, the
+    tool still appears, and the model just gets the weaker definition - measurably
+    worse targeting, with no error and no log line. That is the exact
+    silent-downgrade failure mode this bundle exists to prevent (see
+    `ComputerUseHookIncompatibleProviderError` for the sibling guard against the
+    same class of failure on the streaming path). So: refuse to mount rather than
+    let it happen invisibly.
+
+    Detection deliberately does not trust a version string - manifests can lie,
+    and a shallow git clone may not even have one. Instead it drives the actual
+    installed code with a throwaway probe tool/tool-list and checks the real
+    output, exactly the way `_fail_if_stream_incompatible` checks for a real
+    `stream` attribute rather than a claimed version.
+    """
+
+
+def _provider_derives_native_tool_betas(provider: Any) -> bool:
+    """Probe whether `provider` self-derives `anthropic-beta` headers for native
+    tool types (amplifier-module-provider-anthropic PR #79).
+
+    Only called after `_is_anthropic(provider)` has already confirmed this IS
+    the provider brand this hook depends on - unlike the orchestrator probe
+    below, there is no "unknown vendor, cannot judge" case to consider here.
+    A real provider-anthropic unconditionally has a working
+    `_derive_native_tool_betas()` from PR #79 onward, so an absent or broken
+    one is exactly the pre-PR-#79 shape, not an ambiguous signal.
+    """
+    derive = getattr(provider, "_derive_native_tool_betas", None)
+    if not callable(derive):
+        return False
+    try:
+        betas = derive([{"type": "computer_20251124"}])
+    except Exception:
+        logger.exception(
+            "computer-use: _derive_native_tool_betas probe raised on %s",
+            type(provider).__name__,
+        )
+        return False
+    return isinstance(betas, list) and any("computer-use" in str(b) for b in betas)
+
+
+def _is_loop_streaming(orchestrator: Any) -> bool:
+    """Same module-name heuristic `_is_anthropic()` uses for providers, applied
+    to the orchestrator. Needed because - unlike the provider, already
+    confirmed Anthropic before `_provider_derives_native_tool_betas` runs - the
+    mounted orchestrator could be anything, including one this hook has no
+    opinion about at all."""
+    identity = f"{type(orchestrator).__module__}.{type(orchestrator).__name__}"
+    return "loop_streaming" in identity.lower().replace("-", "_")
+
+
+def _orchestrator_preserves_native_tool_spec(orchestrator: Any) -> bool | None:
+    """Probe whether the mounted orchestrator's tool-spec construction preserves
+    a tool's `native_tool_spec` (amplifier-module-loop-streaming PR #36).
+
+    Exercises the orchestrator module's own `_build_tool_spec()` against a
+    throwaway stub tool exposing `native_tool_spec`, and checks whether the
+    native `type` actually survives into the emitted `ToolSpec`. This is a real
+    behavioural probe of the installed code, not a version string.
+
+    Returns:
+        True  - identified as loop-streaming, and it preserves the native type.
+        False - identified as loop-streaming, but it does not: either
+                `_build_tool_spec()` is missing entirely, or it drops the
+                native type (the pre-PR-#36 behaviour).
+        None  - NOT identified as loop-streaming at all (see
+                `_is_loop_streaming`) - some other orchestrator is mounted,
+                which is simply not this check's concern. Callers must not
+                treat this as "confirmed compatible".
+    """
+    if not _is_loop_streaming(orchestrator):
+        return None
+    module = sys.modules.get(type(orchestrator).__module__)
+    build: Any = getattr(module, "_build_tool_spec", None) if module else None
+    if not callable(build):
+        return False
+
+    class _NativeToolSpecProbe:
+        name = "__computer_use_native_tool_spec_probe__"
+        description = "probe"
+        input_schema: dict[str, Any] = {}
+
+        @property
+        def native_tool_spec(self) -> dict[str, Any]:
+            return {
+                "type": "computer_20251124",
+                "name": "__computer_use_native_tool_spec_probe__",
+            }
+
+    try:
+        spec: Any = build(_NativeToolSpecProbe())
+        dumped = spec.model_dump(exclude_none=True)
+    except Exception:
+        logger.exception(
+            "computer-use: native_tool_spec passthrough probe raised on orchestrator %s",
+            type(orchestrator).__name__,
+        )
+        return False
+    return dumped.get("type") == "computer_20251124"
+
+
+def _fail_if_native_tool_passthrough_unsupported(
+    coordinator: Any, provider: Any
+) -> None:
+    """Refuse to mount if `computer`'s native tool form cannot reach the wire
+    without this hook promoting it itself. See
+    `ComputerUseNativeToolPassthroughUnsupportedError` for the full rationale.
+
+    The orchestrator probe returns `None` when it cannot be run at all (some
+    orchestrator other than loop-streaming is mounted) - that is "not this
+    check's concern", not "confirmed compatible", and is intentionally NOT
+    treated as a failure: we only refuse to mount when the probe positively
+    identified loop-streaming AND it came back negative. The provider probe
+    has no such middle state - see its docstring.
+    """
+    if not _provider_derives_native_tool_betas(provider):
+        raise ComputerUseNativeToolPassthroughUnsupportedError(
+            f"computer-use: provider {type(provider).__name__} "
+            f"({type(provider).__module__}) does not derive anthropic-beta headers "
+            "from native tool types (no working _derive_native_tool_betas()). "
+            "hook-computer-use no longer injects this header itself - upgrade "
+            "amplifier-module-provider-anthropic to at least commit 94a4354 (PR #79, "
+            "'fix: cache_control targets last function tool; derive betas from "
+            "native tool types'), or the `computer` tool's native definition will "
+            "silently degrade to a plain function tool."
+        )
+
+    orchestrator = None
+    try:
+        orchestrator = coordinator.get("orchestrator")
+    except Exception:
+        logger.debug("computer-use: orchestrator lookup failed", exc_info=True)
+    if orchestrator is not None and (
+        _orchestrator_preserves_native_tool_spec(orchestrator) is False
+    ):
+        raise ComputerUseNativeToolPassthroughUnsupportedError(
+            f"computer-use: orchestrator {type(orchestrator).__name__} "
+            f"({type(orchestrator).__module__}) does not preserve a tool's "
+            "native_tool_spec through its ToolSpec construction. "
+            "hook-computer-use no longer promotes tool specs itself - upgrade "
+            "amplifier-module-loop-streaming to at least commit f8004e0 (PR #36, "
+            "'feat: preserve model-native tool form through ToolSpec "
+            "construction'), or the `computer` tool's native definition will "
+            "silently degrade to a plain function tool."
         )
 
 
@@ -283,145 +438,6 @@ def _expand_tool_results(messages: list[Any], max_inline: int) -> list[Any]:
     return rewritten
 
 
-def _promote_tools(
-    coordinator: Any, tools: list[Any], model: str | None = None
-) -> tuple[list[Any], list[str]]:
-    """Swap function-shaped specs for native ones where the tool asks for it.
-
-    `model` is the model actually about to receive THIS request
-    (`ChatRequest.model`, when the caller can see it) - passed through to any
-    tool exposing `note_model()` so its declared `native_tool_spec`/
-    `native_beta_header` stay correct even when the model changes mid-session
-    (e.g. `provider-anthropic`'s own model-fallback). See
-    `tool_versions.resolve_tool_version` in tool-computer-use for why this
-    fixes a real, reachable 400-every-turn defect rather than a hypothetical
-    one.
-    """
-    if not tools:
-        return tools, []
-    native: list[Any] = []
-    normal: list[Any] = []
-    betas: list[str] = []
-    for spec in tools:
-        payload = None
-        tool = None
-        try:
-            tool = coordinator.get("tools", getattr(spec, "name", ""))
-        except Exception:
-            # Best-effort: this loop runs over EVERY tool on the request, not just
-            # `computer`, so a lookup failure for an unrelated tool is expected and
-            # must not break promotion of the others. Logged (not silent) so a
-            # persistent failure to find `computer` specifically is still
-            # diagnosable instead of invisibly meaning "computer-use never
-            # promotes" with zero trace.
-            logger.debug(
-                "computer-use: tool lookup failed for %r", spec.name, exc_info=True
-            )
-            tool = None
-        # D3 fix: `native_tool_spec` is a property, and on some tools it can raise
-        # (e.g. a backend I/O failure). `hasattr(tool, "native_tool_spec")` used to
-        # gate this block - but Python 3's `hasattr` swallows *only* `AttributeError`;
-        # any other exception raised by the property escapes `hasattr` itself, before
-        # the `try/except` below even starts, and takes down the whole provider
-        # request. Checking the *class* for the descriptor (never invokes the
-        # getter - a property accessed via the class returns the descriptor object
-        # itself) tells us whether the attribute exists at all, without ever calling
-        # into a tool's code. Reading the actual value happens only inside the
-        # `try/except` that already handles a broken tool.
-        if (
-            tool is not None
-            and getattr(type(tool), "native_tool_spec", None) is not None
-        ):
-            # Model/tool_version coupling fix: `note_model` is a plain method
-            # (not a property), so simply reading it via getattr can never
-            # trigger the D3 hazard - only *calling* it can raise, and that is
-            # already inside this function's broader try/except below. A tool
-            # with no `note_model` (or any tool predating this fix) is
-            # unaffected - `getattr(..., None)` degrades to a no-op.
-            note_model = getattr(tool, "note_model", None)
-            if callable(note_model):
-                try:
-                    note_model(model)
-                except Exception:
-                    logger.exception(
-                        "computer-use: note_model(%r) failed for %r; "
-                        "native_tool_spec may be stale this turn",
-                        model,
-                        spec.name,
-                    )
-            try:
-                payload = dict(tool.native_tool_spec)
-            except Exception:  # a broken tool must not break the request
-                logger.exception(
-                    "computer-use: could not read native_tool_spec from %r", spec.name
-                )
-                payload = None
-        if payload:
-            native.append(
-                NativeToolSpec(
-                    name=payload.get("name", spec.name),
-                    parameters={},
-                    description=getattr(spec, "description", None),
-                    native_payload=payload,
-                    type=payload.get("type"),
-                )
-            )
-            header = getattr(tool, "native_beta_header", None)
-            if header:
-                betas.append(str(header))
-        else:
-            normal.append(spec)
-    # Native tools go first: the provider stamps cache_control onto the LAST tool,
-    # and server-side tool definitions must not carry it.
-    return native + normal, betas
-
-
-def _ensure_beta_headers(provider: Any, headers: list[str]) -> None:
-    """Enable the given `anthropic-beta` flags on the already-mounted provider.
-
-    Only `_beta_headers` is written here. `_default_headers` is deliberately NOT
-    touched (it was, until 2026-07-31, and the write was dead code): that dict is
-    baked into the Anthropic SDK client at provider *construction* time
-    (`amplifier_module_provider_anthropic/__init__.py:686`,
-    `AsyncAnthropic(..., default_headers=self._default_headers, ...)`), which runs
-    long before this hook ever gets a chance to mutate the provider instance -
-    `mount()` order guarantees the provider already exists by the time we see it.
-    Writing to `_default_headers` after that point mutates a dict the already-built
-    httpx client copied at init and never rereads; it has zero effect and was
-    silently doing nothing on every single request.
-
-    `_beta_headers` works for the opposite reason: it is RE-READ per request
-    (`amplifier_module_provider_anthropic/__init__.py:1262-1273`,
-    `_build_request_beta_headers`), not baked into a client at construction time.
-
-    KNOWN PRIVATE-ATTRIBUTE DEPENDENCY (dated 2026-07-31): `_beta_headers` is not
-    part of the `Provider` protocol - there is no public API for a hook to request
-    additional beta headers for a request it did not originate. The correct
-    long-term fix lives upstream, on amplifier-module-provider-anthropic: derive the
-    required `anthropic-beta` values from the native tool *types* actually present
-    on `request.tools` (the provider already inspects `request.tools` to build the
-    wire payload), so no external hook needs to reach into a private attribute at
-    all. Until that lands, this dependency is deliberate and documented, not an
-    oversight - if `provider-anthropic` ever renames or removes `_beta_headers`,
-    the `isinstance` guard below degrades this to a no-op again, which is why it is
-    logged rather than left to fail silently a second time.
-    """
-    existing = getattr(provider, "_beta_headers", None)
-    if existing is None or not isinstance(existing, list):
-        logger.warning(
-            "computer-use: provider %s has no writable _beta_headers list; "
-            "cannot enable %s. Native computer-use tool calls will likely be "
-            "rejected by the Anthropic API for missing the required beta opt-in.",
-            type(provider).__name__,
-            headers,
-        )
-        return
-    for header in headers:
-        if header not in existing:
-            existing.append(header)
-            logger.info("computer-use: enabled anthropic-beta %s", header)
-
-
 def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
     if getattr(provider, _WRAPPED_FLAG, False):
         return False
@@ -436,6 +452,11 @@ def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
     # "wrapped provider ... for native computer use" while the wrap is never
     # actually exercised on the request hot path.
     _fail_if_stream_incompatible(provider)
+    # Same reasoning, different failure mode: if the mounted orchestrator/provider
+    # cannot carry `computer`'s native tool form to the wire on their own, wrapping
+    # would still "succeed" while the tool silently degrades to a plain function
+    # tool. See ComputerUseNativeToolPassthroughUnsupportedError.
+    _fail_if_native_tool_passthrough_unsupported(coordinator, provider)
     if not hasattr(provider, "complete"):
         return False
 
@@ -443,17 +464,6 @@ def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
 
     async def complete(request: Any, **kwargs: Any):
         try:
-            tools = list(getattr(request, "tools", None) or [])
-            if tools:
-                promoted, betas = _promote_tools(
-                    coordinator, tools, getattr(request, "model", None)
-                )
-                _trace(
-                    f"complete: tools={[getattr(t, 'name', '?') for t in tools]} promoted_betas={betas}"
-                )
-                if betas:
-                    request.tools = promoted
-                    _ensure_beta_headers(provider, betas)
             messages = getattr(request, "messages", None)
             if isinstance(messages, list):
                 if _TRACE_PATH:
@@ -486,7 +496,7 @@ def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
         f"WRAPPED provider={type(provider).__name__} module={type(provider).__module__}"
     )
     logger.info(
-        "computer-use: wrapped provider %s for native computer-use",
+        "computer-use: wrapped provider %s for screenshot inlining",
         type(provider).__name__,
     )
     return True
@@ -663,7 +673,7 @@ async def mount(
             # logs - to one that is working correctly.
             logger.warning(
                 "computer-use: no provider found to wrap (requested=%r); "
-                "native computer-use tool promotion will not happen this turn",
+                "screenshot inlining will not happen this turn",
                 name,
             )
         else:
@@ -691,5 +701,8 @@ async def mount(
         "name": "hook-computer-use",
         "version": __version__,
         "provides": ["native-computer-use-wire-format"],
-        "description": "Promotes native tool specs and returns screenshots as image blocks",
+        "description": (
+            "Verifies native tool-spec passthrough is supported upstream and "
+            "returns screenshots as image blocks"
+        ),
     }

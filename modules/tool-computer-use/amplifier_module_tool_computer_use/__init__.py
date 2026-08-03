@@ -583,13 +583,15 @@ class ComputerTool:
         `display_width_px`/`display_height_px` must never drift out of sync with
         what `computer.screenshot` is actually capturing. That is why this stays a
         plain property reading `self.display` rather than something cached at
-        construction: `hook-computer-use` re-reads `native_tool_spec` fresh on
-        *every* `provider:request` (see `_promote_tools` in that module - it is
-        never cached at the hook layer; only D2's *I/O* was cached here, not the
-        *value*), so the very next request after a monitor switch automatically
-        declares the new dimensions. The in-memory state this property reads
-        (`self._display`) is exactly what `select_monitor` updates - one piece of
-        state, two readers (this property and `_run`), always in sync.
+        construction: the orchestrator's `ToolSpec` construction (see
+        `amplifier-module-loop-streaming`'s `_build_tool_spec`, which reads this
+        property fresh to build every request's tool list - it is never cached
+        there either; only D2's *I/O* was cached here, not the *value*) re-reads
+        `native_tool_spec` on every `provider:request`, so the very next request
+        after a monitor switch automatically declares the new dimensions. The
+        in-memory state this property reads (`self._display`) is exactly what
+        `select_monitor` updates - one piece of state, two readers (this property
+        and `_run`), always in sync.
         """
         disp = self.display
         spec: dict[str, Any] = {

@@ -39,6 +39,11 @@ class FakeCoordinator:
         self.hooks = FakeHooks()
 
     def get(self, mount_point, name=None):
+        if mount_point == "orchestrator":
+            # No orchestrator mounted in this harness - the hook must treat
+            # that as "cannot verify", not "confirmed incompatible" (see
+            # `_fail_if_native_tool_passthrough_unsupported`).
+            return None
         if mount_point != "tools":
             return {"anthropic": FAKE_PROVIDER} if name is None else FAKE_PROVIDER
         return self._tools if name is None else self._tools.get(name)
@@ -48,10 +53,35 @@ class FakeCoordinator:
 
 
 class anthropic_provider:
+    """Stand-in for the real provider-anthropic instance.
+
+    Includes a real, working `_derive_native_tool_betas` (amplifier-module-
+    provider-anthropic PR #79 shape) so this fake passes
+    `_fail_if_native_tool_passthrough_unsupported`'s compatibility probe - the
+    hook itself no longer promotes tools or injects beta headers, so a fake
+    lacking this method would (correctly) make the hook refuse to wrap it.
+    """
+
+    _NATIVE_TOOL_BETA_HEADERS = {
+        "computer_20241022": "computer-use-2024-10-22",
+        "computer_20250124": "computer-use-2025-01-24",
+        "computer_20251124": "computer-use-2025-11-24",
+    }
+
     def __init__(self) -> None:
         self.seen: ChatRequest | None = None
         self._beta_headers: list[str] = []
         self._default_headers: dict[str, str] = {}
+
+    def _derive_native_tool_betas(self, tools):
+        betas: list[str] = []
+        for tool in tools or []:
+            if not isinstance(tool, dict):
+                continue
+            beta = self._NATIVE_TOOL_BETA_HEADERS.get(tool.get("type") or "")
+            if beta and beta not in betas:
+                betas.append(beta)
+        return betas
 
     async def complete(self, request, **kwargs):
         self.seen = request
@@ -134,38 +164,30 @@ async def main() -> int:
     sent = FAKE_PROVIDER.seen
     assert sent is not None
 
-    print("\n[3] tools array carries the NATIVE definition (not a function schema)")
-    first = sent.tools[0]
-    dumped = first.model_dump(exclude_none=True)
-    check(
-        "native tool is first (avoids cache_control stamping)",
-        dumped.get("name") == "computer",
-        str(dumped),
+    print(
+        "\n[3] hook no longer touches request.tools (native promotion now happens "
+        "upstream, in the orchestrator's ToolSpec construction - see "
+        "amplifier-module-loop-streaming PR #36)"
     )
+    check("tools list is the exact same object", sent.tools is request.tools)
+    check("tool count unchanged", len(sent.tools) == 2, str(sent.tools))
+    check("computer tool untouched", sent.tools[0].name == "computer")
     check(
-        "serialises to server tool type",
-        str(dumped.get("type", "")).startswith("computer_"),
-        str(dumped),
-    )
-    check(
-        "no 'parameters' key on the wire (API rejects it)",
-        "parameters" not in dumped,
-        str(dumped),
-    )
-    check(
-        "provider sees .type != function",
-        getattr(first, "type", None) not in (None, "function"),
+        "still a plain function tool (this test builds the request directly, "
+        "bypassing the orchestrator's own promotion)",
+        getattr(sent.tools[0], "type", None) in (None, "function"),
     )
     check("other tools untouched", sent.tools[1].name == "read_file")
-    print(f"       -> {dumped}")
 
-    print("\n[4] beta header enabled on the provider")
+    print(
+        "\n[4] hook no longer injects anthropic-beta headers (provider derives them "
+        "itself - see amplifier-module-provider-anthropic PR #79)"
+    )
     check(
-        "anthropic-beta contains a computer-use flag",
-        any("computer-use" in h for h in FAKE_PROVIDER._beta_headers),
+        "_beta_headers left exactly as the provider set it up (empty)",
+        FAKE_PROVIDER._beta_headers == [],
         str(FAKE_PROVIDER._beta_headers),
     )
-    print(f"       -> {FAKE_PROVIDER._beta_headers}")
 
     print("\n[5] screenshot marker became a REAL image content block")
     tool_msg = sent.messages[1]
