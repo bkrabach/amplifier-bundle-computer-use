@@ -1,4 +1,4 @@
-"""Unit tests for `_normalize_openai_action` - the wire-shape translation
+"""Unit tests for `providers._normalize_openai_action` - the wire-shape translation
 between OpenAI's Responses API `computer_call` action batch (`{"type": ...,
 "x": ..., "y": ..., ...}`) and this tool's own `(action, params)` vocabulary
 (`{"action": ..., "coordinate": [...], ...}`).
@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
 
 import pytest
-from amplifier_module_tool_computer_use import _normalize_openai_action
+from amplifier_module_tool_computer_use.providers import _normalize_openai_action
 
 
 def test_screenshot():

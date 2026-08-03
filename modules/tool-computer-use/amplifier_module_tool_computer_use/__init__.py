@@ -47,6 +47,7 @@ from .imaging import capture_scaled_b64
 from .ledger import HeldInputLedger
 from .monitors import PRIMARY, VIRTUAL_DESKTOP, select_monitor
 from .presence import GUARD_MS, PresenceMonitor
+from .providers import dialect_for_tool_type, read_call
 from .registry import NoBackendAvailable, select_backend
 from .tool_versions import (
     beta_header_for,
@@ -144,91 +145,6 @@ _CLICK_ACTIONS = {
     "double_click": ("left", 2),
     "triple_click": ("left", 3),
 }
-
-#: OpenAI's Responses API `computer_call` action `type` -> this tool's own
-#: `action` name, for the shapes translated 1:1 by `_normalize_openai_action`
-#: (click's target action depends on `button`, handled separately).
-_OPENAI_BUTTON_TO_ACTION = {
-    "left": "left_click",
-    "right": "right_click",
-    "middle": "middle_click",
-    "wheel": "middle_click",
-    "back": "left_click",
-    "forward": "left_click",
-}
-
-
-def _normalize_openai_action(raw: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    """Translate ONE OpenAI `computer_call` action (`{"type": ..., "x": ...,
-    "y": ..., ...}`) into this tool's own `(action, params)` vocabulary
-    (`{"coordinate": [x, y], ...}`, matching what `_run()` already expects).
-
-    OpenAI's Responses API batches one or more of these under a single
-    `computer_call`'s `actions` list - a fundamentally different wire shape
-    from Anthropic's one-action-per-call `{"action": ..., "coordinate":
-    [...]}` form this module was originally built for (live capture,
-    `tests/fixtures/captures/openai-turn0.json` / `openai-turn1.json`):
-    flat `x`/`y` fields instead of a `coordinate` pair, `type` instead of
-    `action` as the discriminator, and per-action-type fields (`button`,
-    `keys`, `scroll_x`/`scroll_y`, `path`) with no Anthropic equivalent
-    name. This is the one seam that does that translation - callers
-    (`ComputerTool._execute_openai_action_batch`) run the *normalized*
-    result through the exact same `_run()` every other caller uses.
-
-    Raises `ValueError` for a `type` this tool has no equivalent action
-    for, or a well-known type missing a field it requires - surfaced to the
-    model as an ordinary tool error, never silently dropped or guessed at.
-    """
-    action_type = str(raw.get("type") or "").strip()
-
-    def xy() -> list[float]:
-        x, y = raw.get("x"), raw.get("y")
-        if x is None or y is None:
-            raise ValueError(f"openai action {action_type!r} is missing x/y")
-        return [float(x), float(y)]
-
-    if action_type == "screenshot":
-        return "screenshot", {}
-    if action_type == "wait":
-        return "wait", {}
-    if action_type == "move":
-        return "mouse_move", {"coordinate": xy()}
-    if action_type == "click":
-        button = str(raw.get("button") or "left")
-        return _OPENAI_BUTTON_TO_ACTION.get(button, "left_click"), {"coordinate": xy()}
-    if action_type == "double_click":
-        return "double_click", {"coordinate": xy()}
-    if action_type == "drag":
-        path = raw.get("path") or []
-        if len(path) < 2:
-            raise ValueError("openai 'drag' action requires a path of >= 2 points")
-        start, end = path[0], path[-1]
-        return "left_click_drag", {
-            "start_coordinate": [float(start["x"]), float(start["y"])],
-            "coordinate": [float(end["x"]), float(end["y"])],
-        }
-    if action_type == "scroll":
-        dx = int(raw.get("scroll_x") or 0)
-        dy = int(raw.get("scroll_y") or 0)
-        if dy != 0:
-            direction, amount = ("down" if dy > 0 else "up"), abs(dy)
-        elif dx != 0:
-            direction, amount = ("right" if dx > 0 else "left"), abs(dx)
-        else:
-            direction, amount = "down", 0
-        params: dict[str, Any] = {
-            "scroll_direction": direction,
-            "scroll_amount": amount,
-        }
-        if raw.get("x") is not None and raw.get("y") is not None:
-            params["coordinate"] = xy()
-        return "scroll", params
-    if action_type == "keypress":
-        keys = raw.get("keys") or []
-        return "key", {"text": "+".join(str(k) for k in keys)}
-    if action_type == "type":
-        return "type", {"text": str(raw.get("text") or "")}
-    raise ValueError(f"unsupported OpenAI computer-use action type {action_type!r}")
 
 
 def _prune_shots() -> None:
@@ -654,7 +570,20 @@ class ComputerTool:
     # -- native promotion (read by hook-computer-use) ---------------------------
     @property
     def native_tool_spec(self) -> dict[str, Any]:
-        """Anthropic server-side tool definition, sized to the cached display.
+        """The native tool declaration for whichever dialect `_tool_version`
+        belongs to (`providers.py`) - sized to the cached display when that
+        dialect requires a size, bare when it rejects one.
+
+        This used to build ONE shape (Anthropic's: `name` +
+        `display_width_px`/`display_height_px`) no matter which provider was in
+        play, and gate `enable_zoom` on `self._tool_version >=
+        "computer_20251124"` - a string comparison that silently did double
+        duty as a provider check, because OpenAI's bare `"computer"` happens to
+        sort below it. OpenAI tolerated the surplus fields only because
+        `provider-openai` discards everything but `type`; the declaration
+        itself was wrong for that wire and nothing here said so. Each dialect
+        now owns its own shape (see `providers._declare_anthropic` /
+        `_declare_openai`).
 
         D2 fix: this used to call `self._bridge.display()`, a property that shelled
         out to PowerShell with a 30s timeout on *every single* provider request. That
@@ -679,15 +608,12 @@ class ComputerTool:
         and `_run`), always in sync.
         """
         disp = self.display
-        spec: dict[str, Any] = {
-            "type": self._tool_version,
-            "name": "computer",
-            "display_width_px": disp.model_width,
-            "display_height_px": disp.model_height,
-        }
-        if self._enable_zoom and self._tool_version >= "computer_20251124":
-            spec["enable_zoom"] = True
-        return spec
+        return dialect_for_tool_type(self._tool_version).declare(
+            self._tool_version,
+            width=disp.model_width,
+            height=disp.model_height,
+            enable_zoom=self._enable_zoom,
+        )
 
     @property
     def native_beta_header(self) -> str:
@@ -1049,61 +975,105 @@ class ComputerTool:
         raise ValueError(f"unsupported action {action!r}")
 
     async def execute(self, input: dict[str, Any]) -> ToolResult:
-        # OpenAI's Responses API `computer_call` batches one or more actions
-        # under an "actions" list, each shaped `{"type": ..., "x": ..., ...}`
-        # - fundamentally different from the one-action-per-call
-        # `{"action": ..., "coordinate": [...]}` shape Anthropic's
-        # `computer_use` tool speaks and this method was originally built
-        # for. `amplifier-module-provider-openai`'s own `ToolCall` carries
-        # that batch straight through as `arguments={"actions": [...]}`
-        # (see its `_extract_computer_actions`) - detecting it here, by
-        # actual shape, is the honest seam: translate to this tool's own
-        # action vocabulary and run each one through the SAME `_run()`
-        # every other caller uses, never a second, parallel dispatcher.
-        raw_actions = input.get("actions")
-        if isinstance(raw_actions, list):
-            return await self._execute_openai_action_batch(raw_actions)
+        """Run one tool call, in whichever provider dialect it arrived in.
 
-        action = str(input.get("action") or "").strip()
-        if action not in ACTIONS:
-            return ToolResult(
-                success=False,
-                error={
-                    "message": f"unknown action {action!r}; expected one of {', '.join(ACTIONS)}"
-                },
-            )
-        if self._read_only and action in MUTATING:
-            return ToolResult(
-                success=False,
-                error={
-                    "message": f"action {action!r} blocked: computer-use is mounted read_only"
-                },
-            )
+        The two live wire forms disagree about shape and cardinality -
+        Anthropic sends one `{"action": ..., "coordinate": [...]}` per call;
+        OpenAI batches N `{"type": ..., "x": ..., ...}` entries under `actions`
+        and expects ONE result for the whole batch (`providers.py` has the full
+        comparison). `providers.read_call` is the only place that knows the
+        difference: it identifies the dialect from the payload's actual shape -
+        never by asking which provider is mounted - and yields this tool's own
+        `(action, params)` vocabulary. Everything after that line is shared, and
+        was already shared before this seam existed: one `ACTIONS` check, one
+        `read_only`/`MUTATING` gate, one `_run()`, one set of error handlers.
+        There is no second, parallel dispatcher per vendor and there must never
+        be one.
 
+        Cardinality is not special-cased either: a single Anthropic action is a
+        one-element batch, and the loop below is identical for both. The one
+        genuine per-dialect difference is what a result must carry -
+        `result_must_carry_screenshot`.
+        """
+        dialect, calls = read_call(input)
+
+        last_summary = ""
+        last_image_b64: str | None = None
         try:
-            # C4: `Backend` stays synchronous (local paths and all existing tests
-            # untouched), but a remote action can block on a network round trip
-            # for hundreds of milliseconds. Running it in a thread keeps the
-            # event loop live so cancellation can actually be serviced during
-            # that wait, instead of stalling behind a screenshot transfer.
-            # Cheap locally too - `asyncio.to_thread` on a microsecond-scale
-            # X11/Quartz call costs a thread-pool round trip, not a network one.
-            summary, image_b64 = await asyncio.to_thread(self._run, action, input)
-        except HaltedError as exc:
-            return self._record_halt_result(action, exc)
-        except (BackendError, ValueError) as exc:
+            # The iterable may be lazy and may raise while being pulled (see
+            # `providers._normalize_openai_batch`), so iteration happens INSIDE
+            # this handler: a malformed entry halfway through a batch fails
+            # after the good actions before it have already run, exactly as the
+            # per-item loop did before. Every ValueError raised by `_run` is
+            # caught below and returned, so the only thing reaching this
+            # handler is a dialect read failure.
+            for action, params in calls:
+                if action not in ACTIONS:
+                    return ToolResult(
+                        success=False,
+                        error={
+                            "message": f"unknown action {action!r}; expected one of {', '.join(ACTIONS)}"
+                        },
+                    )
+                if self._read_only and action in MUTATING:
+                    return ToolResult(
+                        success=False,
+                        error={
+                            "message": f"action {action!r} blocked: computer-use is mounted read_only"
+                        },
+                    )
+                try:
+                    # C4: `Backend` stays synchronous (local paths and all existing
+                    # tests untouched), but a remote action can block on a network
+                    # round trip for hundreds of milliseconds. Running it in a
+                    # thread keeps the event loop live so cancellation can actually
+                    # be serviced during that wait, instead of stalling behind a
+                    # screenshot transfer. Cheap locally too - `asyncio.to_thread`
+                    # on a microsecond-scale X11/Quartz call costs a thread-pool
+                    # round trip, not a network one.
+                    summary, image_b64 = await asyncio.to_thread(
+                        self._run, action, params
+                    )
+                except HaltedError as exc:
+                    return self._record_halt_result(action, exc)
+                except (BackendError, ValueError) as exc:
+                    return ToolResult(
+                        success=False,
+                        error={"message": str(exc), "type": type(exc).__name__},
+                    )
+                except Exception as exc:
+                    logger.exception("computer action %s failed", action)
+                    return ToolResult(
+                        success=False,
+                        error={"message": str(exc), "type": type(exc).__name__},
+                    )
+                last_summary = summary
+                if image_b64 is not None:
+                    last_image_b64 = image_b64
+        except ValueError as exc:
             return ToolResult(
-                success=False, error={"message": str(exc), "type": type(exc).__name__}
-            )
-        except Exception as exc:
-            logger.exception("computer action %s failed", action)
-            return ToolResult(
-                success=False, error={"message": str(exc), "type": type(exc).__name__}
+                success=False, error={"message": str(exc), "type": "ValueError"}
             )
 
-        if image_b64 is None:
-            return ToolResult(success=True, output=summary)
-        return self._screenshot_tool_result(summary, image_b64)
+        if last_image_b64 is None:
+            if not dialect.result_must_carry_screenshot:
+                return ToolResult(success=True, output=last_summary)
+            # OpenAI's `computer_call_output` is invalid without an image, so
+            # take one more if the batch's own actions produced none - the
+            # model always sees the result of what it just did.
+            try:
+                last_summary, last_image_b64 = await asyncio.to_thread(
+                    self._run, "screenshot", {}
+                )
+            except (BackendError, ValueError) as exc:
+                return ToolResult(
+                    success=False,
+                    error={"message": str(exc), "type": type(exc).__name__},
+                )
+        # `_run("screenshot", ...)` always returns image bytes (never None) -
+        # see its own branch - so this is a real invariant, not a defensive guess.
+        assert last_image_b64 is not None
+        return self._screenshot_tool_result(last_summary, last_image_b64)
 
     def _record_halt_result(self, action: str, exc: HaltedError) -> ToolResult:
         """Shared halt bookkeeping for both `execute()`'s single-action path
@@ -1181,90 +1151,6 @@ class ComputerTool:
                 }
             ),
         )
-
-    async def _execute_openai_action_batch(self, raw_actions: list[Any]) -> ToolResult:
-        """Execute an OpenAI-shaped `computer_call` action batch in order,
-        returning exactly ONE `ToolResult` - matching what
-        `amplifier-module-provider-openai` needs to build ONE
-        `computer_call_output` per `call_id`, regardless of how many actions
-        were batched into the call (see its `_extract_computer_actions`
-        docstring: \"Live Responses API traffic ... returns a batched
-        actions array\").
-
-        Each item is translated via `_normalize_openai_action` into this
-        tool's own `(action, params)` vocabulary and run through the exact
-        same `_run()` every other caller (Anthropic's single-action path,
-        `DesktopTool`) uses - no second, parallel action-dispatch
-        implementation. `read_only`/`MUTATING` gating and halt/error
-        handling apply per-item, identically to the single-action path.
-
-        A `computer_call_output` always needs an image (OpenAI's own
-        `_extract_computer_screenshot_data_url` raises without one) - if the
-        batch's last action was not itself a screenshot, one more is taken
-        so the model always sees the result of what it just did.
-        """
-        last_summary = ""
-        last_image_b64: str | None = None
-        for raw in raw_actions:
-            if not isinstance(raw, dict):
-                return ToolResult(
-                    success=False,
-                    error={"message": f"unsupported action entry {raw!r}"},
-                )
-            try:
-                action, params = _normalize_openai_action(raw)
-            except ValueError as exc:
-                return ToolResult(
-                    success=False,
-                    error={"message": str(exc), "type": "ValueError"},
-                )
-            if action not in ACTIONS:
-                return ToolResult(
-                    success=False,
-                    error={
-                        "message": f"unknown action {action!r}; expected one of {', '.join(ACTIONS)}"
-                    },
-                )
-            if self._read_only and action in MUTATING:
-                return ToolResult(
-                    success=False,
-                    error={
-                        "message": f"action {action!r} blocked: computer-use is mounted read_only"
-                    },
-                )
-            try:
-                summary, image_b64 = await asyncio.to_thread(self._run, action, params)
-            except HaltedError as exc:
-                return self._record_halt_result(action, exc)
-            except (BackendError, ValueError) as exc:
-                return ToolResult(
-                    success=False,
-                    error={"message": str(exc), "type": type(exc).__name__},
-                )
-            except Exception as exc:
-                logger.exception("computer action %s failed", action)
-                return ToolResult(
-                    success=False,
-                    error={"message": str(exc), "type": type(exc).__name__},
-                )
-            last_summary = summary
-            if image_b64 is not None:
-                last_image_b64 = image_b64
-
-        if last_image_b64 is None:
-            try:
-                last_summary, last_image_b64 = await asyncio.to_thread(
-                    self._run, "screenshot", {}
-                )
-            except (BackendError, ValueError) as exc:
-                return ToolResult(
-                    success=False,
-                    error={"message": str(exc), "type": type(exc).__name__},
-                )
-        # `_run("screenshot", ...)` always returns image bytes (never None) -
-        # see its own branch - so this is a real invariant, not a defensive guess.
-        assert last_image_b64 is not None
-        return self._screenshot_tool_result(last_summary, last_image_b64)
 
 
 DESKTOP_ACTIONS = [

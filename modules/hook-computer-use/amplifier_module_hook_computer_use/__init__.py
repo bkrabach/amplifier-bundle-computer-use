@@ -234,6 +234,36 @@ def _provider_recognizes_bare_computer_tool(
     return converted == [{"type": tool_type}]
 
 
+#: Every known way an Amplifier provider module can prove it will carry a
+#: native `computer` tool type to the wire, newest-vendor-last. A table, not a
+#: chain of `or`s, for one reason: when the answer is False the caller can name
+#: every integration point it actually tried (see `_wrap_provider`'s log line).
+#: A silent "unsupported" that does not say what it looked for is how a
+#: downgrade hides.
+#:
+#: NOTE these are NOT vendor wire formats - those live in one place,
+#: `tool-computer-use`'s `providers.py`. These are the *plumbing* names of
+#: amplifier provider modules (`_derive_native_tool_betas`,
+#: `_convert_tools_from_request`), which is a different axis that merely
+#: correlates 1:1 with vendors while there are exactly two. This module cannot
+#: import that table anyway: `hook-computer-use` declares `dependencies = []`
+#: and is separately installable, by design.
+_NATIVE_WIRE_PROBES: tuple[tuple[str, Any], ...] = (
+    (
+        "_derive_native_tool_betas (dated computer_YYYYMMDD types)",
+        _provider_derives_native_tool_betas,
+    ),
+    (
+        "_convert_tools_from_request (bare `computer` type)",
+        _provider_recognizes_bare_computer_tool,
+    ),
+)
+
+
+def _native_wire_probe_names() -> str:
+    return "; ".join(label for label, _ in _NATIVE_WIRE_PROBES)
+
+
 def _provider_supports_native_computer_tool(
     provider: Any, tool_type: str = _DEFAULT_PROBE_TOOL_TYPE
 ) -> bool:
@@ -270,9 +300,17 @@ def _provider_supports_native_computer_tool(
     `_fail_if_orchestrator_native_tool_spec_unsupported`, which does not have
     this ambiguity (see that function's docstring).
     """
-    return _provider_derives_native_tool_betas(
-        provider, tool_type
-    ) or _provider_recognizes_bare_computer_tool(provider, tool_type)
+    for label, probe in _NATIVE_WIRE_PROBES:
+        if probe(provider, tool_type):
+            logger.debug(
+                "computer-use: provider %s carries native tool type %r "
+                "(confirmed by %s)",
+                type(provider).__name__,
+                tool_type,
+                label,
+            )
+            return True
+    return False
 
 
 def _resolve_native_tool_type(coordinator: Any) -> str:
@@ -619,12 +657,14 @@ def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
     if not _provider_supports_native_computer_tool(provider, tool_type):
         logger.info(
             "computer-use: provider %s (%s) does not carry native tool type "
-            "%r to the wire (checked via its own real tool-conversion "
-            "behavior - see _provider_supports_native_computer_tool); native "
-            "tool not enabled",
+            "%r to the wire; native tool not enabled. Integration points "
+            "actually driven, all negative: %s (see "
+            "_provider_supports_native_computer_tool - this is a real "
+            "behavioural probe of the installed code, never a name check)",
             type(provider).__name__,
             type(provider).__module__,
             tool_type,
+            _native_wire_probe_names(),
         )
         return False
     # Fail loud (see ComputerUseHookIncompatibleProviderError) BEFORE wrapping, not

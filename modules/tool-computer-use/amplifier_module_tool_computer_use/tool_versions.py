@@ -1,20 +1,27 @@
-"""Model <-> Anthropic computer-use tool-type compatibility.
+"""Model <-> computer-use tool-type RESOLUTION POLICY.
 
-Anthropic's server-side computer-use tool type (`computer_20250124`,
-`computer_20251124`, ...) is versioned per model generation. Declaring the wrong
-`type` for the model that actually receives the request is rejected by the API
-with a 400 - on *every single turn*, not as a transient failure. This module is
-the fix for that defect: `ComputerTool` used to hardcode a single default
-version (`computer_20251124`) regardless of which model was in use, which 400s
-every request the moment a session's model differs from whatever that hardcoded
-default happened to match - most commonly via `provider-anthropic`'s own
-model-fallback (Haiku/Sonnet fallback chains), which silently switches models
-mid-session with no signal to this module.
+The vendor data this module resolves *over* is not here - it lives in
+`providers.py`, one row per dialect, next to the wire format that row implies
+(this module used to hold that table itself, mixing Anthropic's versioned
+`computer_YYYYMMDD` types with OpenAI's bare `computer` in one flat dict, with
+no way to tell which vendor a row belonged to). What lives here is the policy:
+*when* to resolve, *which* source wins, and *whether* an unresolvable pairing
+is allowed to raise.
+
+Why any of this exists: Anthropic's server-side computer-use tool type is
+versioned per model generation. Declaring the wrong `type` for the model that
+actually receives the request is rejected by the API with a 400 - on *every
+single turn*, not as a transient failure. `ComputerTool` used to hardcode a
+single default version (`computer_20251124`) regardless of which model was in
+use, which 400s every request the moment a session's model differs from
+whatever that hardcoded default happened to match - most commonly via
+`provider-anthropic`'s own model-fallback (Haiku/Sonnet fallback chains), which
+silently switches models mid-session with no signal to this module.
 
 Evidence, not a guess
 ----------------------
-The table below is built from a live verification against the real Anthropic
-API (2026-08), not inferred from model-naming conventions:
+`providers.py`'s per-dialect `models` tables are built from live verification
+against the real APIs (2026-08), not inferred from model-naming conventions:
 
     model                          tool_version         result
     claude-sonnet-4-5-20250929     computer_20250124    ACCEPTED (native tool_use)
@@ -23,12 +30,13 @@ API (2026-08), not inferred from model-naming conventions:
     claude-sonnet-5                computer_20251124    ACCEPTED (native tool_use)
     claude-opus-5                  computer_20250124    REJECTED (400)
     claude-opus-5                  computer_20251124    ACCEPTED (native tool_use)
+    gpt-5.5                        computer             ACCEPTED (native computer_call)
 
-Deliberately NOT exhaustive: a model absent from this table is *unverified*,
+Deliberately NOT exhaustive: a model absent from those tables is *unverified*,
 not unsupported. `resolve_tool_version`/`require_static_pairing` never invent a
-compatibility guess for it - see their docstrings. Extend this table only from
-another verified 200/400 pair against the real API, never from inference about
-naming conventions.
+compatibility guess for it - see their docstrings. Extend a dialect's `models`
+only from another verified 200/400 pair against the real API, never from
+inference about naming conventions.
 
 Two resolution points, two different failure postures
 -------------------------------------------------------
@@ -53,6 +61,8 @@ from __future__ import annotations
 
 import logging
 
+from .providers import beta_headers, model_tool_types
+
 logger = logging.getLogger(__name__)
 
 
@@ -64,38 +74,15 @@ class ToolVersionError(RuntimeError):
     """
 
 
-#: `anthropic-beta` header required to opt into each native tool type.
-BETA_HEADER_FOR_VERSION: dict[str, str] = {
-    "computer_20251124": "computer-use-2025-11-24",
-    "computer_20250124": "computer-use-2025-01-24",
-    "computer_20241022": "computer-use-2024-10-22",
-}
+#: Header required to opt into each native tool type, assembled from every
+#: dialect's own `beta_headers` (`providers.py`). Anthropic contributes all of
+#: today's entries; OpenAI has no such concept and contributes none.
+BETA_HEADER_FOR_VERSION: dict[str, str] = beta_headers()
 
-#: Verified model -> required tool_version pairs. See module docstring.
-KNOWN_MODEL_TOOL_VERSIONS: dict[str, str] = {
-    # Keyed on the UNDATED generation prefix, not the dated id the evidence was
-    # captured against (`claude-sonnet-4-5-20250929`). `required_for_model`
-    # matches `model.startswith(known)`, so a dated key can only ever match the
-    # exact dated id - the plain alias `claude-sonnet-4-5`, which is what a
-    # provider commonly reports, fell through to FALLBACK_TOOL_VERSION
-    # (`computer_20251124`) and 400'd every request. Found by the evaluation
-    # harness on its first real run, against a DTU whose provider reported the
-    # undated alias. The undated prefix covers both forms.
-    "claude-sonnet-4-5": "computer_20250124",
-    "claude-sonnet-5": "computer_20251124",
-    "claude-opus-5": "computer_20251124",
-    # OpenAI's Responses API native `computer` tool type is bare - no date,
-    # no version suffix (unlike Anthropic's per-generation `computer_YYYYMMDD`
-    # scheme above; see amplifier-module-provider-openai's own
-    # `_convert_tools_from_request`, which accepts ONLY `{"type": "computer"}`
-    # verbatim - any other field 400s "Unknown parameter"). Verified live
-    # end-to-end through this bundle against gpt-5.5 (2026-08-03): a real
-    # `computer_call` batch (`{"actions": [{"type": "screenshot"}]}`) against
-    # a real remote desktop, correctly returned a `computer_call_output` the
-    # model then read and reasoned over (reported the on-screen clock
-    # changing between two screenshots taken 15s apart).
-    "gpt-5.5": "computer",
-}
+#: Verified model -> required tool_version pairs, assembled from every
+#: dialect's own `models` table (`providers.py`). Iteration order follows
+#: `providers.DIALECTS`, which `required_for_model`'s prefix scan depends on.
+KNOWN_MODEL_TOOL_VERSIONS: dict[str, str] = model_tool_types()
 
 #: Used only when neither an explicit `tool_version` config value nor any
 #: resolvable model is available anywhere (mount-time static config carried
