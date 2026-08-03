@@ -246,3 +246,27 @@ yet closed:
   contention, and far cheaper. Computer-use is for native apps, OS dialogs, and
   black-box GUIs. The tell: if you are about to read pixels to find a button
   that has a DOM node, the wrong tool is in hand.
+
+## macOS `type_text` silently no-ops while returning success (found 2026-08-03)
+
+Live run, Mac **unlocked**, presence guard confirmed the screen state. The model
+executed `key` (cmd+space) successfully — Spotlight opened, verified by
+screenshot — then `type` returned `success: true` and **nothing was entered**.
+
+This is NOT the lock defect (screen was unlocked and capture returned real
+desktop content). `key` works and `type_text` does not, which localizes it:
+
+- `key` path — proven working. My own probe: `osascript` System Events
+  `keystroke " " using command down` → Spotlight opened, screen hash changed.
+- `type_text` path — reports success, produces nothing.
+
+The model's own read, worth checking first: *"the type path posting events to a
+specific app rather than the system-wide event tap."*
+
+Same class as every other defect this bundle keeps surfacing: **a write that
+fails while reporting success.** The lock guard now catches the locked-session
+case; this is a second, independent instance of the same shape and the
+`no fallbacks / fail loud` rule says it must not report success.
+
+Blocks: end-to-end `type` proof on macOS through the bundle. `key`-only flows
+are unaffected.
