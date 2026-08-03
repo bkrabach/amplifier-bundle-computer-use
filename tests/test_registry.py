@@ -84,6 +84,41 @@ def test_select_backend_raises_with_every_reason_when_none_available():
     ]
 
 
+def test_no_backend_available_message_tells_a_human_what_to_do_next():
+    """Mount-time refusal must be operator-actionable, not just a fact.
+
+    `NoBackendAvailable.__str__` used to stop at WHAT happened and WHY (each
+    candidate's own probe reason) - the exact per-backend detail this test
+    still checks for above - with nothing telling a human what to actually do
+    about it. Fail-loud-to-the-system (refusing to mount) and fail-loud-to-
+    the-human-who-has-to-act-on-it (telling them what to do next) are
+    different properties; this proves the second one is now built too.
+    """
+    a = _make("a", available=False)
+    b = _make("b", available=False)
+
+    with pytest.raises(NoBackendAvailable) as excinfo:
+        select_backend({}, factories=(a, b))
+
+    message = str(excinfo.value)
+    assert "what to do" in message.lower()
+    # The remote-target escape hatch is a real, always-available alternative -
+    # a human reading this message must be told it exists, not left to
+    # discover it by reading select_backend's own docstring.
+    assert "config.target" in message
+
+
+def test_no_backend_available_message_is_actionable_with_zero_attempts():
+    """The `attempts == []` branch (registry misconfigured, not an environment
+    problem) must also tell a human what kind of problem this is - a config/
+    packaging bug, not something they can fix on their own machine."""
+    with pytest.raises(NoBackendAvailable) as excinfo:
+        select_backend({}, factories=())
+
+    message = str(excinfo.value)
+    assert "what to do" in message.lower()
+
+
 def test_select_backend_survives_a_probe_that_raises():
     """D1's whole point: a broken backend must not break selection of the *next*
     candidate, and must never propagate an exception out of mount()."""

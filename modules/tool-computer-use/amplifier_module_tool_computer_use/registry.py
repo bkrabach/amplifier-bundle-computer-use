@@ -22,16 +22,52 @@ from .windows import WindowsBackend
 logger = logging.getLogger(__name__)
 
 
+#: Appended to `NoBackendAvailable`'s message - the "what to do next" a bare
+#: exception type name and a per-backend reason string do not supply on their
+#: own. `mount()` (`tool-computer-use/__init__.py`) logs this whole message via
+#: `logger.warning` and echoes it into the mounted-module manifest's
+#: `description` field, so this text - not a traceback - is what an operator
+#: actually sees when computer-use silently isn't there. Deliberately generic
+#: (not per-backend) because `attempts` already carries the specific reason for
+#: each candidate that was actually tried; this is the part that reason text
+#: cannot supply on its own - the remediation options that apply regardless of
+#: which specific backend failed and why.
+_REMEDIATION = (
+    "What to do: fix the backend that applies to this machine (see its reason "
+    "above - e.g. a missing dependency, no DISPLAY/XAUTHORITY, powershell.exe "
+    "unreachable, or a missing macOS Accessibility/Screen Recording grant), or "
+    "set config.target='ssh://user@host' to drive a different, reachable "
+    "machine instead. See CONTRIBUTING.md for per-platform backend "
+    "requirements."
+)
+
+
 class NoBackendAvailable(RuntimeError):
-    """No configured backend could serve this machine."""
+    """No configured backend could serve this machine.
+
+    This is the actual operator-facing message a human sees when computer-use
+    refuses to mount - not a bare exception type name. Three parts, in order:
+    WHAT happened (no backend available), WHY (every candidate's own probe
+    reason - `attempts` - so a real X11 connection failure is never confused
+    with a missing dependency), and WHAT TO DO about it (`_REMEDIATION`).
+    Fail-loud-to-the-system (refusing to mount a tool that cannot work) and
+    fail-loud-to-the-human-who-has-to-act-on-it (telling them what to actually
+    do) are different properties; this exists so both are built, not just the
+    first.
+    """
 
     def __init__(self, attempts: list[tuple[str, str]]) -> None:
         self.attempts = attempts
         if attempts:
             detail = "; ".join(f"{name}: {reason}" for name, reason in attempts)
-            message = f"no computer-use backend available ({detail})"
+            message = f"no computer-use backend available ({detail}). {_REMEDIATION}"
         else:
-            message = "no computer-use backends configured"
+            message = (
+                "no computer-use backends configured (registry.BACKEND_FACTORIES "
+                "is empty). What to do: this is a packaging/config bug, not a "
+                "normal environment problem - file an issue against "
+                "amplifier-bundle-computer-use."
+            )
         super().__init__(message)
 
 

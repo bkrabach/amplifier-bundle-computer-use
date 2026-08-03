@@ -450,6 +450,36 @@ def test_wrap_provider_skips_quietly_for_provider_predating_pr58():
     assert not getattr(provider, hook_mod._WRAPPED_FLAG, False)
 
 
+def test_capability_probe_rejection_is_operator_actionable(caplog):
+    """The capability-probe rejection (`_provider_supports_native_computer_tool`
+    returning False in `_wrap_provider`) is a real, silent capability gap for
+    this session - 'computer' just quietly runs as a plain function tool - and
+    it used to be logged at INFO, a level routinely filtered out of default
+    log verbosity. This is fail-loud-to-the-system without being fail-loud-to-
+    the-human: refusing to promote the tool is the right call, but nothing
+    told an operator it happened, why, or what to do about it.
+
+    Proves three things about the log line this path now produces: it is
+    loud enough to see by default (WARNING, not INFO), it is honest about the
+    ambiguity `_provider_supports_native_computer_tool`'s own docstring
+    describes (a negative result cannot distinguish "wrong vendor" from "right
+    vendor, old build"), and it tells a human what to do about each case.
+    """
+    coord = _FakeCoordinatorWithOrchestrator(orchestrator=None)
+    provider = _ProviderPredatingPR79()
+
+    with caplog.at_level("WARNING", logger=hook_mod.__name__):
+        wrapped = hook_mod._wrap_provider(provider, coord, max_inline=3)
+
+    assert wrapped is False
+    records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert records, "capability-probe rejection must be visible at WARNING, not INFO"
+    message = records[0].getMessage()
+    assert "does not carry native tool type" not in message  # old, INFO-only wording
+    assert "NOT enabled" in message
+    assert "what to do" in message.lower()
+
+
 def test_wrap_provider_wraps_openai_shaped_provider():
     """Regression guard for the whole point of this change: an OpenAI-shaped
     provider with working bare-computer-tool passthrough gets wrapped, exactly

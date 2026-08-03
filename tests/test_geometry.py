@@ -13,7 +13,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
 
+import pytest
 from amplifier_module_tool_computer_use.geometry import (
+    CoordinateOutOfRangeError,
     Display,
     ImageSpace,
     compute_display,
@@ -164,13 +166,78 @@ def test_to_screen_clamps_within_negative_origin_monitor_bounds():
         origin_x=5786,
         origin_y=-2163,
     )
-    # Wildly out-of-range model coords must clamp to THIS monitor's real bounds,
-    # not to (0, 0) or to the positive quadrant - a naive `max(0, ...)` clamp
-    # (correct for an origin of 0) would be wrong here.
-    sx, sy = disp.to_screen(-999, -999)
+    # A legitimate at-the-edge model coordinate (the dimension itself, one past
+    # the last 0-indexed pixel - see test_to_screen_scales_and_clamps) must clamp
+    # to THIS monitor's real bounds, not to (0, 0) or to the positive quadrant -
+    # a naive `max(0, ...)` clamp (correct for an origin of 0) would be wrong
+    # here. This used to be exercised with wildly out-of-range inputs
+    # (-999/999999); those now raise CoordinateOutOfRangeError (see
+    # test_to_screen_raises_on_wildly_out_of_range_coordinate) - a real
+    # negative-origin monitor's own bounds are exercised here instead, at the
+    # legitimate edge.
+    sx, sy = disp.to_screen(0, 0)
     assert (sx, sy) == (5786, -2163)
-    sx, sy = disp.to_screen(999999, 999999)
+    sx, sy = disp.to_screen(1280, 720)
     assert (sx, sy) == (5786 + 3840 - 1, -2163 + 2160 - 1)
+
+
+# -- Display.to_screen: out-of-range MODEL coordinates must fail loud -----------
+#
+# `to_screen` used to clamp ANY model coordinate - however far outside the
+# model's own image bounds - to the nearest valid screen pixel, and the click
+# would then "succeed" against whatever it happened to land on. A model
+# coordinate hundreds of pixels outside the image it was shown is real evidence
+# of a mis-scaled screenshot, a stale monitor selection, or a provider
+# coordinate-space mismatch - not a rounding artifact to paper over.
+
+
+def test_to_screen_raises_on_wildly_out_of_range_coordinate():
+    disp = Display(
+        screen_width=3840, screen_height=2160, model_width=1280, model_height=720
+    )
+    with pytest.raises(CoordinateOutOfRangeError):
+        disp.to_screen(1680, 360)  # 400px past the 1280-wide model image
+    with pytest.raises(CoordinateOutOfRangeError):
+        disp.to_screen(640, -999)  # wildly negative, not a rounding artifact
+    with pytest.raises(CoordinateOutOfRangeError):
+        disp.to_screen(999999, 999999)
+
+
+def test_to_screen_tolerates_the_dimension_itself_as_the_edge():
+    """The single most common off-by-one a model makes: emitting the image's
+    own width/height (one past the last valid 0-indexed pixel) instead of
+    width-1/height-1. This must keep clamping, not raise - it is the exact
+    case `test_to_screen_scales_and_clamps` already locks in."""
+    disp = Display(
+        screen_width=3840, screen_height=2160, model_width=1280, model_height=720
+    )
+    sx, sy = disp.to_screen(1280, 720)
+    assert (sx, sy) == (disp.screen_width - 1, disp.screen_height - 1)
+
+
+def test_to_screen_tolerates_small_rounding_overshoot_past_the_edge():
+    """One pixel past the dimension itself is still within the documented
+    edge tolerance (`_EDGE_TOLERANCE_PX=2`, one of which the dimension-as-
+    edge case above already spends) - sub-pixel rounding differences across
+    provider dialects, not a real out-of-range error."""
+    disp = Display(
+        screen_width=3840, screen_height=2160, model_width=1280, model_height=720
+    )
+    sx, sy = disp.to_screen(1281, 721)  # 1px past width/height - still tolerated
+    assert (sx, sy) == (disp.screen_width - 1, disp.screen_height - 1)
+
+
+def test_to_screen_raises_just_past_the_edge_tolerance():
+    """One pixel beyond the documented tolerance must raise - proves the
+    boundary is exactly where it is documented to be, not a looser 'close
+    enough' heuristic."""
+    disp = Display(
+        screen_width=3840, screen_height=2160, model_width=1280, model_height=720
+    )
+    with pytest.raises(CoordinateOutOfRangeError):
+        disp.to_screen(1282, 360)  # 1px past the tolerated 1281
+    with pytest.raises(CoordinateOutOfRangeError):
+        disp.to_screen(640, -3)  # 1px past the tolerated -2 on the low edge
 
 
 def test_to_model_round_trips_through_negative_origin():

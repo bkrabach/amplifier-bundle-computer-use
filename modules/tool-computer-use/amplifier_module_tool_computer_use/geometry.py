@@ -16,6 +16,51 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+class CoordinateOutOfRangeError(ValueError):
+    """Raised by `Display.to_screen` when a MODEL-space coordinate lies well
+    outside the screenshot the model was actually shown.
+
+    `to_screen` used to clamp ANY coordinate - no matter how far outside the
+    model's own image bounds - to the nearest valid screen pixel, and the
+    action would then report success against whatever it happened to land
+    on. A model coordinate hundreds of pixels outside the image it was shown
+    is not a rounding artifact at an edge; it is real evidence of a
+    mis-scaled screenshot, a stale monitor selection, or a provider
+    coordinate-space mismatch - and silently clicking the nearest edge
+    instead of surfacing that is exactly the kind of silent degradation this
+    bundle otherwise refuses to allow (see
+    `ComputerUseHookIncompatibleProviderError`,
+    `ComputerUseNativeToolPassthroughUnsupportedError` in hook-computer-use).
+
+    Coordinates within `_EDGE_TOLERANCE_PX` of the image bounds are still
+    clamped, not raised - see that constant's docstring for why that band is
+    legitimate. This is a `ValueError` subclass so it is caught by every
+    existing `except (BackendError, ValueError)` handler in `ComputerTool._run`
+    /`execute` without any change to that dispatch code, and reaches the model
+    as an ordinary tool error it can react to (e.g. by requesting a fresh
+    screenshot) rather than as a click that silently landed on the wrong
+    target.
+    """
+
+
+#: How far a MODEL-space coordinate may lie beyond the screenshot's own bounds
+#: before `to_screen` treats it as a real error rather than a rounding/off-by-
+#: one artifact. Judgement call, not evidence: `model_width`/`model_height`
+#: THEMSELVES (one past the last valid 0-indexed pixel, e.g. x=1280 on a
+#: 1280px-wide image) are always legitimate - that is the ordinary "used the
+#: dimension instead of dimension-1" pattern models routinely produce at a
+#: screen edge, and is exactly what `test_to_screen_scales_and_clamps` already
+#: locks in. A couple more pixels of slack absorb sub-pixel rounding
+#: differences across dialects (see `providers._normalize_gemini_action`'s
+#: float-not-int comment: Gemini's 0..999 grid over an image lands fractions
+#: of a pixel short of the true edge by construction, never past it - so this
+#: tolerance is generous with room to spare for that case, not tuned tightly
+#: to it). Anywhere past this band is not an edge - it is a different
+#: coordinate space entirely, and clamping it there would click the wrong
+#: target while reporting success.
+_EDGE_TOLERANCE_PX = 2
+
+
 @dataclass(frozen=True)
 class ImageSpace:
     """The pixel size of the screenshot the model was actually shown.
@@ -72,7 +117,29 @@ class Display:
         return self.scale_x
 
     def to_screen(self, x: float, y: float) -> tuple[int, int]:
-        """MODEL coords -> SCREEN coords, clamped to the desktop bounds."""
+        """MODEL coords -> SCREEN coords, clamped to the desktop bounds.
+
+        Raises `CoordinateOutOfRangeError` if `(x, y)` lies more than
+        `_EDGE_TOLERANCE_PX` outside the model image this `Display` was built
+        for - see that error's docstring for why a coordinate that far out is
+        a real error, not a rounding artifact to silently paper over.
+        """
+        lo_x, hi_x = -_EDGE_TOLERANCE_PX, self.model_width - 1 + _EDGE_TOLERANCE_PX
+        lo_y, hi_y = -_EDGE_TOLERANCE_PX, self.model_height - 1 + _EDGE_TOLERANCE_PX
+        if not (lo_x <= x <= hi_x):
+            raise CoordinateOutOfRangeError(
+                f"model x={x!r} is outside the {self.model_width}x{self.model_height} "
+                f"image the model was shown (valid x is {lo_x}..{hi_x} including the "
+                f"{_EDGE_TOLERANCE_PX}px edge tolerance) - refusing to clamp a click "
+                "onto the wrong target"
+            )
+        if not (lo_y <= y <= hi_y):
+            raise CoordinateOutOfRangeError(
+                f"model y={y!r} is outside the {self.model_width}x{self.model_height} "
+                f"image the model was shown (valid y is {lo_y}..{hi_y} including the "
+                f"{_EDGE_TOLERANCE_PX}px edge tolerance) - refusing to clamp a click "
+                "onto the wrong target"
+            )
         sx = round(x * self.scale_x) + self.origin_x
         sy = round(y * self.scale_y) + self.origin_y
         sx = max(self.origin_x, min(sx, self.origin_x + self.screen_width - 1))

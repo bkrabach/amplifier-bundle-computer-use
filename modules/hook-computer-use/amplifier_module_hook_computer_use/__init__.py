@@ -699,12 +699,28 @@ def _wrap_provider(provider: Any, coordinator: Any, max_inline: int) -> bool:
         return False
     tool_type = _resolve_native_tool_type(coordinator)
     if not _provider_supports_native_computer_tool(provider, tool_type):
-        logger.info(
-            "computer-use: provider %s (%s) does not carry native tool type "
-            "%r to the wire; native tool not enabled. Integration points "
-            "actually driven, all negative: %s (see "
-            "_provider_supports_native_computer_tool - this is a real "
-            "behavioural probe of the installed code, never a name check)",
+        # WARNING, not info: this is the operator-facing line for a real, silent
+        # capability gap - "native computer-use is NOT enabled this session" -
+        # and INFO is routinely filtered out of default log verbosity, which is
+        # exactly how this would otherwise go unnoticed. What/why/what-to-do,
+        # not just a behavioural-probe result: `_provider_supports_native_computer_tool`'s
+        # own docstring is explicit that a negative result cannot distinguish
+        # "not a supported vendor" from "a supported vendor whose installed
+        # build predates the fix" - so both possibilities, and what to do about
+        # each, are spelled out here rather than left for a human to infer from
+        # a list of probe names.
+        logger.warning(
+            "computer-use: provider %s (%s) does NOT carry native tool type %r "
+            "to the wire - native computer-use is NOT enabled this session; "
+            "'computer' will run as an ordinary function tool instead (weaker "
+            "targeting, no native screenshot handling). Integration points "
+            "actually driven, all negative: %s. What to do: if this provider is "
+            "Anthropic or OpenAI and you expected native support, upgrade it to "
+            "a build implementing the integration point named above (see "
+            "ComputerUseNativeToolPassthroughUnsupportedError's docstring for "
+            "the exact commits/PRs); if this provider was never meant to "
+            "support computer-use, this message is expected and no action is "
+            "needed.",
             type(provider).__name__,
             type(provider).__module__,
             tool_type,

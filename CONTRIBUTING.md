@@ -84,6 +84,25 @@ against a clean `Xvfb`, before cutting a release that touches the coexistence gu
 presence detector, or the input backends it depends on. See the script's own docstring
 for what evidence it produces and how to read the result.
 
+`scripts/wire_check.py` is the same kind of gate for the multi-provider wire-format
+anti-regression scheme (`docs/designs/multi-provider-design.md` §11.2, layer 3): it sends
+one minimal, real, declaration-only request per provider (the exact shape
+`providers.py`'s `Dialect.declare()` emits) and records the result in
+`tests/fixtures/wire-check.json`. It needs real credentials and the network, so it is
+**not** run in CI either:
+
+```bash
+ANTHROPIC_API_KEY=... OPENAI_API_KEY=... .venv/bin/python scripts/wire_check.py
+```
+
+Run it periodically (at least every `MAX_AGE_DAYS`, currently 30 —
+`tests/test_wire_attestation_freshness.py`) and before cutting a release that touches a
+provider dialect. Unlike the coexistence gate, staleness here **is** enforced in the
+normal offline test suite: `test_wire_attestation_freshness.py` fails the build if the
+attestation this script writes is missing, records a rejection, or has gone stale — see
+that module's docstring for why the attestation and its freshness check are deliberately
+two different files.
+
 ## Commit conventions
 
 This project uses [Conventional Commits](https://www.conventionalcommits.org/):
