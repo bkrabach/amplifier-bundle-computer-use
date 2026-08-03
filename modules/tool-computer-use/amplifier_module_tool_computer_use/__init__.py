@@ -1031,8 +1031,34 @@ class ComputerTool:
                     # screenshot transfer. Cheap locally too - `asyncio.to_thread`
                     # on a microsecond-scale X11/Quartz call costs a thread-pool
                     # round trip, not a network one.
+                    # THE ONE EDIT GEMINI FORCED OUTSIDE `providers.py`.
+                    # Anthropic and OpenAI both emit absolute pixels in the
+                    # screenshot's own space, so `read_call` was already a
+                    # complete translation for them. Gemini emits a normalized
+                    # 0..999 grid, and converting that needs the model image
+                    # size - a fact `read_actions` is not given and cannot
+                    # obtain (it takes only the payload, and the size is
+                    # per-session and mutable via `desktop.select_monitor`, so
+                    # it cannot be closed over when `DIALECTS` is built at
+                    # import time).
+                    #
+                    # Placed HERE, inside the same handler as `_run`, rather
+                    # than at the top of the loop: `self.display` can raise
+                    # `BackendError` when mount never resolved geometry, and
+                    # `_run` already reads it under exactly this handler. Any
+                    # earlier and an unmounted display would turn today's clean
+                    # "unknown action" ToolResult into an escaping exception.
+                    # Identity for both existing dialects, so their behaviour
+                    # is bit-for-bit unchanged - `providers._already_model_space`.
                     summary, image_b64 = await asyncio.to_thread(
-                        self._run, action, params
+                        self._run,
+                        action,
+                        dialect.to_model_space(
+                            action,
+                            params,
+                            self.display.model_width,
+                            self.display.model_height,
+                        ),
                     )
                 except HaltedError as exc:
                     return self._record_halt_result(action, exc)
