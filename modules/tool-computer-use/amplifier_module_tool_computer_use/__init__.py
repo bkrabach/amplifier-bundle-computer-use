@@ -236,6 +236,22 @@ class ComputerTool:
                     "no confirmation gate. This is a deliberate, logged opt-out, "
                     "not a default."
                 )
+        # `unattended_writes_ok` and `gate_writes` are two answers to the SAME
+        # policy question (\u00a710.4: "gate every write, or gate none") - not two
+        # independent mechanisms. The config knob itself lives in
+        # hook-computer-use (see that module's `mount()` docstring for why:
+        # it is the module that answers `ask_user`/EOF-avoidance too, so it
+        # owns the one place an operator sets it). `hook-computer-use`'s gate
+        # handler syncs the live value onto THIS attribute on every
+        # `tool:pre` call for `computer`/`desktop`, strictly before this
+        # tool's own `execute()` runs for that same call - so by the time
+        # `DesktopTool.execute()`'s fail-safe check reads it below, it
+        # reflects the exact same decision the hook already made, instead of
+        # silently re-deciding and contradicting it. Defaults False: with no
+        # gate hook mounted (or one that has not run yet), this stays False
+        # and the fail-safe denies - never a silent, un-authored escape
+        # hatch.
+        self._unattended_writes_ok: bool = False
         # Per-monitor targeting (see monitors.py): default is "primary", i.e. one
         # real monitor, not the virtual-desktop bounding box around all of them.
         # Set to monitors.VIRTUAL_DESKTOP to opt into the old whole-desktop
@@ -1382,15 +1398,42 @@ class DesktopTool:
                         f"{disp.model_width}x{disp.model_height}"
                     ),
                 )
-            if self._computer._gate_writes and action in MUTATING_DESKTOP:
+            if (
+                self._computer._gate_writes
+                and action in MUTATING_DESKTOP
+                and not self._computer._unattended_writes_ok
+            ):
+                # Fail-safe of last resort: reached only when NOTHING already
+                # granted this write - no gate hook synced
+                # `unattended_writes_ok=True` (config or interactive
+                # `ask_user` approval), and `gate_writes` was not explicitly
+                # turned off. Every remedy is named here, not just pointed
+                # at - a doc pointer alone has already shipped as an
+                # unreachable-in-the-moment reference three times in this
+                # repo.
                 return ToolResult(
                     success=False,
                     error={
                         "message": (
                             f"action {action!r} requires confirmation "
-                            "(gate_writes) but no gate hook is registered to "
-                            "grant it - see docs/designs/remote-transport.md "
-                            "\u00a710.4"
+                            "(gate_writes) and nothing granted it: no gate "
+                            "hook is registered (or none has run yet), "
+                            "'unattended_writes_ok' is not set, and "
+                            "'gate_writes' was not explicitly disabled. The "
+                            "write was NOT sent. To proceed, do ONE of: (1) "
+                            "mount hook-computer-use so its 'tool:pre' gate "
+                            "hook can grant approval (interactively via "
+                            "'ask_user', or unattended - see (2)); (2) set "
+                            "hook-computer-use config "
+                            "'unattended_writes_ok: true' to allow writes on "
+                            "this target with no human confirmation - a "
+                            "deliberate, logged opt-in, never a default; or "
+                            "(3) set tool-computer-use config "
+                            "'gate_writes: false' to disable the gate "
+                            "entirely for this target - a deliberate, "
+                            "logged opt-out. See "
+                            "docs/designs/remote-transport.md \u00a710.4 for "
+                            "the policy rationale."
                         )
                     },
                 )

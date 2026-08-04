@@ -418,7 +418,7 @@ aspirations. `behaviors/computer-use.yaml` ships a minimal subset.
 |---|---|---|
 | `max_inline_screenshots` | `3` | Most-recent screenshots kept inline; older ones collapse to text so a long session stays affordable |
 | `priority` | `50` | Hook registration priority |
-| `unattended_writes_ok` | `false` | See below. Explicit, logged, never inferred |
+| `unattended_writes_ok` | `false` | See below. Explicit, logged, never inferred. Also satisfies `tool-computer-use`'s `gate_writes` for `focus_window`/`set_clipboard` — see §7 |
 
 ---
 
@@ -468,6 +468,19 @@ backend.
 It is not a convenience toggle to make prompts go away. If you are running interactively
 and finding the prompts tedious, you want `read_only: true` (look, don't touch) or
 `gate_writes: false` (also logged at WARNING) — not this.
+
+**`unattended_writes_ok` and `gate_writes` are two answers to the same policy question,
+not two independent gates.** `gate_writes` (`tool-computer-use`'s config) decides *whether*
+a mutating desktop action (`focus_window`, `set_clipboard`) needs approval at all;
+`unattended_writes_ok` (this hook's config, above) is *how* that approval can be granted
+when nobody is at a terminal to answer a prompt. This hook syncs its live
+`unattended_writes_ok` value onto the mounted `ComputerTool` on every call, so
+`tool-computer-use`'s own fail-safe check agrees with this hook's decision instead of
+silently re-denying an action this hook already approved. Concretely: set
+`unattended_writes_ok: true` here and `focus_window`/`set_clipboard` work on a gated
+remote target with no human confirmation — a deliberate, logged choice, not a default. Set
+nothing (no hook, no `unattended_writes_ok`, no explicit `gate_writes: false`) and those
+two actions stay refused, with the refusal message naming all three ways out.
 
 ### Presence guard and halt
 

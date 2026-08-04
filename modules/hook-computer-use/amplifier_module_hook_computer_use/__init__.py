@@ -873,6 +873,20 @@ def _make_gate_handler(coordinator: Any, unattended_writes_ok: bool = False):
     config) and never inferred from the environment - the gate itself is not
     weakened for the interactive case; this only changes what happens on the
     ONE path that used to crash instead of asking or denying.
+
+    This is also the ONE mechanism that keeps `unattended_writes_ok` and
+    `gate_writes` from being two write-gates that do not know about each
+    other: they are two answers to the same policy question
+    (`docs/designs/remote-transport.md` \u00a710.4), not independent
+    mechanisms. `ComputerTool`'s own fail-safe (`DesktopTool.execute()`,
+    tool-computer-use's `__init__.py`) needs to see the SAME decision this
+    handler makes, or it re-denies an action this handler already approved -
+    unreachable in exactly the case that shipped it (a remote `focus_window`
+    with `unattended_writes_ok: true` set). So on every call, before making
+    its own decision, this handler syncs the live value onto the
+    `ComputerTool` instance (`computer._unattended_writes_ok`) - always,
+    even when `gate_writes` is off or the action is a read, so the tool
+    never reads a stale value from an earlier, differently-configured call.
     """
 
     async def handler(event: str, data: dict[str, Any]) -> HookResult:
@@ -884,7 +898,14 @@ def _make_gate_handler(coordinator: Any, unattended_writes_ok: bool = False):
         except Exception:  # noqa: BLE001 - a lookup failure degrades to "no gate", never a crash
             return HookResult(action="continue")
         computer = tool if tool_name == "computer" else getattr(tool, "_computer", None)
-        if computer is None or not getattr(computer, "_gate_writes", False):
+        if computer is None:
+            return HookResult(action="continue")
+        # Sync BEFORE the early-return below, unconditionally: this handler is
+        # the single source of truth for `unattended_writes_ok`, and
+        # `DesktopTool.execute()`'s fail-safe check must always see this
+        # call's live value, not a value left behind by a previous one.
+        computer._unattended_writes_ok = unattended_writes_ok
+        if not getattr(computer, "_gate_writes", False):
             return HookResult(action="continue")
         action = (data.get("tool_input") or {}).get("action")
         if action not in _GATE_MUTATING_ACTIONS:

@@ -39,6 +39,16 @@ hooks:
       # Allow writes on a gated target with NO human confirmation, when no
       # interactive approval is possible (stdin is not a TTY). Deliberate,
       # always logged at WARNING, never a default. See docs/SETUP.md section 7.
+      #
+      # This and tool-computer-use's `gate_writes` are two answers to the
+      # SAME policy question, not two independent gates: `gate_writes`
+      # decides whether `focus_window`/`set_clipboard` need approval at all;
+      # this decides how that approval is granted with nobody at a
+      # terminal. Set this true and those two actions work on a gated
+      # remote target with no prompt. Leave both this and `gate_writes`
+      # at their defaults on a remote, non-read_only target and those two
+      # actions stay refused until one of: an interactive `ask_user`
+      # approval, this set true, or tool-computer-use's `gate_writes: false`.
       # unattended_writes_ok: true
 
 agents:
