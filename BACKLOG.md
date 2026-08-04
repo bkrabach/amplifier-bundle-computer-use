@@ -196,6 +196,76 @@ Evidence:
 
 ---
 
+## Platform coverage
+
+### Native Windows (no WSL2) — not supported, not started
+
+**Today a Windows target requires WSL2 on the Windows machine.** `WindowsBackend.probe()`
+returns `wslpath not on PATH (not running under WSL2?)` and nothing mounts
+(`windows.py:165-166`). The module's own first line is `"""WSL2 -> Windows desktop
+backend."""` For a *remote* Windows target this also means the SSH server must run **inside
+WSL** — connecting to Windows OpenSSH lands in a native shell with no `wslpath`.
+
+**This is not a config flag.** It needs a second bridge that drives Win32 directly instead
+of through WSL interop. Honest scope, from the actual code:
+
+- **`bridge.ps1` itself is reusable as-is.** It is pure Win32 P/Invoke via `Add-Type` and
+  has no WSL dependency in its logic — only in comments. The WSL assumption lives entirely
+  on the Python side.
+- **A `WindowsNativeBackend`, parallel to `WindowsBackend`.** The blocker is not the action
+  set; it is that `_translate()` (`windows.py:50`) shells out to `wslpath` to convert every
+  path across the boundary, and `_which_powershell()` (`windows.py:85`) exists to find
+  `powershell.exe` under a WSL automount root. On native Windows both are unnecessary and
+  both are wrong. Every path in `raw()` (`windows.py:214-216`) and `capture()`
+  (`windows.py:386`) goes through `_translate`.
+- **`overlay_windows.py` is affected too** — it imports `_translate`, `_which_powershell`,
+  and `BackendError` straight from `windows.py` (`overlay_windows.py:116`,
+  `:228`, `:382`). Whatever seam the native backend introduces, the overlay has to take it
+  as well, or the on-desktop indicator is native-Windows-only-broken.
+- **A new `registry.BACKEND_FACTORIES` entry**, ordered so the WSL2 backend still wins where
+  both could apply (a WSL2 controller must not start driving via a native path).
+- **Remote native Windows is a strictly larger job than local, and should be scoped
+  separately.** `ssh_transport.py` assumes a POSIX target throughout: `sh -lc` for the `uv`
+  probe (`:192-193`), `shlex.quote` everywhere, a tar stream over stdin, and
+  `uv run ... python3 -c <stub>` as the remote command (`:329-332`). Windows OpenSSH's
+  default shell satisfies none of that. Doing local-native first, and remote-native only
+  after, keeps these from being one undifferentiated change.
+- **Verification cost is the real cost.** `WindowsBackend` was itself a mechanical refactor
+  that could not be exercised when written (see its module docstring), and the Windows
+  *locked-session* case is still unverified on Windows hardware. A second Windows bridge
+  doubles the surface that needs a real Windows box to prove, and none of the existing 541
+  tests exercise a native-Windows path.
+
+Until this exists, the supported answer for a plain Windows box is: install WSL2 (with an
+SSH server inside it for remote use), or drive that machine from a different controller.
+
+### Wayland on Linux — unsupported and undetected
+
+`LinuxX11Backend.probe()` (`linux_x11.py:168-208`) checks `python-xlib`, `DISPLAY`, an X
+connection, and XTEST. **None of those distinguish X11 from XWayland**, and
+`_resolve_xauthority()` (`linux_x11.py:117`) explicitly includes
+`/run/user/<uid>/.mutter-Xwaylandauth` as a cookie candidate — so on a Wayland desktop
+running XWayland the probe can report **available** and the tools mount. What they reach is
+the XWayland server, not the compositor. **This bundle has never verified capture or input
+under XWayland and makes no claim about it.**
+
+Two separable pieces of work, smallest first:
+
+- **Detect and say so** (small): check `XDG_SESSION_TYPE` / `WAYLAND_DISPLAY` in `probe()`
+  and either refuse or emit a named, loud warning, instead of letting a reader discover it
+  by watching clicks go nowhere. No new capability — just honesty at mount, consistent with
+  how `python-xlib` and the exclusive-grab case are already handled.
+- **Actually support Wayland** (large, not scoped, and **not yet investigated against this
+  codebase**): Wayland has no XTEST equivalent, so this would be a separate backend — the
+  likely route is `xdg-desktop-portal` (`RemoteDesktop` / `ScreenCast`), which is
+  compositor-dependent and, as far as we know, requires an interactive per-session consent
+  dialog. That last point would be a poor fit for the unattended remote case this bundle is
+  built around, but it is an unverified assumption, not a measured finding — treat this
+  bullet as a direction to investigate, not a design. Note the prior art already surveyed
+  in this file's *Also relevant* section carries the identical X11-only constraint.
+
+---
+
 ## Performance
 
 - **Persistent PowerShell bridge.** Every Windows action spawns a fresh

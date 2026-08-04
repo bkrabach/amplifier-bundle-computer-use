@@ -1,8 +1,8 @@
 # amplifier-bundle-computer-use
 
-Give an Amplifier session real control of a **desktop** — Windows, macOS, or Linux,
-on this machine or another one across your private network — using the LLM provider's
-**native computer-use tool**, not a homegrown imitation of it.
+Give an Amplifier session real control of a **desktop** — Windows (**via WSL2**), macOS,
+or Linux (**X11**) — on this machine or another one across your private network, using the
+LLM provider's **native computer-use tool**, not a homegrown imitation of it.
 
 If a human could do it by looking at the screen and clicking, this can do it. No API, no
 CLI, no browser extension required.
@@ -18,9 +18,16 @@ CLI, no browser extension required.
 > **This is not the usual one-line, `--app`-level pointer at a behavior bundle.** It
 > drives a real desktop, so the install has four moving parts that live outside this
 > repository: a **version floor on three upstream modules**, a **model that supports
-> native computer use**, a **target machine with per-platform prerequisites** (WSL2
-> interop / macOS TCC grants / X11), and — for remote targets — **SSH key auth and
-> `uv` on the far end**.
+> native computer use**, a **target machine with per-platform prerequisites**, and — for
+> remote targets — **SSH key auth and `uv` on the far end**.
+>
+> **The per-platform prerequisites are hard requirements, not recommendations:**
+>
+> | Target | Requires |
+> |---|---|
+> | **Windows** | **WSL2.** A plain Windows host — including one reachable over Windows OpenSSH — is **not supported.** You SSH into the WSL2 side; every action crosses into Win32 via `powershell.exe` interop |
+> | **macOS** | **Two separate TCC grants** — Screen Recording (capture) *and* Accessibility (input). Neither is checked at mount; the tools appear and then fail on first use |
+> | **Linux** | **An X11 session.** Wayland is not supported, and not detected — under XWayland the probe can pass anyway |
 >
 > **[→ docs/SETUP.md](docs/SETUP.md)** has the exact checks, the proven-vs-rough
 > matrix, the full config reference, and the operational facts (a locked screen
@@ -189,14 +196,30 @@ typical bundle.** In brief:
   See `docs/SETUP.md` §1 for how the probe works.
 - **A model with `supports_native_computer_use`** — OpenAI: `minor >= 4`, not `-nano`.
   Anthropic: per-family version thresholds. §2 of the setup doc has the tables.
-- **A target machine** — local (WSL2+Windows / macOS / Linux X11) or remote over SSH.
-  Per-platform prerequisites differ: WSL interop, macOS **Screen Recording *and*
-  Accessibility** TCC grants (separately granted), X11 + `python-xlib`.
+- **A target machine** — local or remote over SSH — meeting its platform's **hard**
+  prerequisites. These are not optional, and two of the three are not caught at mount:
+  - **Windows: WSL2 is required.** There is no native-Windows code path. `windows.py` is a
+    *"WSL2 -> Windows desktop backend"*; every action crosses into Win32 via
+    `powershell.exe` interop. A plain Windows host — including one reachable over **Windows
+    OpenSSH** — is **not supported**; the probe reports `wslpath not on PATH (not running
+    under WSL2?)` and nothing mounts. For a remote Windows target, the SSH server must run
+    **inside WSL**. Tracked in `BACKLOG.md`.
+  - **macOS: two separate TCC grants** — **Screen Recording** (capture) *and*
+    **Accessibility** (input). Granting one does not grant the other, and **neither is
+    checked at mount** — the tools appear healthy and fail on first use.
+  - **Linux: an X11 session** + `python-xlib`. **Wayland is not supported, and not
+    detected** — the probe tests only `DISPLAY`/XTEST, which XWayland satisfies, so it can
+    report available on a Wayland desktop. Unverified territory; use real X11.
 - **For remote targets** — key-based SSH (`BatchMode=yes`; a passphrase-locked key will
-  not prompt, it will fail), a trusted host key, and `uv` or `python3` on the far end.
+  not prompt, it will fail), a trusted host key, and **`uv` on the far end** (mandatory —
+  the connection resolves `uv` before anything else and fails if it is absent). The
+  target's own per-platform prerequisites above still apply; SSH does not bypass them.
 - Pillow (installed with the tool module).
 
-No admin rights, no agent to install on the target, no extra service, no new listening port.
+**No agent installed on the target**, and no admin rights, extra service, or new listening
+port: our files ship down the SSH pipe and are removed at session end — nothing to update
+or uninstall. That is a claim about *our agent*, **not** a claim that the target needs no
+setup. It still needs everything listed above.
 
 ## Safety
 

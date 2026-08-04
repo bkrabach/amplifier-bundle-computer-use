@@ -9,8 +9,8 @@ that live outside this repository:
 |---|---|---|
 | 1 | **Upstream module versions** — `loop-streaming`, `provider-anthropic` / `provider-openai` | Bundle refuses to mount, or silently degrades to a weaker function tool |
 | 2 | **A model that supports native computer use** | Provider reports no capability; the tool is dead weight |
-| 3 | **A target machine, and its per-platform prerequisites** | Backend probe fails; tools never appear in the session |
-| 4 | **For remote targets: SSH, key auth, and `uv`/`python3` on the far end** | Connect-time error, or a Phase-2 `BackendError` on an unimplemented action |
+| 3 | **A target machine, and its per-platform prerequisites** — Windows **requires WSL2**; macOS requires **two** TCC grants; Linux requires **X11** (not Wayland) | Backend probe fails and tools never appear — or, on macOS and Linux, they appear and fail on first use |
+| 4 | **For remote targets: SSH, key auth, and `uv` on the far end** | Connect-time error, or a Phase-2 `BackendError` on an unimplemented action |
 
 Work through them in that order. Each section tells you the exact check to run. **But
 first, register the bundle at all** — none of the above matters until Amplifier knows
@@ -211,12 +211,34 @@ tools:
 Each backend's `probe()` is cheap and never raises — it reports a reason. That reason is
 what you will see in the log when the tools do not appear.
 
-### Windows (from WSL2)
+**Read your platform's hard requirement first.** Only one of the three is caught at mount
+time; the other two let the tools mount and then fail on first use.
 
-| Requirement | Probe check |
-|---|---|
-| Running under WSL2 | `wslpath` on `PATH` |
-| WSL↔Windows interop enabled (default in WSL2) | `powershell.exe` resolvable |
+| Platform | Hard requirement | Enforced at mount? |
+|---|---|---|
+| Windows | **WSL2 on the Windows machine.** Native Windows is **not supported** | **Yes** — probe fails, nothing mounts |
+| macOS | **Two separate TCC grants** — Screen Recording *and* Accessibility | **No** — mounts with neither; fails on first capture / first input |
+| Linux | **An X11 session.** Wayland is not supported | **No** — and there is no Wayland check at all. See below |
+
+### Windows — WSL2 is required. A plain Windows host is not supported.
+
+> **You do not drive Windows directly. You drive it *from WSL2*, across the interop
+> boundary.** `windows.py`'s own first line is `"""WSL2 -> Windows desktop backend."""`
+> Every action crosses into Win32 through `powershell.exe` + `bridge.ps1`. There is **no
+> native-Windows code path in this bundle.**
+>
+> A Windows machine without WSL2 — including one reachable over **Windows OpenSSH** —
+> **cannot be a target today.** This is a missing implementation, not a config flag; it is
+> tracked in `BACKLOG.md` under *Native Windows (no WSL2)*.
+
+| Requirement | Probe check | Exact failure text |
+|---|---|---|
+| Running under WSL2 | `wslpath` on `PATH` | `wslpath not on PATH (not running under WSL2?)` |
+| WSL↔Windows interop enabled (on by default in WSL2) | `powershell.exe` resolvable | `powershell.exe not found (tried: ...); WSL<->Windows interop must be enabled (on by default in WSL2), or set tool config 'powershell_path'` |
+
+If you are on a normal Windows box and see `wslpath not on PATH`, nothing is misconfigured
+— you have hit the boundary of what is built. Install WSL2 (and, for remote use, an SSH
+server *inside* WSL — see §5), or drive that machine from a different controller.
 
 `powershell.exe` is resolved **without depending on `PATH`** — a non-login SSH shell's
 `PATH` does not include `/mnt/c/...`. Override with tool config `powershell_path`.
@@ -224,20 +246,31 @@ what you will see in the log when the tools do not appear.
 Every action spawns a fresh `powershell.exe` running `bridge.ps1` (Win32 P/Invoke via
 `Add-Type`). This is a known latency cost, tracked in `BACKLOG.md` under Performance.
 
-### macOS
+### macOS — both TCC grants are required, and neither is checked at mount
 
-| Requirement | Where enforced |
-|---|---|
-| `sys.platform == "darwin"` | `probe()` |
-| `pyobjc-framework-Quartz` importable | `probe()` — installed by the tool module's `sys_platform == 'darwin'` marker |
-| At least one active display (`CGGetActiveDisplayList`) | `probe()` — zero means asleep screen, or clamshell with no external display |
-| **Screen Recording** TCC grant | Lazy, on capture. Missing → `CGDisplayCreateImage` returns `None`, reported as a named error |
-| **Accessibility** TCC grant | Lazy, on input. Checked via `AXIsProcessTrusted()` over ctypes |
+> **A successful mount tells you nothing about whether either permission exists.**
+> `probe()` checks three things only: `sys.platform == "darwin"`, that Quartz imports, and
+> that at least one display is active. **Both TCC grants are checked lazily, on first
+> use** — so `computer` and `desktop` will appear in your session, look healthy, and then
+> fail on the first screenshot or the first click.
 
-Screen Recording and Accessibility are **separately granted**. A process can capture the
-screen perfectly while every click and keystroke is silently discarded. Grant both:
-System Settings → Privacy & Security → Screen Recording / Accessibility, for the process
-actually running this code.
+| Requirement | Where enforced | Exact failure text |
+|---|---|---|
+| `sys.platform == "darwin"` | `probe()` | `not macOS (sys.platform='linux')` |
+| `pyobjc-framework-Quartz` importable | `probe()` — installed by the tool module's `sys_platform == 'darwin'` marker | `pyobjc-framework-Quartz is not importable (...); install it to enable the macOS backend` |
+| At least one active display | `probe()` | `zero active displays (screen may be asleep, or this is a clamshell-closed Mac with no external display attached)` |
+| **Screen Recording** TCC grant | **Lazy, on first capture** | `CGDisplayCreateImage(N) returned no image: Screen Recording permission is NOT granted to this process (CGPreflightScreenCaptureAccess() == False)` |
+| **Accessibility** TCC grant | **Lazy, on first input** | `Accessibility permission not granted: this process is not trusted to control the computer (AXIsProcessTrusted() == False)` |
+
+Screen Recording and Accessibility are **two separate grants**, in two separate panes, and
+granting one does not grant the other. A process can capture the screen perfectly while
+every click and keystroke is silently discarded by WindowServer with no exception raised —
+which is exactly why the Accessibility check exists rather than letting input no-op.
+
+Grant both, before your first run: System Settings → Privacy & Security → **Screen
+Recording**, and again under **Accessibility**, for the process actually running this code
+(Terminal, the sshd-launched login shell, or the `python` binary itself — whichever the
+Privacy pane lists after the first attempted action).
 
 > **Do not run two agent processes against the same macOS target.** Two concurrent agents
 > corrupt each other's Screen Recording grant: `CGDisplayCreateImage` then returns `None`
@@ -245,15 +278,46 @@ actually running this code.
 > no exception on either side. The transport is refcounted and shared per
 > `(ssh_path, host)` specifically to prevent this; do not route around it.
 
-### Linux / X11
+### Linux — X11 only. Wayland is not supported, and not detected.
 
-| Requirement | Probe check |
-|---|---|
-| `python-xlib` installed **in the running interpreter** | Reported *as a missing dependency* — this used to surface as "'NoneType' object has no attribute 'Display'", which reads like an X connection fault and sends you looking at `DISPLAY`/`xhost` instead of at `pip install python-xlib` |
-| `DISPLAY` set | `probe()` |
-| X server connectable, XTEST present | `probe()` |
+> **This backend speaks X11 and nothing else.** Its name is `linux-x11`; there is no
+> Wayland backend in `registry.BACKEND_FACTORIES`.
+>
+> **The probe has no Wayland check.** It tests `DISPLAY`, an X connection, and XTEST — all
+> three of which XWayland satisfies. On a Wayland desktop running XWayland, `probe()` can
+> therefore report **available** and the tools will mount. What that reaches is the
+> XWayland server, not the Wayland compositor. This bundle has **never verified input or
+> capture under XWayland**, and makes no claim about it. Use a real X11 session.
 
-`XAUTHORITY` is resolved and set if absent.
+| Requirement | Probe check | Exact failure text |
+|---|---|---|
+| `python-xlib` installed **in the running interpreter** | `probe()` | `python-xlib is not installed in the running interpreter (...); this backend cannot drive X11 without it` |
+| `DISPLAY` set | `probe()` | `no DISPLAY set; no local X11 session to talk to` |
+| X server connectable | `probe()` | `cannot connect to X server ':0': ...` |
+| XTEST extension present | `probe()` | `X server does not support the XTEST extension` |
+
+The `python-xlib` message is deliberate: this used to surface as `'NoneType' object has no
+attribute 'Display'`, which reads like an X connection fault and sends you looking at
+`DISPLAY`/`xhost` instead of at the missing package.
+
+`XAUTHORITY` is resolved and set if absent (`~/.Xauthority`, then
+`/run/user/<uid>/gdm/Xauthority`, then `/run/user/<uid>/.mutter-Xwaylandauth`).
+
+**One more Linux requirement is also lazy, not probed:** no other X client may hold an
+exclusive pointer/keyboard grab. Capture and `mouse_move` work regardless, so failing the
+whole backend at mount would discard real capability — instead the first click/key/type
+raises:
+
+```
+discrete input (click/key/type_text/scroll/drag) cannot reach application windows on
+this X11 session: the root window's pointer and/or keyboard is already exclusively
+grabbed by another client (XGrabPointer=1, XGrabKeyboard=1; 0 means available, nonzero
+means already held elsewhere)
+```
+
+Most common cause, and verified on this backend's own reference machine:
+`gnome-remote-desktop` / mutter holding an exclusive grab for a headless virtual seat —
+independent of whether an RDP client is actually connected.
 
 ---
 
@@ -265,8 +329,10 @@ The claim is "if you can SSH to the box, you can drive its desktop." Concretely 
 |---|---|
 | **Key-based auth** | The transport runs `ssh -T -o BatchMode=yes`. `BatchMode` disables every interactive prompt — a passphrase-locked or password-only key **will fail to connect**, it will not prompt. |
 | **Host key already trusted** | `StrictHostKeyChecking=accept-new`. Never `no`. A host-key mismatch on a machine that types your passwords is refused. |
-| **`uv` or `python3` on the target** | `uv` is located by absolute path (`~/.local/bin/uv`, `/opt/homebrew/bin/uv`, `/usr/local/bin/uv`, then `which`) — never trusting `PATH`, because a non-login shell's `PATH` is not guaranteed. `uv run --with pillow --with python-xlib` provisions dependencies with no pre-existing venv and no pip. Falls back to bare `python3 -c`. |
-| **Nothing installed on the target** | The bundle's own files are tarred and pushed over the same stdin pipe as the protocol. No daemon, no new listening port, no agent to install. |
+| **`uv` on the target — mandatory** | `SshTransport.connect()` calls `_resolve_uv_command()` **unconditionally**, before anything else. If `uv` is not found the connection raises `SshConnectError: could not find 'uv' on <host> (tried: ['uv', '$HOME/.local/bin/uv', '/opt/homebrew/bin/uv', '/usr/local/bin/uv'])`. There is **no `python3`-only path** — the `python3 -c` branch (`with_pillow: false`) is reached only *after* `uv` has already been resolved. `uv` is located by absolute path, never trusting `PATH`, because a non-login SSH shell's `PATH` is not guaranteed. |
+| **`python3` on the target** | The remote agent is executed as `python3 -c <stub>` either way. |
+| **The target's own per-platform prerequisites still apply** | SSH does not bypass §4. The remote agent runs the same `registry.select_backend()` on the far end, so a remote Windows target still needs WSL2, a remote Mac still needs both TCC grants, a remote Linux box still needs X11. |
+| **No agent installed on the target** | The bundle's own files are tarred and pushed over the same stdin pipe as the protocol, and removed when the session ends. No daemon, no new listening port, nothing to update or uninstall. **This is a claim about our agent, not about your setup** — the target still needs the prerequisites in the rows above and in §4. |
 | **A network** | Tailscale/WireGuard is the tested arrangement; native `sshd` on port 22, no new port opened. |
 
 One persistent `ssh -T` subprocess per target, shared and refcounted across every consumer
@@ -285,12 +351,22 @@ Turning `read_only` off on a remote target therefore cannot silently produce "fu
 access, no gate" — the gate switches on in the same step unless you explicitly disable it,
 which is logged at WARNING.
 
-### WSL target reached over SSH
+### Windows target reached over SSH — you SSH into WSL, not into Windows
 
-A Windows target driven remotely means SSH → the WSL side → `powershell.exe` interop.
-`shutil.which("powershell.exe")` **fails** in that shell, because a non-login SSH shell's
-`PATH` does not contain `/mnt/c/...`. The absolute-path resolution in `windows.py` is
-load-bearing, not a wart. If you have a custom WSL mount root, set `powershell_path`.
+> **The SSH server must be running *inside WSL2* on the Windows machine.** A remote
+> Windows target is SSH → **the WSL2 side** → `powershell.exe` interop → Win32. Connecting
+> to **Windows OpenSSH** lands you in a native Windows shell where `wslpath` does not
+> exist, `probe()` returns `wslpath not on PATH (not running under WSL2?)`, and no tools
+> mount. See §4.
+
+So the full prerequisite list for a remote Windows desktop is: **WSL2 installed**, an
+**SSH server running inside WSL**, **WSL↔Windows interop enabled** (default), and **`uv`
+available to the SSH user**.
+
+Once you are on the WSL side, `shutil.which("powershell.exe")` still **fails**, because a
+non-login SSH shell's `PATH` does not contain `/mnt/c/...`. The absolute-path resolution
+in `windows.py` is load-bearing, not a wart. If you have a custom WSL mount root, set
+`powershell_path`.
 
 ### Remote action gaps
 
@@ -562,6 +638,10 @@ macOS is blocked. Windows and Linux `type` are unaffected.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `computer` / `desktop` tools absent, no error | No backend available. Mount catches `NoBackendAvailable`, logs the reason, mounts nothing | Read the log line — it lists every candidate's own probe reason plus remediation |
+| `wslpath not on PATH (not running under WSL2?)` | You are on native Windows, or SSH'd into **Windows OpenSSH** rather than into WSL | Not a misconfiguration — native Windows is unsupported. Install WSL2 and (for remote) run sshd inside it. §4 |
+| `could not find 'uv' on <host>` | `uv` missing on the remote target. It is **mandatory**, not optional | Install `uv` for the SSH user on the target. §5 |
+| Tools mount on macOS, then first screenshot or first click fails | Neither TCC grant is checked at mount — both are lazy | Grant Screen Recording **and** Accessibility. §4 |
+| Tools mount on a Wayland desktop, input does not behave | The probe has no Wayland check; it attached to XWayland | Use a real X11 session. §4 |
 | `tool-computer-use: NOT MOUNTING - invalid configuration` | Malformed `target` (e.g. `user@host` instead of `ssh://user@host`) | Fix the config. Logged at ERROR because it is a mistake someone can fix |
 | `ComputerUseNativeToolPassthroughUnsupportedError` at mount | `loop-streaming` predates PR #36 | Upgrade — the error names the exact commit |
 | `ComputerUseHookIncompatibleProviderError` | Provider gained a `stream()` method. The hook only wraps `complete()`, and the orchestrator prefers `stream()` whenever present — wrapping would silently do nothing | Refuses to operate rather than degrade invisibly. Wrap both, or use an orchestrator that does not prefer `stream()` |
