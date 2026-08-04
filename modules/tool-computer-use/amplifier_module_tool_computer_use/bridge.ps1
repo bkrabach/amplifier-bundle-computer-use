@@ -23,7 +23,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 
 public static class CU {
-    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
     [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, int data, IntPtr extra);
@@ -60,8 +60,6 @@ public static class CU {
     }
 }
 "@ -ReferencedAssemblies System.Drawing
-
-[void][CU]::SetProcessDPIAware()
 
 # ---- constants ---------------------------------------------------------------
 $MOUSE = @{ ldown = 0x02; lup = 0x04; rdown = 0x08; rup = 0x10; mdown = 0x20; mup = 0x40; wheel = 0x0800; hwheel = 0x1000 }
@@ -227,6 +225,30 @@ $CAPTURE_OR_WRITE_ACTIONS = @(
 # ---- dispatch ----------------------------------------------------------------
 $out = @{ ok = $true }
 try {
+  # Per-Monitor-v2 DPI awareness (Windows 10 1703+, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+  # = -4) MUST be set before any Screen/CopyFromScreen/cursor call below. The legacy,
+  # process-wide "system DPI aware" declaration this replaces (see git history) only
+  # covers the primary monitor's scale factor: on a real multi-monitor desktop where
+  # monitor's scaling (measured live on the four-monitor 4K box this bug was filed
+  # against - every physical 3840x2160 panel at 150% scaling reported as a
+  # DPI-VIRTUALIZED 2560x1440 by [System.Windows.Forms.Screen]::AllScreens), Windows
+  # DPI-virtualizes every monitor's bounds AND every CopyFromScreen/SetCursorPos/
+  # GetWindowRect coordinate to the primary's DPI. `Save-Screenshot` below then
+  # captures a squished/cropped fraction of the real monitor into a bitmap sized for
+  # the WRONG (virtualized, not physical) dimensions - the "monitor renders into a
+  # fraction of the frame" defect, and every subsequent click/move computed from
+  # those same virtualized bounds lands off-target on that monitor. Fails loud
+  # (never silently falls back to the DPI-broken legacy call) if per-monitor-v2
+  # awareness cannot be set: a build predating the Creators Update cannot guarantee
+  # correct multi-monitor capture or input, and this bundle refuses to serve a
+  # capture it cannot guarantee is correct rather than return a misleading one.
+  if (-not [CU]::SetProcessDpiAwarenessContext([IntPtr]-4)) {
+    throw ("DPI_AWARENESS_FAILED: SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2) " +
+      "was refused by this Windows build. Multi-monitor capture and input cannot be " +
+      "guaranteed correct without per-monitor DPI awareness (requires the Windows 10 " +
+      "Creators Update, 1703, or later) - refusing to capture/drive rather than risk " +
+      "a silently mis-scaled or mis-scoped monitor.")
+  }
   $req = Get-Content -Raw -LiteralPath $RequestFile | ConvertFrom-Json
   $action = "$($req.action)".ToLower()
   $state = Get-SessionState
