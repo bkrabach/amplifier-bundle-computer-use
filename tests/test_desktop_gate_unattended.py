@@ -228,3 +228,173 @@ def test_gate_hook_syncs_false_too_never_stale_true_from_a_prior_call(monkeypatc
     )
 
     assert computer._unattended_writes_ok is False
+
+
+# -- the remaining gap: interactive `ask_user` approval must also reach the --
+# -- tool-side fail-safe, without becoming a session-sticky escape hatch -----
+
+
+def test_interactive_write_approved_satisfies_gate_writes_for_focus_window():
+    """THE FIX for the second door: once the gate hook has synced
+    `_interactive_write_approved` onto the ComputerTool (what it does right
+    before handing a call to `ask_user` - see test_gate_hook_sets_... below),
+    `DesktopTool.execute()`'s fail-safe must let the write through, exactly
+    the same way it already does for `_unattended_writes_ok`.
+
+    Fails without the fix: before this change, `execute()`'s condition only
+    checked `_unattended_writes_ok`, so setting `_interactive_write_approved`
+    alone had no effect and the write was still denied.
+    """
+    desktop, computer, backend = _make_desktop({"read_only": False})
+    assert computer._gate_writes is True
+    computer._interactive_write_approved = True  # what the gate hook syncs pre-ask_user
+
+    result = _run(desktop.execute({"action": "focus_window", "handle": "abc"}))
+
+    assert result.success is True
+    assert backend.focus_calls == ["abc"]
+
+
+def test_interactive_write_approved_defaults_false_still_denies():
+    """No hook mounted (or one that has not run yet): the new flag must
+    default False just like `_unattended_writes_ok`, so the fail-safe still
+    denies when NOTHING granted the write - this flag must never become a
+    second, accidental escape hatch."""
+    desktop, computer, _backend = _make_desktop({"read_only": False})
+    assert computer._interactive_write_approved is False
+    assert computer._unattended_writes_ok is False
+
+    result = _run(desktop.execute({"action": "focus_window", "handle": "abc"}))
+
+    assert result.success is False
+    assert "gate_writes" in result.error["message"]
+
+
+def test_gate_hook_sets_interactive_write_approved_before_ask_user(monkeypatch):
+    """The hook-side half: right before dispatching to `ask_user`, the
+    handler must sync `_interactive_write_approved = True` onto the SAME
+    ComputerTool instance `DesktopTool` holds - this is safe to do before the
+    human actually answers because `ask_user` is a blocking gate
+    (`HOOKS_API.md`): `execute()` is only ever reached for this call if the
+    approval was granted; a decline never reaches the tool at all."""
+    monkeypatch.setattr(hook_mod, "_interactive_approval_possible", lambda: True)
+    computer = ComputerTool(_FakeDesktopBackend(), {"read_only": False})
+    computer.resolve_display()
+    assert computer._interactive_write_approved is False  # not yet synced
+
+    handler = hook_mod._make_gate_handler(_FakeCoordinator({"computer": computer}))
+    result = _run(
+        handler(
+            "tool:pre",
+            {"tool_name": "computer", "tool_input": {"action": "left_click"}},
+        )
+    )
+
+    assert result.action == "ask_user"
+    assert computer._interactive_write_approved is True
+
+
+def test_gate_hook_leaves_interactive_write_approved_false_on_the_deny_path(
+    monkeypatch,
+):
+    """The EOF-avoidance deny path (no TTY, no unattended_writes_ok) must
+    NEVER set `_interactive_write_approved` - nobody approved anything on
+    this path; it must stay a clean deny, not accidentally also flip an
+    escape hatch."""
+    monkeypatch.setattr(hook_mod, "_interactive_approval_possible", lambda: False)
+    computer = ComputerTool(_FakeDesktopBackend(), {"read_only": False})
+    computer.resolve_display()
+
+    handler = hook_mod._make_gate_handler(_FakeCoordinator({"computer": computer}))
+    result = _run(
+        handler(
+            "tool:pre",
+            {"tool_name": "computer", "tool_input": {"action": "left_click"}},
+        )
+    )
+
+    assert result.action == "deny"
+    assert computer._interactive_write_approved is False
+
+
+def test_gate_hook_leaves_interactive_write_approved_false_on_unattended_continue(
+    monkeypatch,
+):
+    """The unattended-continue path must set ONLY `_unattended_writes_ok`,
+    never `_interactive_write_approved` too - the two flags answer different
+    questions and must not be conflated, even though either one alone
+    satisfies the tool-side fail-safe."""
+    monkeypatch.setattr(hook_mod, "_interactive_approval_possible", lambda: False)
+    computer = ComputerTool(_FakeDesktopBackend(), {"read_only": False})
+    computer.resolve_display()
+
+    handler = hook_mod._make_gate_handler(
+        _FakeCoordinator({"computer": computer}), unattended_writes_ok=True
+    )
+    result = _run(
+        handler(
+            "tool:pre",
+            {"tool_name": "computer", "tool_input": {"action": "left_click"}},
+        )
+    )
+
+    assert result.action == "continue"
+    assert computer._unattended_writes_ok is True
+    assert computer._interactive_write_approved is False
+
+
+def test_previous_interactive_approval_cannot_authorize_a_later_call(monkeypatch):
+    """THE test that matters most: a human approving call 1 must not silently
+    authorize call 2. End-to-end through both the gate hook AND the tool's
+    own fail-safe.
+
+    Call 1: an interactive session is available, the gate hook routes
+    `focus_window` to `ask_user`, syncing `_interactive_write_approved =
+    True` for that call; `execute()` then lets the (simulated-approved)
+    write through.
+
+    Call 2: a SECOND, independent `focus_window` call comes in while no
+    interactive session is available and no `unattended_writes_ok` is
+    configured. The gate hook must reset the flag to False BEFORE making
+    this call's own decision - proving call 1's approval cannot leak
+    forward - and both the hook's own decision and the tool's independent
+    fail-safe must deny it.
+    """
+    monkeypatch.setattr(hook_mod, "_interactive_approval_possible", lambda: True)
+    desktop, computer, backend = _make_desktop({"read_only": False})
+    handler = hook_mod._make_gate_handler(
+        _FakeCoordinator({"computer": computer, "desktop": desktop})
+    )
+
+    # -- call 1: routed to ask_user, human (simulated) approves --------------
+    result1 = _run(
+        handler(
+            "tool:pre",
+            {"tool_name": "desktop", "tool_input": {"action": "focus_window"}},
+        )
+    )
+    assert result1.action == "ask_user"
+    assert computer._interactive_write_approved is True
+
+    exec_result1 = _run(desktop.execute({"action": "focus_window", "handle": "abc"}))
+    assert exec_result1.success is True
+    assert backend.focus_calls == ["abc"]
+
+    # -- call 2: a later, independent call - no fresh approval this time -----
+    monkeypatch.setattr(hook_mod, "_interactive_approval_possible", lambda: False)
+    result2 = _run(
+        handler(
+            "tool:pre",
+            {"tool_name": "desktop", "tool_input": {"action": "focus_window"}},
+        )
+    )
+    assert result2.action == "deny"
+    # The load-bearing assertion: call 1's approval did not survive.
+    assert computer._interactive_write_approved is False
+
+    # Even calling execute() directly (bypassing the hook's own deny
+    # short-circuit) must still refuse - the tool-side fail-safe is
+    # independent defense, not just trusting the hook ran.
+    exec_result2 = _run(desktop.execute({"action": "focus_window", "handle": "xyz"}))
+    assert exec_result2.success is False
+    assert backend.focus_calls == ["abc"]  # "xyz" never reached the backend

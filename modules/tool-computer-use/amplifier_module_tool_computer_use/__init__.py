@@ -252,6 +252,29 @@ class ComputerTool:
         # and the fail-safe denies - never a silent, un-authored escape
         # hatch.
         self._unattended_writes_ok: bool = False
+        # A SEPARATE per-call signal from `_unattended_writes_ok` above -
+        # deliberately, not the same flag wearing a second meaning. That one
+        # answers "is nobody at the keyboard, and is that explicitly OK?" -
+        # always False when a human interactively approves via `ask_user`,
+        # since the whole point of that path is a human WAS asked. Reusing
+        # it for the interactive case would make its name lie about which
+        # of the two questions it is answering (see this module's own
+        # incident history: names and return values that did not match
+        # reality). This is the interactive counterpart: "did a human just
+        # grant THIS specific call via `ask_user`?" `hook-computer-use`'s
+        # gate handler resets it to False at the top of every `tool:pre`
+        # call (same unconditional-sync point as `_unattended_writes_ok`,
+        # so a stale True from an earlier approved call can never survive
+        # into a later one), then sets it True only when it is about to
+        # hand this exact call's decision to `ask_user`. That is safe to do
+        # before the human actually answers: `ask_user` is a blocking gate
+        # (`HOOKS_API.md` - priority 2, same tier as `deny`) - if the human
+        # declines or times out, this tool's `execute()` is never called
+        # for that call at all, so no observer ever reads a `True` paired
+        # with a decline. Defaults False: with no gate hook mounted (or one
+        # that has not run yet), this stays False and the fail-safe denies
+        # - same "never a silent, un-authored escape hatch" rule as above.
+        self._interactive_write_approved: bool = False
         # Per-monitor targeting (see monitors.py): default is "primary", i.e. one
         # real monitor, not the virtual-desktop bounding box around all of them.
         # Set to monitors.VIRTUAL_DESKTOP to opt into the old whole-desktop
@@ -1402,11 +1425,14 @@ class DesktopTool:
                 self._computer._gate_writes
                 and action in MUTATING_DESKTOP
                 and not self._computer._unattended_writes_ok
+                and not self._computer._interactive_write_approved
             ):
                 # Fail-safe of last resort: reached only when NOTHING already
                 # granted this write - no gate hook synced
-                # `unattended_writes_ok=True` (config or interactive
-                # `ask_user` approval), and `gate_writes` was not explicitly
+                # `unattended_writes_ok=True` (the explicit unattended
+                # config opt-in), no gate hook synced
+                # `interactive_write_approved=True` (a human granting THIS
+                # call via `ask_user`), and `gate_writes` was not explicitly
                 # turned off. Every remedy is named here, not just pointed
                 # at - a doc pointer alone has already shipped as an
                 # unreachable-in-the-moment reference three times in this

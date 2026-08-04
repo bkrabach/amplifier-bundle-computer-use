@@ -887,6 +887,20 @@ def _make_gate_handler(coordinator: Any, unattended_writes_ok: bool = False):
     `ComputerTool` instance (`computer._unattended_writes_ok`) - always,
     even when `gate_writes` is off or the action is a read, so the tool
     never reads a stale value from an earlier, differently-configured call.
+
+    Same wall, different door: the interactive `ask_user` path this handler
+    dispatches to below had the identical problem - a human approves, but
+    nothing told `execute()`'s fail-safe that THIS exact call was the one
+    approved. `computer._interactive_write_approved`
+    (`ComputerTool.__init__`'s docstring has the full rationale) is the
+    honest, per-call answer - reset False at the very top of every call
+    alongside `_unattended_writes_ok`, set True only immediately before this
+    handler hands its decision to `ask_user`. Deliberately a second flag,
+    not a second meaning stuffed into `_unattended_writes_ok`: one says
+    "nobody's there and that's an explicit opt-in", the other says "someone
+    was there and said yes" - and this codebase has already paid once for a
+    name that answered a different question than the one it looked like it
+    answered.
     """
 
     async def handler(event: str, data: dict[str, Any]) -> HookResult:
@@ -905,6 +919,17 @@ def _make_gate_handler(coordinator: Any, unattended_writes_ok: bool = False):
         # `DesktopTool.execute()`'s fail-safe check must always see this
         # call's live value, not a value left behind by a previous one.
         computer._unattended_writes_ok = unattended_writes_ok
+        # Same unconditional-reset discipline for the interactive counterpart
+        # (`ComputerTool.__init__`'s docstring for `_interactive_write_approved`
+        # has the full rationale for why this is a second, honestly-named
+        # flag rather than overloading the one above). Reset to False on
+        # EVERY call, before any early return - only the `ask_user` branch
+        # below ever sets it True, and only for the one call it is deciding
+        # right now. This is what makes a previous call's approval unable to
+        # authorize this one: by the time this line runs for call N, call
+        # N-1's `execute()` has already run and already read whatever this
+        # handler set for it.
+        computer._interactive_write_approved = False
         if not getattr(computer, "_gate_writes", False):
             return HookResult(action="continue")
         action = (data.get("tool_input") or {}).get("action")
@@ -945,6 +970,13 @@ def _make_gate_handler(coordinator: Any, unattended_writes_ok: bool = False):
                 ),
             )
 
+        # Sync BEFORE returning, same as `_unattended_writes_ok` above: `ask_user`
+        # is a blocking gate (`HOOKS_API.md`, priority 2, same tier as `deny`) -
+        # the kernel calls `DesktopTool.execute()` for THIS call only if the
+        # human allows it; a decline or timeout never reaches `execute()` at
+        # all. So setting this now is not presuming the answer - it is only
+        # ever read on the one path where the answer was already yes.
+        computer._interactive_write_approved = True
         return HookResult(
             action="ask_user",
             approval_prompt=(
