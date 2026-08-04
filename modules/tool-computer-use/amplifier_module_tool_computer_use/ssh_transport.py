@@ -218,16 +218,46 @@ def _bootstrap_stub(deadman_seconds: float, read_only: bool) -> str:
     requests that follow), extracts the tar.gz into a scratch dir, and runs
     the agent IN-PROCESS via `runpy` (an `os.exec*` would discard whatever of
     stdin Python has already buffered past the tar bytes).
+
+    Scratch-dir lifecycle (the leak this stub used to have - `w` was created
+    and never removed by any exit path):
+
+    `atexit.register(shutil.rmtree, w, ...)` is registered the INSTANT `w` is
+    created, before extraction even happens, and fires whenever THIS process
+    reaches a normal Python-level shutdown - which covers every exit path
+    that runs any Python code on the way out:
+
+    * stdin EOF / the agent's own `bye` op (the ordinary case - `run()`'s
+      loop ends, `main()` returns, `SystemExit(main())` propagates to the
+      top of this `-c` script).
+    * SIGTERM, SIGHUP, or SIGINT delivered after `remote_agent.RemoteAgent
+      .install_signal_handlers()` has run - each of those handlers calls
+      `sys.exit(0)`, which is a normal (if abrupt) Python exit, not the raw
+      OS default action, so it still reaches this same shutdown path.
+
+    It does NOT cover a SIGKILL (to this process or an ancestor `uv run`
+    it can't intercept), an OOM-kill, or the host disappearing outright -
+    none of those ever run another line of Python, so nothing registered
+    with `atexit` can fire. `amplifier_cu_agent.remote_agent
+    .sweep_stale_agent_dirs()` (called from `main()`, so it runs once per
+    NEW connection, on the fresh agent process) exists to bound the damage
+    from exactly that gap: it age-gates rather than identity-gates so a
+    live sibling session's directory (a second, independent connection to
+    the same target - see `_build_ssh_transport` in `registry.py`) is never
+    at risk, but anything old enough to be almost certainly orphaned gets
+    swept up the next time anyone connects. See that function's docstring
+    for the full reasoning.
     """
     read_only_arg = "true" if read_only else "false"
     return (
-        "import sys,os,tarfile,io,runpy,hashlib,tempfile;"
+        "import sys,os,tarfile,io,runpy,hashlib,tempfile,atexit,shutil;"
         "buf=sys.stdin.buffer;"
         "n=int(buf.readline().strip());"
         "data=buf.read(n);"
         "sys.exit(97) if len(data)!=n else None;"
         "d=hashlib.sha256(data).hexdigest();"
         "w=tempfile.mkdtemp(prefix='amplifier-cu-agent-');"
+        "atexit.register(shutil.rmtree,w,ignore_errors=True);"
         "tarfile.open(fileobj=io.BytesIO(data),mode='r:gz').extractall(w);"
         "sys.path.insert(0,w);"
         "os.environ['AMPLIFIER_CU_AGENT_SHA256']=d;"
