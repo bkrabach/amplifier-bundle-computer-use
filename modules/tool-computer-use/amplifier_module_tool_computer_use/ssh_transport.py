@@ -97,7 +97,70 @@ _SSH_OPTS = [
 ]
 
 
-class SshConnectError(RuntimeError):
+#: Truncation and redaction for stderr captured from a target during a
+#: failed connect/send - long output is dominated by retry noise (the
+#: incident that motivated this: a `uv fetch` failure whose real cause was
+#: one line in the middle of several), so the useful part is almost always
+#: the first couple of lines (what failed) and the last few (the root
+#: cause). `_CREDENTIAL_IN_URL_RE` targets embedded basic-auth credentials
+#: in URLs (`scheme://user:pass@host`) - a private package-feed index URL
+#: is exactly the kind of thing this stderr can legitimately contain, and
+#: this is the one place that text is guaranteed to end up in both an
+#: exception message and a log line.
+_STDERR_HEAD_LINES = 4
+_STDERR_TAIL_LINES = 6
+_STDERR_MAX_LINES = _STDERR_HEAD_LINES + _STDERR_TAIL_LINES
+_CREDENTIAL_IN_URL_RE = re.compile(r"://([^/\s:@]+):([^/\s:@]+)@")
+
+
+def _redact_credentials(text: str) -> str:
+    """Replace `scheme://user:password@host` basic-auth credentials with a
+    fixed marker. Hosts and paths are left intact - only the userinfo
+    component is secret."""
+    return _CREDENTIAL_IN_URL_RE.sub("://***:***@", text)
+
+
+def _summarize_stderr(raw: str) -> str:
+    """Redact credentials, then truncate to the first/last few lines if the
+    output is long. Returns text ready to embed under an exception message -
+    legible both as a multi-line console dump and as the tail of a single
+    (possibly newline-containing) log record."""
+    lines = _redact_credentials(raw).strip().splitlines()
+    if len(lines) <= _STDERR_MAX_LINES:
+        return "\n".join(lines)
+    head = lines[:_STDERR_HEAD_LINES]
+    tail = lines[-_STDERR_TAIL_LINES:]
+    omitted = len(lines) - len(head) - len(tail)
+    return "\n".join([*head, f"... ({omitted} lines omitted) ...", *tail])
+
+
+class AgentStderrError(RuntimeError):
+    """Base for exceptions that may carry captured target/agent stderr.
+
+    `agent_stderr` is the raw text captured from the target process's
+    stderr stream at the moment of failure - already truncated and
+    credential-redacted by `_summarize_stderr` (see
+    `SshTransport._drain_stderr_on_failure`). It is `None` when nothing
+    could be captured (no fallback, no fabricated content - callers must
+    not assume it is always populated).
+
+    `str(exc)` embeds it below the message, so a single `logger.error("%s",
+    exc)` call and a printed traceback both show the whole picture - there
+    is nothing left for the operator to go read that isn't already here.
+    """
+
+    def __init__(self, message: str, *, agent_stderr: str | None = None) -> None:
+        self.message = message
+        self.agent_stderr = agent_stderr
+        super().__init__(message)
+
+    def __str__(self) -> str:
+        if self.agent_stderr:
+            return f"{self.message}\nagent stderr:\n{self.agent_stderr}"
+        return self.message
+
+
+class SshConnectError(AgentStderrError):
     """The SSH session could not be established or the deploy/handshake failed."""
 
 
@@ -256,17 +319,19 @@ class SshTransport:
             proc.stdin.write(payload)
             proc.stdin.flush()
         except BrokenPipeError as exc:
-            self._drain_stderr_on_failure()
+            stderr = self._drain_stderr_on_failure()
             raise SshConnectError(
-                f"broken pipe writing payload to {self.user_host} - deploy failed"
+                f"broken pipe writing payload to {self.user_host} - deploy failed",
+                agent_stderr=stderr,
             ) from exc
 
         line = self._read_line_with_timeout(proc.stdout, connect_timeout)
         if line is None:
-            self._drain_stderr_on_failure()
+            stderr = self._drain_stderr_on_failure()
             raise SshConnectError(
                 f"no handshake from {self.user_host} within {connect_timeout}s "
-                "(agent may have crashed during bootstrap - see stderr)"
+                "(agent may have crashed during bootstrap)",
+                agent_stderr=stderr,
             )
         resp = Response.decode(line)
         if not resp.ok or not isinstance(resp.result, dict):
@@ -304,10 +369,11 @@ class SshTransport:
                 ) from exc
             resp_line = self._read_line_with_timeout(proc.stdout, timeout)
             if resp_line is None:
-                self._drain_stderr_on_failure()
+                stderr = self._drain_stderr_on_failure()
                 raise SshConnectError(
                     f"no response from {self.user_host} within {timeout}s "
-                    "(connection likely lost)"
+                    "(connection likely lost)",
+                    agent_stderr=stderr,
                 )
             # Surface the agent's own stderr whenever it reports an error.
             # Previously stderr was drained ONLY on connect failure, so a
@@ -331,17 +397,28 @@ class SshTransport:
         t.join(timeout)
         return result["line"]
 
-    def _drain_stderr_on_failure(self) -> None:
+    def _drain_stderr_on_failure(self) -> str | None:
+        """Best-effort read of the agent's stderr after a failure.
+
+        Logs the raw captured text at ERROR exactly as before, and ALSO
+        returns a truncated, credential-redacted summary so the caller can
+        attach it to the exception it is about to raise - see
+        `AgentStderrError`. Returns `None` when nothing could be captured
+        (no process, no pipe, empty read, or the read itself failed); this
+        is a real "nothing available" signal, not a placeholder.
+        """
         if self._proc is None or self._proc.stderr is None:
-            return
+            return None
         try:
             data = self._proc.stderr.read(4096)
-            if data:
-                logger.error(
-                    "ssh-transport: agent stderr: %s", data.decode(errors="replace")
-                )
         except Exception as exc:  # noqa: BLE001 - best-effort diagnostics only
             logger.debug("ssh-transport: stderr drain failed: %s", exc)
+            return None
+        if not data:
+            return None
+        text = data.decode(errors="replace")
+        logger.error("ssh-transport: agent stderr: %s", text)
+        return _summarize_stderr(text)
 
     def close(self) -> None:
         """Shutdown order per \u00a710.1: release_all -> bye -> close stdin ->

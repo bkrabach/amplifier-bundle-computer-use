@@ -20,13 +20,13 @@ from .backend import (
     ScreenGeometry,
     WindowList,
 )
-from .ssh_transport import SshConnectError, SshTransport
+from .ssh_transport import AgentStderrError, SshConnectError, SshTransport
 from .wire import Request, Response, classify_op
 
 logger = logging.getLogger(__name__)
 
 
-class RemoteTargetUnavailable(RuntimeError):
+class RemoteTargetUnavailable(AgentStderrError):
     """A `target:` was explicitly configured and could not be reached.
 
     Deliberately NOT a subclass of `registry.NoBackendAvailable` - that type is
@@ -86,7 +86,9 @@ class RemoteBackend:
                 connect_timeout=connect_timeout,
             )
         except SshConnectError as exc:
-            raise RemoteTargetUnavailable(str(exc)) from exc
+            raise RemoteTargetUnavailable(
+                exc.message, agent_stderr=exc.agent_stderr
+            ) from exc
         self._connected = True
         self.name = f"remote-ssh:{handshake.get('backend', '?')}"
         self.presence_platform = handshake.get("backend")
