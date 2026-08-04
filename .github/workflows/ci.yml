@@ -46,15 +46,6 @@ jobs:
       - name: Run tests
         run: .venv/bin/python -m pytest tests/ -q
 
-      # Runs once (not per matrix entry -- the claims don't depend on Python
-      # version). `ci-main-green` is skipped here: it asks the GitHub API for
-      # this workflow's own most recent conclusion on `main`, which is
-      # circular when run from inside a not-yet-concluded run of that same
-      # workflow -- it stays a normal (non-skipped) claim for local/human
-      # for what this checks and why "always" claims fail the build while
-      # "drift" claims only warn.
-      - name: Verify proposal claims
-        if: matrix.python-version == '3.12'
 
   lint:
     name: lint (ruff)

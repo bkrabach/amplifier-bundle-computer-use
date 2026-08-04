@@ -73,9 +73,7 @@ def test_parse_marker_tolerates_trailing_appended_text():
         "text to the same tool-result content string"
     )
     assert result[tool_mod.MARKER] == 1
-    assert result["images"] == [
-        "/home/user/.amplifier/computer-use/shots/deadbeef.png"
-    ]
+    assert result["images"] == ["/home/user/.amplifier/computer-use/shots/deadbeef.png"]
 
 
 def test_parse_marker_tolerates_trailing_text_on_bare_marker():
