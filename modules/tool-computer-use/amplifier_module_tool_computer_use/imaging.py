@@ -34,7 +34,7 @@ def capture_scaled_b64(
     instead of `capture()` + a local PIL resize. `RemoteBackend` is the only
     backend that does - a faithful `capture()` there would drag the FULL
     native-resolution PNG (1.3-10.5 MB, measured - see
-    docs/remote-transport.md \u00a73.2/\u00a74) across the wire only to
+    docs/designs/remote-transport.md \u00a73.2/\u00a74) across the wire only to
     throw away ~90%+ of the pixels locally. Detected via the class-descriptor
     idiom (`getattr(type(backend), ...)`, never `hasattr(backend, ...)`) -
     the exact same idiom `hook-computer-use` already uses for

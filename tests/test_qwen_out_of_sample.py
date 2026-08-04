@@ -1,6 +1,6 @@
 """OUT-OF-SAMPLE extensibility probe: Qwen (Alibaba DashScope).
 
-`docs/multi-provider-design.md` Sec 18 states the extensibility claim and
+`docs/designs/multi-provider-design.md` Sec 18 states the extensibility claim and
 then disowns the measurement behind it: Gemini was added at a cost of 0 files
 outside `providers.py`, but the base had been improved KNOWING Gemini's shape.
 Sec 18's own words - "That is fitting the base to the test case... It is not a

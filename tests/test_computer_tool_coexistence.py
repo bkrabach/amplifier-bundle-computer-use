@@ -6,7 +6,7 @@ every call it receives so we can assert the backend method is (or is not)
 invoked, and a real `CoexistenceGuard` (wrapped by a small recording proxy)
 proves the before/after discipline actually fires around each action, and
 exactly once per composite (not once per constituent click/motion) - see
-`docs/coexistence.md` §8.4.
+`docs/designs/coexistence.md` §8.4.
 """
 
 from __future__ import annotations

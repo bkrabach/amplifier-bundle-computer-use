@@ -1,5 +1,5 @@
 """Unit tests for pause/cancel semantics (`pause.py`) -
-`docs/coexistence.md` \u00a78.1-\u00a78.4: the injector owns pause state; only
+`docs/designs/coexistence.md` \u00a78.1-\u00a78.4: the injector owns pause state; only
 a human-sourced call may set or clear it; drags interrupted mid-flight are
 reported truthfully rather than silently completed or reverted.
 """

@@ -1,4 +1,4 @@
-"""The halt invariant (`docs/coexistence.md` \u00a76.0):
+"""The halt invariant (`docs/designs/coexistence.md` \u00a76.0):
 
 > A detected human halts writes before the next one - every platform, every
 > mode, and no configuration key disables it.

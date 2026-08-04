@@ -1,5 +1,5 @@
 """Unit tests for target binding (`target_binding.py`) -
-`docs/coexistence.md` \u00a78.6: every multi-event operation is bound to a
+`docs/designs/coexistence.md` \u00a78.6: every multi-event operation is bound to a
 delivery target at its start; before each elementary event, the injector
 re-reads the current target, and aborts unconditionally on any change.
 """

@@ -211,7 +211,7 @@ class Backend(Protocol):
 
         `guard` is optional coexistence infrastructure
         (`coexistence_guard.CoexistenceGuard`, see that module and
-        `docs/coexistence.md` \u00a75.2/\u00a78.6) - a backend that supports
+        `docs/designs/coexistence.md` \u00a75.2/\u00a78.6) - a backend that supports
         per-keystroke intra-operation presence/pause/target-binding checks
         accepts it and calls `guard.before_event()`/`guard.after_event()`
         around each character (see `linux_x11.LinuxX11Backend.type_text`).

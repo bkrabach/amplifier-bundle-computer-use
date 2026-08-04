@@ -6,7 +6,7 @@
 The design's stated resume path is "a human clearing the halt through the one
 channel that requires nothing of the controller at all - restarting a fresh
 driving session after they choose to" (`coexistence_guard.py` module
-docstring, citing `docs/coexistence.md` \u00a713 D3: "resume is manual
+docstring, citing `docs/designs/coexistence.md` \u00a713 D3: "resume is manual
 when a console user is present").
 
 That sentence has an unstated assumption: that a "fresh driving session"
@@ -317,7 +317,7 @@ def make_durable_halt_poll(
     The fix is to poll on every `before_event()` call, not just at
     construction - but `load_halt()` does a full file read + JSON parse,
     which is not something to pay on every elementary injected event
-    (`docs/coexistence.md` \u00a75's per-sample cost budget: this
+    (`docs/designs/coexistence.md` \u00a75's per-sample cost budget: this
     mechanism already does an in-process idle read on that same hot path,
     and is sized in microseconds, not milliseconds). This closure keeps the
     common case - no halt has ever been recorded for this platform - down

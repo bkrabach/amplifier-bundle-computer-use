@@ -1,4 +1,4 @@
-"""The macOS announcement - `docs/coexistence.md` \u00a77.3, \u00a79.1, \u00a713 (D2).
+"""The macOS announcement - `docs/designs/coexistence.md` \u00a77.3, \u00a79.1, \u00a713 (D2).
 
 O1 (`coexistence-probes.md`) proved `osascript -e 'display dialog ...'` reaches
 the console user's screen and returns which button was pressed, even launched

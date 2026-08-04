@@ -1,4 +1,4 @@
-"""Unit tests for the §5.7 fix (`docs/coexistence.md`): a remote
+"""Unit tests for the §5.7 fix (`docs/designs/coexistence.md`): a remote
 backend's `idle_source()` is not free (an SSH round trip - on Windows, a
 `powershell.exe` spawn per read), and reasoning about the result with only
 `guard_ms` silently presents a locally-measured band as if it applied to

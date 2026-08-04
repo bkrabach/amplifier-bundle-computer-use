@@ -5,7 +5,7 @@ newlines.
 Pure logic only - no sockets, no subprocess, no SSH. `RemoteBackend` and
 `remote_agent.py` both import this module so the controller and the agent
 share exactly one definition of "what a valid line looks like" and "which ops
-may be retried" - see `docs/remote-transport.md` \u00a76.
+may be retried" - see `docs/designs/remote-transport.md` \u00a76.
 
 This module has zero dependencies beyond the stdlib and is safe to import on
 the remote target (which may lack `amplifier_core`, PIL, or any of this
@@ -20,7 +20,7 @@ from typing import Any, Literal
 
 #: Wire protocol version. The controller disconnects (fails loud, never
 #: negotiates down) if the agent's handshake reports anything else - see
-#: `docs/remote-transport.md` \u00a76.1.
+#: `docs/designs/remote-transport.md` \u00a76.1.
 PROTOCOL_VERSION = 1
 
 OpClass = Literal["read", "write", "control"]
@@ -41,7 +41,7 @@ READ_OPS = frozenset(
         "list_windows",
         "get_clipboard",
         "ping",
-        # Coexistence presence read (docs/coexistence.md \u00a75) - forwards
+        # Coexistence presence read (docs/designs/coexistence.md \u00a75) - forwards
         # to the remote agent's own backend.presence_idle_ms(). Idempotent by
         # construction (a query, no side effect), so READ is the correct class.
         "presence_idle",
@@ -86,7 +86,7 @@ def classify_op(op: str) -> OpClass:
 
 
 def is_retryable(op: str) -> bool:
-    """WRITE ops are never retryable - `docs/remote-transport.md` \u00a76.3
+    """WRITE ops are never retryable - `docs/designs/remote-transport.md` \u00a76.3
     is explicit that this is policy, not advisory."""
     return classify_op(op) != "write"
 
@@ -155,7 +155,7 @@ class Response:
 class ProtocolMismatchError(RuntimeError):
     """The agent's handshake did not satisfy the controller's requirements.
 
-    Fail-loud, no negotiate-down: `docs/remote-transport.md` \u00a76.1 -
+    Fail-loud, no negotiate-down: `docs/designs/remote-transport.md` \u00a76.1 -
     "The controller fails loud and disconnects if: protocol is not exactly
     what it speaks; agent_sha256 does not match what it deployed;
     probe.available is false; or any required entry in permissions is false."

@@ -1,4 +1,4 @@
-"""The single guard - `docs/coexistence.md` \u00a78.6's combined check,
+"""The single guard - `docs/designs/coexistence.md` \u00a78.6's combined check,
 composing presence detection, the halt invariant, pause, target binding, and
 geometric exclusion into the one call site every elementary injected event
 passes through:

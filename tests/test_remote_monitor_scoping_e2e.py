@@ -10,7 +10,7 @@ real, so a bug that only shows up after JSON round-tripping (e.g. a tuple
 silently becoming a list, or a monitor id losing its type) would be caught
 here and nowhere else in the suite.
 
-Motivation (docs/remote-transport.md \u00a711, \u00a7C1): on a real
+Motivation (docs/designs/remote-transport.md \u00a711, \u00a7C1): on a real
 multi-monitor target, a remote capture that falls back to the whole
 virtual-desktop bounding box downscales far more aggressively than a single
 monitor, and can contain large stretches of dead space where no monitor

@@ -243,7 +243,7 @@ class WindowsBackend:
             ) from exc
 
     # -- Backend protocol ---------------------------------------------------------
-    # -- coexistence: presence (docs/coexistence.md) ---------------------
+    # -- coexistence: presence (docs/designs/coexistence.md) ---------------------
     def presence_idle_ms(self) -> float:
         """Milliseconds since the last input event (real OR synthetic) reached
         this Windows desktop, via `GetLastInputInfo`/`GetTickCount` on the far
@@ -466,7 +466,7 @@ class WindowsBackend:
     def type_text(self, text: str, guard: Any = None) -> None:
         """See `Backend.type_text` for the `guard` parameter's contract.
         Accepted for protocol conformance but not yet used: \u00a75.5 of
-        `docs/coexistence.md` explains why intra-`type_text` human
+        `docs/designs/coexistence.md` explains why intra-`type_text` human
         detection is not viable on Windows today (`GetLastInputInfo`
         quantisation exceeds any usable guard band) - Windows presence
         detection ships at op granularity only, one layer up

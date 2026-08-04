@@ -284,7 +284,7 @@ class LinuxX11Backend:
         geom = self._root.get_geometry()
         return ScreenGeometry(geom.width, geom.height, 0, 0)
 
-    # -- coexistence: presence + target binding (docs/coexistence.md) ----
+    # -- coexistence: presence + target binding (docs/designs/coexistence.md) ----
     def presence_idle_ms(self) -> float:
         """Milliseconds since the last input event (real OR synthetic)
         reached this X server, via the `MIT-SCREEN-SAVER` extension's
@@ -537,7 +537,7 @@ class LinuxX11Backend:
         """Type literal text, one character at a time.
 
         `guard` is an optional `coexistence_guard.CoexistenceGuard`
-        (\u00a75.2/\u00a78.6 of `docs/coexistence.md`). When supplied, every
+        (\u00a75.2/\u00a78.6 of `docs/designs/coexistence.md`). When supplied, every
         keystroke is individually checked (halt/pause/target-binding, via
         `guard.before_event()`) and individually timestamped for presence
         detection (`guard.after_event()`) - this is the mechanism that lets a

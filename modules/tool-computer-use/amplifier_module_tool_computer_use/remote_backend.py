@@ -1,6 +1,6 @@
 """`RemoteBackend`: implements the `Backend` protocol by marshalling every call
 across `SshTransport` to the SAME platform backend code running on the target -
-`docs/remote-transport.md` \u00a75.
+`docs/designs/remote-transport.md` \u00a75.
 
 Owns request ids, op classification, and the one retry rule that matters:
 WRITE ops are never retried (\u00a76.3) - a lost response does not mean the
@@ -59,7 +59,7 @@ class RemoteBackend:
         self._transport: SshTransport | None = cfg.get("_transport")
         self._ids = itertools.count(1)
         self._connected = False
-        # Coexistence (docs/coexistence.md \u00a75): the bare REMOTE
+        # Coexistence (docs/designs/coexistence.md \u00a75): the bare REMOTE
         # backend name (e.g. "windows-wsl2", "linux-x11", "macos") from the
         # handshake, as reported by the agent's own `self.backend.name` on
         # the target - NOT the composite `self.name` above (which is
@@ -125,7 +125,7 @@ class RemoteBackend:
             raise BackendError(f"{resp.error_type}: {resp.error_message}")
         return resp.result
 
-    # -- coexistence presence source (docs/coexistence.md §5) ---------
+    # -- coexistence presence source (docs/designs/coexistence.md §5) ---------
 
     def presence_idle_ms(self) -> float:
         """Milliseconds since the REMOTE machine last saw any input.
@@ -205,7 +205,7 @@ class RemoteBackend:
         raise BackendError(
             "RemoteBackend.capture() (native resolution over the wire) is not "
             "supported in Phase 1 - use capture_scaled (see C1 in "
-            "docs/remote-transport.md)"
+            "docs/designs/remote-transport.md)"
         )
 
     def capture_scaled(
@@ -278,7 +278,7 @@ class RemoteBackend:
         """See `Backend.type_text` for the `guard` parameter's contract.
         Accepted for protocol conformance but not used: the remote agent
         runs its own copy of a platform backend on the target (\u00a75 of
-        `docs/remote-transport.md`), so any intra-op presence
+        `docs/designs/remote-transport.md`), so any intra-op presence
         detection belongs on that side, not here."""
         del guard
         self._call("type_text", text=text)
