@@ -473,6 +473,9 @@ class _FakeTypeQuartz:
     def CGEventCreateKeyboardEvent(self, source, keycode, key_down):
         return {"keycode": keycode, "key_down": key_down, "unicode": ""}
 
+    def CGEventSetFlags(self, event, flags):
+        pass
+
     def CGEventKeyboardSetUnicodeString(self, event, length, text):
         event["unicode"] = text
 
@@ -505,8 +508,12 @@ def test_type_text_posts_one_event_pair_per_character(monkeypatch):
 
     # Two characters -> two down events + two up events, one CGEvent PAIR
     # per character (not one CGEvent for the whole string) - this is what
-    # makes per-keystroke guard checks meaningful at all (§5.2).
-    assert fake.posted_strings == ["a", "a", "b", "b"]
+    # makes per-keystroke guard checks meaningful at all (§5.2). Since the
+    # 2026-08-04 fix, characters travel as a real keycode, not a
+    # `CGEventKeyboardSetUnicodeString` payload - see `_FakeRealKeycodeQuartz`
+    # tests below for the keycode/flags assertions; this fake's
+    # `posted_strings` stays empty by construction now.
+    assert len(fake.posted_strings) == 4
 
 
 def test_type_text_calls_guard_before_and_after_each_character(monkeypatch):
@@ -538,7 +545,118 @@ def test_type_text_with_no_guard_skips_every_guard_call(monkeypatch):
 
     backend.type_text("hi")  # guard=None (default) - must not raise
 
-    assert fake.posted_strings == ["h", "h", "i", "i"]
+    assert len(fake.posted_strings) == 4
+
+
+# -- real-hardware defect: type_text silently no-ops (found 2026-08-04) -------
+#
+# Live-hardware verification against an idle, unlocked Mac (screenshots
+# compared before/after, not just "CGEventPost did not raise") proved that
+# the PREVIOUS implementation - a keycode-0 `CGEventCreateKeyboardEvent` with
+# only `CGEventKeyboardSetUnicodeString` carrying the character, posted to
+# `kCGHIDEventTap` - posts successfully and delivers NOTHING to Spotlight's
+# search field: the field was byte-for-byte unchanged after `type_text`, on
+# a direct in-process call AND through the full remote wire path, at both
+# `kCGHIDEventTap` and `kCGSessionEventTap`. `key()` - which instead posts a
+# REAL, non-zero virtual keycode plus `CGEventFlags` for any held modifiers -
+# reliably lands (verified: a single `key("a")` correctly triggered
+# Spotlight's own autocomplete to "azure VPN Client"). `type_text` now
+# routes through that same proven mechanism instead of the unicode-string
+# trick - these tests pin the new, verified behavior and FAIL against the
+# old keycode-0 implementation.
+class _FakeRealKeycodeQuartz:
+    """Stand-in for `Quartz` that also records `CGEventSetFlags` calls, so
+    tests can assert on the REAL (keycode, flags) pair each character
+    resolves to - the old implementation always posted `(0, no-flags-call)`
+    with the character living only in `CGEventKeyboardSetUnicodeString`."""
+
+    kCGHIDEventTap = "HIDEventTap"
+
+    def __init__(self) -> None:
+        self.posted: list[tuple[int, bool, int]] = []  # (keycode, key_down, flags)
+        self.unicode_calls: int = 0
+
+    def CGEventCreateKeyboardEvent(self, source, keycode, key_down):
+        return {"keycode": keycode, "key_down": key_down, "flags": 0}
+
+    def CGEventSetFlags(self, event, flags):
+        event["flags"] = flags
+
+    def CGEventKeyboardSetUnicodeString(self, event, length, text):
+        # The old technique this backend must no longer rely on for
+        # resolvable characters - counted so tests can assert it is unused.
+        self.unicode_calls += 1
+
+    def CGEventPost(self, tap, event):
+        self.posted.append((event["keycode"], event["key_down"], event["flags"]))
+
+
+def test_type_text_uses_real_keycodes_not_the_unicode_string_technique(monkeypatch):
+    fake = _FakeRealKeycodeQuartz()
+    monkeypatch.setattr(macos, "Quartz", fake)
+    monkeypatch.setattr(MacOSBackend, "_ensure_ready_for_input", lambda self: None)
+    backend = MacOSBackend({})
+    keycode_a = macos._KEYCODE["a"]
+
+    backend.type_text("a")
+
+    # Old (defective) implementation always posts keycode 0 and relies on
+    # CGEventKeyboardSetUnicodeString - proven on real hardware to post
+    # successfully while delivering nothing. The fix posts the SAME real,
+    # non-zero keycode `key("a")` already uses (proven to land).
+    assert fake.posted == [(keycode_a, True, 0), (keycode_a, False, 0)]
+    assert fake.unicode_calls == 0
+
+
+def test_type_text_sets_shift_flag_for_uppercase_and_shifted_symbols(monkeypatch):
+    fake = _FakeRealKeycodeQuartz()
+    monkeypatch.setattr(macos, "Quartz", fake)
+    monkeypatch.setattr(MacOSBackend, "_ensure_ready_for_input", lambda self: None)
+    backend = MacOSBackend({})
+    keycode_a = macos._KEYCODE["a"]
+    keycode_one = macos._KEYCODE["1"]
+
+    backend.type_text("A!")
+
+    # 'A' = shift + the same keycode as 'a'; '!' = shift + the '1' keycode -
+    # both real, verified keys, never keycode 0.
+    keycodes_and_flags = [(kc, flags) for kc, _down, flags in fake.posted]
+    assert (keycode_a, _CG_FLAG_SHIFT) in keycodes_and_flags
+    assert (keycode_one, _CG_FLAG_SHIFT) in keycodes_and_flags
+    assert fake.unicode_calls == 0
+
+
+def test_type_text_refuses_unsupported_characters_before_typing_anything(monkeypatch):
+    """No US-ANSI keycode exists for these characters - per the no-fallback
+    rule, `type_text` must not silently retry them through the unverified
+    unicode-string technique and call it success. It must fail loud, and it
+    must not have posted ANY event for the supported characters that
+    preceded the unsupported one either (atomic: no partial, silent typing)."""
+    fake = _FakeRealKeycodeQuartz()
+    monkeypatch.setattr(macos, "Quartz", fake)
+    monkeypatch.setattr(MacOSBackend, "_ensure_ready_for_input", lambda self: None)
+    backend = MacOSBackend({})
+
+    with pytest.raises(BackendError, match="\u00e9"):
+        backend.type_text("caf\u00e9")  # 'é' has no US ANSI keycode
+
+    assert fake.posted == []
+    assert fake.unicode_calls == 0
+
+
+def test_type_text_guard_wiring_still_works_with_real_keycodes(monkeypatch):
+    """The per-character guard contract (already covered above) must survive
+    the switch away from the unicode-string technique."""
+    fake = _FakeRealKeycodeQuartz()
+    monkeypatch.setattr(macos, "Quartz", fake)
+    monkeypatch.setattr(MacOSBackend, "_ensure_ready_for_input", lambda self: None)
+    backend = MacOSBackend({})
+    guard = _FakeGuard()
+
+    backend.type_text("ab", guard=guard)
+
+    assert guard.calls == ["before", "after", "before", "after"]
+    assert len(fake.posted) == 4  # 2 chars * (down + up)
 
 
 # -- session/lock detection (D-locked-screen): _macos_session_state ------------

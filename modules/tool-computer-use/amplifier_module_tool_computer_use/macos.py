@@ -110,9 +110,9 @@ _BUTTON_CONST = {
 #: physical-key identifiers, not characters - there is no public API to look one up by
 #: name, so this table is the standard, widely-published mapping every mac automation
 #: tool (pyautogui, robotgo, pynput, ...) hardcodes. US ANSI layout only: this covers
-#: what a "key combo" (e.g. "cmd+s") needs - a literal keycode for a named key - not
-#: arbitrary Unicode text, which `type_text` sends through `CGEventKeyboardSetUnicodeString`
-#: instead (see `type_text`) and therefore needs no keycode/layout mapping at all.
+#: what a "key combo" (e.g. "cmd+s") needs - a literal keycode for a named key - AND,
+#: since the 2026-08-04 fix (see `type_text`'s docstring), every printable character
+#: `type_text` can resolve via `_char_to_keycode_and_flags` below.
 _KEYCODE = {
     "a": 0x00,
     "s": 0x01,
@@ -468,6 +468,70 @@ def _combo_flags_and_keycode(combo: str) -> tuple[int, int]:
     if keycode is None:
         raise BackendError(f"combo {combo!r} names only modifiers, no real key")
     return flags, keycode
+
+
+#: US ANSI shifted characters, mapped to the BASE key in `_KEYCODE` that,
+#: combined with Shift, produces them - e.g. '!' is Shift+'1' on every US
+#: keyboard. Used by `_char_to_keycode_and_flags` below, the same "real
+#: keycode, not a synthesized Unicode string" reliability `key()` already
+#: depends on, extended to cover `type_text`'s printable-character range.
+_SHIFTED_CHAR_TO_BASE = {
+    "!": "1",
+    "@": "2",
+    "#": "3",
+    "$": "4",
+    "%": "5",
+    "^": "6",
+    "&": "7",
+    "*": "8",
+    "(": "9",
+    ")": "0",
+    "_": "-",
+    "+": "=",
+    "{": "[",
+    "}": "]",
+    "|": "\\",
+    ":": ";",
+    '"': "'",
+    "<": ",",
+    ">": ".",
+    "?": "/",
+    "~": "`",
+}
+
+
+def _char_to_keycode_and_flags(ch: str) -> tuple[int, int] | None:
+    """Resolve one character to a real `(keycode, CGEventFlags)` pair on the
+    US ANSI layout `_KEYCODE`/`_SHIFTED_CHAR_TO_BASE` already encode - or
+    `None` if this character has no real keycode on that layout (accented
+    letters, non-Latin scripts, symbols/emoji outside both tables).
+
+    `type_text` (see its docstring for the real-hardware defect this fixes)
+    uses this for every character instead of the previous keycode-0
+    `CGEventKeyboardSetUnicodeString` technique, which posts successfully
+    but was measured, live, to deliver nothing to at least Spotlight's
+    search field. This function returns `None` rather than guessing so the
+    caller can fail loud on anything it cannot resolve, instead of silently
+    routing unresolvable characters through that unverified technique.
+    """
+    if ch in ("\n", "\r"):
+        return _KEYCODE["return"], 0
+    if ch == "\t":
+        return _KEYCODE["tab"], 0
+    if ch == " ":
+        return _KEYCODE["space"], 0
+    if ch.isascii() and ch.isalpha():
+        code = _KEYCODE.get(ch.lower())
+        if code is None:
+            return None
+        return code, (_CG_FLAG_SHIFT if ch.isupper() else 0)
+    code = _KEYCODE.get(ch)
+    if code is not None:
+        return code, 0
+    base = _SHIFTED_CHAR_TO_BASE.get(ch)
+    if base is not None:
+        return _KEYCODE[base], _CG_FLAG_SHIFT
+    return None
 
 
 class MacOSBackend:
@@ -1032,38 +1096,97 @@ class MacOSBackend:
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
 
     def type_text(self, text: str, guard: Any = None) -> None:
-        """Type literal Unicode text via `CGEventKeyboardSetUnicodeString`, one
-        Python string character at a time.
+        """Type literal text by posting a REAL, non-zero virtual keycode (plus
+        Shift when needed) for every character, one Python string character
+        at a time - the exact mechanism `key()` already uses and that has
+        been verified, on real hardware, to reliably reach the focused
+        element.
 
-        Unlike `key()`/`hold_key()`, this needs no keycode/layout table at all: each
-        character is attached directly to its own keyboard event and WindowServer
-        synthesizes whatever keystroke is needed, correctly, for any layout -
-        including characters with no key on the current physical keyboard. This is
-        the macOS-native equivalent of `LinuxX11Backend.type_text`'s dynamic scratch-
-        keysym mapping, but built into the platform rather than improvised.
+        FIXED 2026-08-04 - real-hardware defect, "a write that reports success
+        while doing nothing"
+        --------------------------------------------------------------------
+        This previously typed via `CGEventKeyboardSetUnicodeString` on a
+        keycode-0 event (Apple's documented "arbitrary Unicode, no layout
+        table needed" technique - the one real automation tools use too, and
+        this module's own prior docstring called "the macOS-native
+        equivalent of `LinuxX11Backend.type_text`'s dynamic scratch-keysym
+        mapping"). Live-hardware verification - screenshots compared
+        before/after, not just "`CGEventPost` did not raise" - proved that
+        assumption wrong: the keycode-0 technique posts successfully
+        (`CGEventPost` never raises or signals failure either way) and
+        delivered NOTHING. Confirmed on a direct in-process call AND through
+        the full remote-agent wire path, at both `kCGHIDEventTap` and
+        `kCGSessionEventTap`: Spotlight's search field was byte-for-byte
+        unchanged after `type_text`. `key()` - a REAL, non-zero keycode plus
+        `CGEventFlags` for any held modifiers, same `kCGHIDEventTap` - was
+        verified, on the SAME target and field, to reliably land (a single
+        `key("a")` correctly triggered Spotlight's own autocomplete). Two
+        earlier reports of this exact defect were wrongly retracted as "the
+        locked-screen defect, re-tested and it landed" - that re-test never
+        compared actual pixel content, only that no exception was raised;
+        this fix is the first verification that actually looked at what
+        appeared on screen.
 
-        Per-character, not one `CGEvent` for the whole string - this is what makes
-        `guard` (`coexistence_guard.CoexistenceGuard`, \u00a75.2/\u00a78.6 of
+        `_char_to_keycode_and_flags` resolves each character via
+        `_KEYCODE`/`_SHIFTED_CHAR_TO_BASE` - the SAME US-ANSI table `key()`
+        already depends on. A character with no keycode on that layout
+        (accented letters, non-Latin scripts, symbols/emoji outside both
+        tables) cannot be resolved - and per the no-fallback rule, this
+        method does NOT silently retry it through the unverified keycode-0
+        technique and call that success. It raises `BackendError` naming
+        every unsupported character before typing anything (atomic: nothing
+        is typed, not even the supported prefix, so a caller never has to
+        guess how far a partially-typed string got).
+
+        Per-character, not one `CGEvent` for the whole string - this is what
+        makes `guard` (`coexistence_guard.CoexistenceGuard`, \u00a75.2/\u00a78.6 of
         `docs/coexistence.md`) meaningful here at all. `GUARD_MS["macos"]`
-        is now measured (O4 - see `presence.py`), so this backend claims the same
+        is measured (O4 - see `presence.py`), so this backend claims the same
         intra-`type_text` detection Linux already does (\u00a75.2): a human keystroke
         landing MID-STRING must be able to interrupt between characters, which a
         single whole-string `CGEvent` made structurally impossible. Omitting `guard`
         (the default) preserves the per-character loop but skips every guard call -
-        existing callers with no guard are unaffected in every respect except that
-        this now posts one `CGEvent` pair per character instead of one pair for the
-        whole string, which WindowServer already delivered to the focused field
-        identically either way.
+        existing callers with no guard are unaffected.
         """
         self._ensure_ready_for_input()
+        resolved: list[tuple[str, int, int]] = []
+        unsupported: list[str] = []
+        seen_unsupported: set[str] = set()
         for ch in text:
+            hit = _char_to_keycode_and_flags(ch)
+            if hit is None:
+                if ch not in seen_unsupported:
+                    seen_unsupported.add(ch)
+                    unsupported.append(ch)
+                continue
+            resolved.append((ch, hit[0], hit[1]))
+        if unsupported:
+            raise BackendError(
+                "type_text: cannot reliably deliver "
+                f"{len(unsupported)} character(s) with no keycode on the US "
+                f"ANSI layout this backend verifies against: {unsupported!r}. "
+                "The alternative (CGEventKeyboardSetUnicodeString on a "
+                "keycode-0 event) was measured on real hardware to post "
+                "successfully while delivering nothing - see this method's "
+                "docstring - so it is never used as a silent fallback here. "
+                "Nothing in this call was typed. Split the text around the "
+                "unsupported character(s), or send them via a different "
+                "mechanism (e.g. the clipboard + 'key' paste combo)."
+            )
+        for _ch, keycode, flags in resolved:
             if guard is not None:
                 guard.before_event()
-            down = Quartz.CGEventCreateKeyboardEvent(None, 0, True)
-            Quartz.CGEventKeyboardSetUnicodeString(down, len(ch), ch)
+            # `CGEventSetFlags` is called unconditionally, even for flags=0 -
+            # verified live: skipping it for the (far more common) no-modifier
+            # case left plain lowercase/digit characters undelivered while
+            # shifted ones landed, on the same target and field. A freshly
+            # created event's default flags are not a substitute for an
+            # explicit, always-present flags call.
+            down = Quartz.CGEventCreateKeyboardEvent(None, keycode, True)
+            Quartz.CGEventSetFlags(down, flags)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
-            up = Quartz.CGEventCreateKeyboardEvent(None, 0, False)
-            Quartz.CGEventKeyboardSetUnicodeString(up, len(ch), ch)
+            up = Quartz.CGEventCreateKeyboardEvent(None, keycode, False)
+            Quartz.CGEventSetFlags(up, flags)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
             if guard is not None:
                 guard.after_event()
