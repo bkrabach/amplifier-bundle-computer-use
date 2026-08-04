@@ -47,6 +47,26 @@ _CLICK_ACTIONS = {
 }
 
 
+def _parse_rect(raw: Any) -> tuple[int, int, int, int] | None:
+    """Parse `bridge.ps1`'s `list_windows` per-entry `rect` (`[L, T, R, B]`,
+    from `GetWindowRect`) into `WindowInfo.rect`'s `(left, top, right,
+    bottom)` shape.
+
+    `None` (never a guess) if `raw` is missing or malformed - `bridge.ps1`
+    already only emits `rect` for windows where `GetWindowRect` succeeded
+    and reported a positive width/height (see its `list_windows` case), so
+    a missing/malformed value here means this PARSE step failed, not that
+    the window has no real geometry.
+    """
+    if not isinstance(raw, (list, tuple)) or len(raw) < 4:
+        return None
+    try:
+        left, top, right, bottom = (int(v) for v in raw[:4])
+    except (TypeError, ValueError):
+        return None
+    return left, top, right, bottom
+
+
 def _translate(path: str, flag: str) -> str:
     proc = subprocess.run(
         ["wslpath", flag, str(path)],
@@ -485,7 +505,10 @@ class WindowsBackend:
             raise BackendError(res.get("error", "list_windows failed"))
         windows = [
             WindowInfo(
-                str(w["handle"]), str(w["title"]), bool(w.get("minimized", False))
+                str(w["handle"]),
+                str(w["title"]),
+                bool(w.get("minimized", False)),
+                rect=_parse_rect(w.get("rect")),
             )
             for w in res.get("windows", [])
         ]

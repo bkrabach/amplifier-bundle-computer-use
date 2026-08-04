@@ -50,7 +50,7 @@ from .halt_state import (
 )
 from .imaging import capture_scaled_b64
 from .ledger import HeldInputLedger
-from .monitors import PRIMARY, VIRTUAL_DESKTOP, select_monitor
+from .monitors import PRIMARY, VIRTUAL_DESKTOP, attribute_monitor, select_monitor
 from .presence import GUARD_MS, PresenceMonitor
 from .providers import dialect_for_tool_type, read_call
 from .registry import NoBackendAvailable, select_backend
@@ -510,6 +510,83 @@ class ComputerTool:
         self._monitors = self._backend.list_monitors()
         return self._monitors
 
+    def _monitors_for_attribution(self) -> list[MonitorInfo]:
+        """Best-effort monitor list for `monitors.attribute_monitor`, used by
+        the `list_windows`/`focus_window` actions below.
+
+        Prefers a fresh `list_monitors()` call (a window can move between
+        monitors between calls) but falls back to whatever was last resolved
+        (`self._monitors`, set by `mount()`/`select_monitor()`/an earlier
+        `list_monitors()` call) if enumeration fails right now - a transient
+        enumeration failure degrades attribution to "unknown" for each window
+        (`attribute_monitor` already returns `None` on an empty list), it
+        does not make `list_windows`/`focus_window` themselves fail.
+        """
+        try:
+            return self._backend.list_monitors()
+        except BackendError:
+            return self._monitors
+
+    def _focus_monitor_warning(self, handle: str) -> str:
+        """After `focus_window`, tell the caller - explicitly, in the result
+        text - if the window it just raised is on a DIFFERENT monitor than
+        the one `computer` currently captures.
+
+        This closes the exact gap that made a working `focus_window` look
+        broken for three sessions in a row: `focus_window` can succeed
+        completely (the foreground window genuinely changes) while the next
+        screenshot shows no difference, because capture is scoped to one
+        monitor at a time (see `monitors.py`) and the window landed on a
+        different one. Without this, "focus succeeded but nothing visibly
+        changed" and "focus silently did nothing" are indistinguishable from
+        the caller's side - which is precisely what happened.
+
+        Deliberately a WARNING, never an automatic `select_monitor` switch:
+        changing the capture target is a separate, already-explicit action
+        (`desktop.select_monitor`) - silently doing it here would mutate
+        session state the caller never asked to change, on the strength of
+        one `focus_window` call. That mirrors this same method's cursor-clamp
+        warning a few lines up (`_run`'s `cursor_position` branch): inform,
+        never silently substitute.
+
+        Returns `""` (no note) when: this session is in virtual-desktop mode
+        (`self._current_monitor is None` - capture already shows the whole
+        desktop, so there is nothing to warn about); the window landed on the
+        SAME monitor `computer` is already scoped to; or fresh window
+        enumeration itself fails (cannot verify either way - say nothing
+        false rather than fabricate a warning).
+        """
+        if self._current_monitor is None:
+            return ""
+        try:
+            result = self._backend.list_windows()
+        except BackendError:
+            return ""
+        entry = next((w for w in result.windows if w.handle == handle), None)
+        if entry is None or entry.rect is None:
+            return (
+                " [warning: could not verify which monitor this window is "
+                "on now - this backend does not report window geometry for "
+                "it; take a screenshot to confirm the focus actually landed "
+                "where expected]"
+            )
+        target = self._current_monitor.id
+        landed = attribute_monitor(entry.rect, self._monitors_for_attribution())
+        if landed == target:
+            return ""
+        if landed is None:
+            return (
+                " [warning: window is not within any enumerated monitor "
+                f"(possibly off-screen or minimized) - `computer` is scoped "
+                f"to {target!r} and will not show it; take a screenshot to "
+                "confirm]"
+            )
+        return (
+            f" [warning: window is now on monitor {landed!r}, but `computer` "
+            f"screenshots are scoped to {target!r} - it will not appear "
+            f"there; use desktop.select_monitor({landed!r}) to see it]"
+        )
+
     @property
     def current_monitor(self) -> MonitorInfo | None:
         """The monitor `display` is scoped to, or `None` in virtual-desktop mode."""
@@ -900,8 +977,13 @@ class ComputerTool:
 
         if action == "list_windows":
             result = backend.list_windows()
+            monitors = self._monitors_for_attribution()
             visible = [w for w in result.windows if not w.minimized][:25]
-            listing = "\n".join(f"  [{w.handle}] {w.title}" for w in visible)
+            lines = []
+            for w in visible:
+                mon = attribute_monitor(w.rect, monitors)
+                lines.append(f"  [{w.handle}] {w.title} (monitor={mon!r})")
+            listing = "\n".join(lines)
             return f"visible windows (foreground={result.foreground}):\n{listing}", None
 
         if action == "focus_window":
@@ -910,7 +992,8 @@ class ComputerTool:
                 raise ValueError("action 'focus_window' requires 'handle'")
             with self._guard_write():
                 backend.focus_window(str(handle))
-            return f"focused window {handle}", None
+            note = self._focus_monitor_warning(str(handle))
+            return f"focused window {handle}{note}", None
 
         if action in _CLICK_ACTIONS:
             button, count = _CLICK_ACTIONS[action]

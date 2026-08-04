@@ -86,7 +86,12 @@ class _FakeBackend:
     def list_windows(self) -> WindowList:
         return WindowList(
             windows=[
-                WindowInfo(handle="42", title="Notepad", minimized=False),
+                WindowInfo(
+                    handle="42",
+                    title="Notepad",
+                    minimized=False,
+                    rect=(100, 200, 900, 800),
+                ),
                 WindowInfo(handle="7", title="Hidden", minimized=True),
             ],
             foreground="42",
@@ -311,7 +316,12 @@ def test_list_windows_focus_window_clipboard_dispatch_to_the_backend():
         "handle": "42",
         "title": "Notepad",
         "minimized": False,
+        "rect": [100, 200, 900, 800],
     }
+    # The second window has no rect (this fake backend never set one) - the
+    # wire encoding must carry that absence through as `None`, never a
+    # fabricated box (see `_op_list_windows`/`RemoteBackend.list_windows`).
+    assert list_windows_result["windows"][1]["rect"] is None
     assert lines[3]["result"] == {"text": "initial clipboard"}
 
 

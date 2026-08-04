@@ -27,6 +27,20 @@ from .wire import Request, Response, classify_op
 logger = logging.getLogger(__name__)
 
 
+def _decode_rect(raw: Any) -> tuple[int, int, int, int] | None:
+    """The inverse of `remote_agent._op_list_windows`'s `list(w.rect)`
+    encoding: a 4-element JSON array back into `WindowInfo.rect`'s tuple
+    shape, or `None` if the agent reported no geometry (or sent something
+    malformed) for this window - never a guess."""
+    if not isinstance(raw, (list, tuple)) or len(raw) < 4:
+        return None
+    try:
+        left, top, right, bottom = (int(v) for v in raw[:4])
+    except (TypeError, ValueError):
+        return None
+    return left, top, right, bottom
+
+
 class RemoteTargetUnavailable(AgentStderrError):
     """A `target:` was explicitly configured and could not be reached.
 
@@ -287,7 +301,10 @@ class RemoteBackend:
         result = self._call("list_windows")
         windows = [
             WindowInfo(
-                str(w["handle"]), str(w["title"]), bool(w.get("minimized", False))
+                str(w["handle"]),
+                str(w["title"]),
+                bool(w.get("minimized", False)),
+                rect=_decode_rect(w.get("rect")),
             )
             for w in result.get("windows", [])
         ]

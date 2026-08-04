@@ -1230,8 +1230,48 @@ class MacOSBackend:
             handle = str(int(wid))
             if foreground is None:
                 foreground = handle
-            windows.append(WindowInfo(handle, title, minimized=False))
+            rect = self._window_rect(entry.get("kCGWindowBounds"))
+            windows.append(WindowInfo(handle, title, minimized=False, rect=rect))
         return WindowList(windows, foreground)
+
+    def _window_rect(self, bounds: Any) -> tuple[int, int, int, int] | None:
+        """`kCGWindowBounds` (a `CFDictionary` with `X`/`Y`/`Width`/`Height`, in
+        Quartz global-display POINTS, top-left origin - same convention as
+        `CGDisplayBounds`, see the module docstring's coordinate-origin note)
+        converted to SCREEN-space physical-pixel `(left, top, right, bottom)`.
+
+        Reuses `_point_to_pixel` (already proven correct for `cursor_position`)
+        for the top-left corner, then scales width/height by the SAME
+        monitor's backing scale - consistent with `_monitor_infos`' documented
+        single-display-per-window assumption (a window straddling two
+        differently-scaled displays is not perfectly exact here, a known,
+        already-documented limitation, not a new one this introduces).
+
+        `None` (never a guess) if `bounds` is missing or malformed, or if no
+        active display's point-space contains the window's top-left corner
+        (`_point_to_pixel` itself only raises when there are zero active
+        displays at all - that propagates, since a call with literally no
+        display data cannot report window geometry either).
+        """
+        if not isinstance(bounds, dict):
+            return None
+        try:
+            px, py = float(bounds["X"]), float(bounds["Y"])
+            pw, ph = float(bounds["Width"]), float(bounds["Height"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        try:
+            left, top = self._point_to_pixel(px, py)
+        except BackendError:
+            return None
+        for m in self._monitor_infos():
+            bnds = Quartz.CGDisplayBounds(int(m.id))
+            if bnds.origin.x <= px < bnds.origin.x + bnds.size.width and (
+                bnds.origin.y <= py < bnds.origin.y + bnds.size.height
+            ):
+                scale = self._display_scale(int(m.id))
+                return left, top, left + round(pw * scale), top + round(ph * scale)
+        return None
 
     def focus_window(self, handle: str) -> None:
         """Raise and activate window `handle` via `osascript` + System Events.

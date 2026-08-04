@@ -527,7 +527,15 @@ class RemoteAgent:
         result = self.backend.list_windows()
         return {
             "windows": [
-                {"handle": w.handle, "title": w.title, "minimized": w.minimized}
+                {
+                    "handle": w.handle,
+                    "title": w.title,
+                    "minimized": w.minimized,
+                    # list(...) - a tuple isn't valid JSON; `RemoteBackend.list_windows`
+                    # converts it back to a tuple on receipt. `None` (no geometry for
+                    # this window) survives the round trip unchanged.
+                    "rect": list(w.rect) if w.rect is not None else None,
+                }
                 for w in result.windows
             ],
             "foreground": result.foreground,

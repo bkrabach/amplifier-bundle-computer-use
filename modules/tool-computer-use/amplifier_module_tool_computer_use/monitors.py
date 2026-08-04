@@ -68,3 +68,50 @@ def select_monitor(monitors: list[MonitorInfo], target: str | None) -> MonitorIn
         f"({available}); check the 'target_monitor' config value or the "
         "monitor id passed to desktop.select_monitor"
     )
+
+
+def attribute_monitor(
+    rect: tuple[int, int, int, int] | None, monitors: list[MonitorInfo]
+) -> str | None:
+    """Which monitor (by `MonitorInfo.id`) a window's `rect` is actually on.
+
+    This is the join that was missing and caused a real incident: capture is
+    scoped to one monitor at a time (see this module's own docstring), but
+    `list_windows()` reported no monitor or geometry data at all - so a
+    `focus_window` call that raised a window on a DIFFERENT monitor than the
+    one being captured looked, from the caller's side, identical to a
+    `focus_window` call that silently did nothing. Three sessions in a row
+    misdiagnosed a working `focus_window` as broken because of exactly this
+    gap.
+
+    Picks the monitor with the largest rect/monitor intersection area - a
+    deterministic computation over real geometry, not a guess: window
+    managers commonly reparent/decorate windows such that a window can
+    straddle a monitor boundary, and "most of the window is here" is the same
+    notion `MonitorFromWindow(MONITOR_DEFAULTTONEAREST)` and equivalents use.
+
+    Returns `None` - explicitly, never a fabricated attribution - when:
+      - `rect` is `None` (this backend could not determine the window's
+        geometry for this call), or
+      - `monitors` is empty (enumeration unavailable), or
+      - `rect` does not overlap any enumerated monitor at all. This is a
+        real, expected case, not just a theoretical one: Windows moves
+        minimized windows to an off-screen parking position (commonly
+        around `(-32000, -32000)`), which is a genuine `GetWindowRect`
+        result, not a bug in this function - reporting `None` for a
+        minimized window's monitor is the honest answer.
+    """
+    if rect is None or not monitors:
+        return None
+    left, top, right, bottom = rect
+    best_id: str | None = None
+    best_area = 0
+    for mon in monitors:
+        mon_right, mon_bottom = mon.x + mon.width, mon.y + mon.height
+        ix1, iy1 = max(left, mon.x), max(top, mon.y)
+        ix2, iy2 = min(right, mon_right), min(bottom, mon_bottom)
+        area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        if area > best_area:
+            best_area = area
+            best_id = mon.id
+    return best_id

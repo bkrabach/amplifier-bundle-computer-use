@@ -89,11 +89,33 @@ class MonitorInfo:
 
 @dataclass(frozen=True)
 class WindowInfo:
-    """One entry from `Backend.list_windows()`."""
+    """One entry from `Backend.list_windows()`.
+
+    `rect`, when known, is the window's bounding box in SCREEN space as
+    `(left, top, right, bottom)` - the same convention `capture()`'s `region`
+    parameter and every `MonitorInfo` already use, so a caller can compare a
+    window's rect directly against `MonitorInfo` bounds with no unit
+    conversion.
+
+    `rect` is `None` when this backend could not determine the window's
+    geometry for this call - never a guessed or synthetic box. This is the
+    fix for a real incident: `list_windows` used to report a window's
+    existence and title but nothing about *where* it was, so a
+    `focus_window` call that raised a window on a monitor other than the one
+    `computer` screenshots were scoped to looked, from the caller's side,
+    identical to a `focus_window` call that silently did nothing - three
+    sessions in a row misdiagnosed a working `focus_window` as broken because
+    of this exact gap. `monitors.attribute_monitor` is the pure function that
+    turns a `rect` plus a `list_monitors()` result into "which monitor is
+    this window actually on" - deliberately NOT a field here, since that
+    answer depends on which monitors are currently enumerated, a fact this
+    dataclass (one backend call, no monitor list) does not have.
+    """
 
     handle: str
     title: str
     minimized: bool = False
+    rect: tuple[int, int, int, int] | None = None
 
 
 @dataclass(frozen=True)

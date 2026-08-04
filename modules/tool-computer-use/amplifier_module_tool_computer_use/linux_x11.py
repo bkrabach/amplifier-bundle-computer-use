@@ -610,8 +610,33 @@ class LinuxX11Backend:
             state_prop = win.get_full_property(state_atom, 0)
             if state_prop and state_prop.value:
                 minimized = hidden_atom in list(state_prop.value)
-            windows.append(WindowInfo(str(int(wid)), title, minimized))
+            windows.append(
+                WindowInfo(str(int(wid)), title, minimized, rect=self._window_rect(win))
+            )
         return WindowList(windows, foreground)
+
+    def _window_rect(self, win: Any) -> tuple[int, int, int, int] | None:
+        """SCREEN-space `(left, top, right, bottom)` for `win`, or `None` if
+        this X server could not answer either request.
+
+        `get_geometry()` alone is not enough: its `x`/`y` are relative to
+        `win`'s immediate parent (typically a window-manager reparenting
+        frame, not the root window), so `translate_coords` against the root
+        window is what actually resolves the window's origin into the same
+        root/SCREEN space every `MonitorInfo` and every other coordinate in
+        this backend already uses (matches `monitors.attribute_monitor`'s
+        expected convention). Best-effort: a window can disappear between
+        `_NET_CLIENT_LIST` being read and this call - any protocol error
+        here is reported as "no geometry" (`None`), never a crash of the
+        whole `list_windows()` call over one stale window.
+        """
+        try:
+            geom = win.get_geometry()
+            origin = win.translate_coords(self._root, 0, 0)
+        except Exception:  # noqa: BLE001 - best-effort per-window geometry
+            return None
+        left, top = int(origin.x), int(origin.y)
+        return left, top, left + int(geom.width), top + int(geom.height)
 
     def focus_window(self, handle: str) -> None:
         self._ensure_connected()
