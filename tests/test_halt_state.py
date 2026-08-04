@@ -9,6 +9,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
 
@@ -20,6 +22,7 @@ from amplifier_module_tool_computer_use.halt_state import (
     load_halt,
     make_durable_halt_poll,
     record_halt,
+    resolve_resume_command,
 )
 from amplifier_module_tool_computer_use.presence import (
     Confidence,
@@ -198,6 +201,88 @@ def test_durable_halt_poll_is_isolated_per_platform(tmp_path: Path) -> None:
     record_halt("linux-x11", _snapshot(), reason="linux halt", state_dir=tmp_path)
     assert linux_poll() is not None
     assert macos_poll() is None
+
+
+# -- resolve_resume_command(): the "command not found" defect ---------------
+# -- (bare `amplifier-computer-use-resume` is not on a normal user's PATH). --
+
+
+def test_resolve_resume_command_uses_installed_console_script_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the console script `pip`/`uv` would have installed exists next
+    to `sys.executable` (as it does whenever this module was actually
+    installed into the running environment), return its full, absolute
+    path - not a bare name the operator has to hope is on PATH."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python3"
+    fake_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    fake_script = fake_bin / "amplifier-computer-use-resume"
+    fake_script.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "executable", str(fake_python))
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    command = resolve_resume_command()
+
+    assert command == str(fake_script.resolve())
+    assert Path(command).exists()
+
+
+def test_resolve_resume_command_falls_back_when_console_script_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the console script is NOT next to `sys.executable` (partial
+    install, a source checkout with no `pip install` step, a venv that
+    never installed this module) - fall back to a `-m` invocation of THIS
+    exact interpreter, which can always import `resume_cli` because it is
+    a sibling module in the same package as this running code. Never emit
+    a path that doesn't exist."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python3"
+    fake_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    # Deliberately do NOT create amplifier-computer-use-resume here.
+    monkeypatch.setattr(sys, "executable", str(fake_python))
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    command = resolve_resume_command()
+
+    assert command == f"{fake_python} -m amplifier_module_tool_computer_use.resume_cli"
+    assert not (fake_bin / "amplifier-computer-use-resume").exists()
+
+
+def test_resolve_resume_command_checks_exe_suffix_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Console scripts on Windows are `.exe` launcher stubs, not bare
+    files - the lookup must account for that or it will always report
+    'absent' on Windows even when the script IS installed."""
+    fake_bin = tmp_path / "Scripts"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python.exe"
+    fake_python.write_text("", encoding="utf-8")
+    fake_script = fake_bin / "amplifier-computer-use-resume.exe"
+    fake_script.write_text("", encoding="utf-8")
+    monkeypatch.setattr(sys, "executable", str(fake_python))
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    command = resolve_resume_command()
+
+    assert command == str(fake_script.resolve())
+
+
+def test_resolve_resume_command_in_the_real_current_environment_is_runnable() -> None:
+    """No mocking: whatever `resolve_resume_command()` returns RIGHT NOW, in
+    THIS test run's actual environment, must resolve to something real -
+    the specific check whose absence let the original defect ship (the
+    bare command name was never checked against the filesystem at all)."""
+    command = resolve_resume_command()
+    if " -m " in command:
+        executable, _, _module = command.partition(" -m ")
+        assert Path(executable).exists()
+    else:
+        assert Path(command).exists()
 
 
 def test_persisted_halt_round_trip_dict() -> None:

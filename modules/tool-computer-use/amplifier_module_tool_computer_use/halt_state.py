@@ -49,6 +49,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -58,6 +59,51 @@ from typing import Any
 from .presence import Confidence, PresenceSnapshot, PresenceState
 
 logger = logging.getLogger(__name__)
+
+#: The console-script name `pyproject.toml` registers for `resume_cli:main`.
+_RESUME_CONSOLE_SCRIPT = "amplifier-computer-use-resume"
+
+#: The dotted module path `-m` can invoke directly - `resume_cli` is a
+#: sibling module inside this exact package (`amplifier_module_tool_computer_use`).
+_RESUME_MODULE = "amplifier_module_tool_computer_use.resume_cli"
+
+
+def resolve_resume_command() -> str:
+    """A resume command guaranteed runnable in THIS process's environment -
+    resolved, never guessed.
+
+    The defect this exists to close: `pip`/`uv` install the
+    `amplifier-computer-use-resume` console script into the SAME directory
+    as the interpreter that installed it (`sys.executable`'s own
+    `bin`/`Scripts`) - never onto a user's shell PATH. A message that names
+    the bare script sends an operator chasing `command not found` across
+    directories and shells for a command that was never on PATH to begin
+    with (that is exactly what shipped and what this fixes).
+
+    Two branches, both unconditionally correct for this process, neither a
+    guess:
+
+    1. If the console script exists on disk next to this interpreter, hand
+       back its full, absolute path - copy-pasteable, no PATH required.
+    2. If it doesn't (partial install, a source checkout with no `pip
+       install` step, a venv that never installed this module) - fall back
+       to `<this interpreter> -m amplifier_module_tool_computer_use.resume_cli`.
+       This branch cannot be wrong: `resume_cli` is a sibling module in the
+       SAME package as this very file, which this exact interpreter has
+       already imported successfully (it is running this code right now) -
+       so that interpreter can always import it again.
+
+    Never emits a path that doesn't exist and never hands back a bare
+    command name for the operator to discover isn't on PATH the hard way.
+    """
+    script_name = _RESUME_CONSOLE_SCRIPT
+    if sys.platform == "win32":
+        script_name += ".exe"
+    script_path = Path(sys.executable).resolve().parent / script_name
+    if script_path.exists():
+        return str(script_path)
+    return f"{sys.executable} -m {_RESUME_MODULE}"
+
 
 #: Mirrors `SHOT_DIR`'s convention (`__init__.py`) - a per-feature directory
 #: under the same `~/.amplifier/computer-use/` root.

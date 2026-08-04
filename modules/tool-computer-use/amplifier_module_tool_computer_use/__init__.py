@@ -42,7 +42,12 @@ from amplifier_core.models import ToolResult
 from .backend import Backend, BackendError, MonitorInfo
 from .coexistence_guard import CoexistenceGuard, HaltedError
 from .geometry import Display, ImageSpace, compute_display
-from .halt_state import load_halt, make_durable_halt_poll, record_halt
+from .halt_state import (
+    load_halt,
+    make_durable_halt_poll,
+    record_halt,
+    resolve_resume_command,
+)
 from .imaging import capture_scaled_b64
 from .ledger import HeldInputLedger
 from .monitors import PRIMARY, VIRTUAL_DESKTOP, select_monitor
@@ -1511,18 +1516,19 @@ def _build_coexistence_guard(
     # mounted its OWN fresh guard, and writes resumed automatically ~80s
     # later with no human ever choosing to resume anything). If a durable
     # halt record exists for this backend, seed this guard already-halted -
-    # the ONLY way past it is `scripts/resume_after_halt.py`, an explicit
-    # human action, never the mere passage of time.
+    # the ONLY way past it is an explicit human action (`resolve_resume_command()`
+    # below - resolved against THIS process, never a bare name assumed to be
+    # on PATH), never the mere passage of time.
     persisted = load_halt(backend.name)
     if persisted is not None:
         guard.seed_halted(persisted.to_snapshot())
         logger.warning(
             "coexistence: backend %r has a durable halt record from a prior "
             "session (reason=%r) - this session starts already HALTED; run "
-            "scripts/resume_after_halt.py to clear it explicitly "
-            "(docs/coexistence.md \u00a713 D3)",
+            "%s to clear it explicitly (docs/coexistence.md \u00a713 D3)",
             backend.name,
             persisted.reason,
+            resolve_resume_command(),
         )
     return guard
 

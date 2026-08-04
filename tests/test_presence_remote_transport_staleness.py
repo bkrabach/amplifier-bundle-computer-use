@@ -23,7 +23,10 @@ sys.path.insert(0, str(ROOT / "modules" / "tool-computer-use"))
 
 from amplifier_module_tool_computer_use import _build_coexistence_guard
 from amplifier_module_tool_computer_use.coexistence_guard import HaltedError
-from amplifier_module_tool_computer_use.halt_state import PERSISTED_BASIS
+from amplifier_module_tool_computer_use.halt_state import (
+    PERSISTED_BASIS,
+    resolve_resume_command,
+)
 from amplifier_module_tool_computer_use.presence import (
     Confidence,
     PresenceMonitor,
@@ -296,11 +299,50 @@ def test_halted_error_message_for_a_persisted_record_does_not_claim_present_tens
     assert "does not mean someone is at the keyboard right now" in lowered
     # Explicitly refuses the "waiting will fix it" reading - the whole point.
     assert "will not clear itself" in lowered or "not clear itself" in lowered
-    # Names an actual recovery path, not just "an explicit human signal".
-    assert "resume_after_halt.py" in message
-    assert "amplifier-computer-use-resume" in message
+    # Names an actual recovery path - resolved against THIS process, not a
+    # bare command name assumed (wrongly) to be on the user's shell PATH.
+    # This is the specific regression check for the "command not found"
+    # defect: the message must contain the SAME resolved command
+    # `resolve_resume_command()` produces, not a hardcoded literal that
+    # could drift from what the code actually emits.
+    assert resolve_resume_command() in message
     # Must NOT reuse the live-sample present-tense phrasing.
     assert "produced input" not in lowered
+
+
+def test_halted_error_resume_command_is_actually_runnable_on_this_machine():
+    """The specific check whose ABSENCE let the defect ship: assert the
+    command embedded in the message is not merely a string, but something
+    that actually resolves on disk in the current environment - an
+    executable interpreter for the `-m` form, or an existing file for the
+    installed-console-script form. A bare, unresolved command name (the
+    pre-fix behavior) fails this: `Path("amplifier-computer-use-resume")`
+    does not exist anywhere on a normal machine.
+    """
+    snap = PresenceSnapshot(
+        state=PresenceState.HUMAN_ACTIVE,
+        confidence=Confidence.HIGH,
+        basis=PERSISTED_BASIS,
+        last_human_input_ago_ms=12.0,
+        margin_ms=30.0,
+        guard_ms=5.0,
+        guard_measured=True,
+        sample_interval_ms=None,
+        latched_until_ms=None,
+    )
+    message = str(HaltedError(snap))
+    command = resolve_resume_command()
+    assert command in message
+
+    if " -m " in command:
+        executable, _, _module = command.partition(" -m ")
+        assert Path(executable).exists(), (
+            f"resume command names an interpreter that doesn't exist: {executable!r}"
+        )
+    else:
+        assert Path(command).exists(), (
+            f"resume command names a console script that doesn't exist on disk: {command!r}"
+        )
 
 
 def test_halted_error_message_for_a_live_sample_is_unchanged_by_the_persisted_case():

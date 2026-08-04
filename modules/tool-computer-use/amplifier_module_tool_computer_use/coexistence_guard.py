@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .exclusion import ExclusionZone
-from .halt_state import PERSISTED_BASIS
+from .halt_state import PERSISTED_BASIS, resolve_resume_command
 from .pause import DragState, PauseController, PausedError
 from .presence import PresenceMonitor, PresenceSnapshot, PresenceState
 from .target_binding import TargetBinding, TargetChangedError
@@ -89,6 +89,13 @@ class HaltedError(RuntimeError):
             # tense invites exactly the wrong read - "someone's there right
             # now, I'll come back later" - when waiting is guaranteed never
             # to clear it; only an explicit human signal does.
+            # The command below is RESOLVED against this process's own
+            # interpreter (`resolve_resume_command()`, `halt_state.py`), not
+            # a bare name assumed to be on PATH - `pip`/`uv` install console
+            # scripts next to the interpreter that installed them, which is
+            # not necessarily anywhere on a user's shell PATH. See that
+            # function's docstring for why this can never emit a path that
+            # doesn't exist.
             super().__init__(
                 "halted: a PRIOR session recorded a human detected at this "
                 "machine and persisted that fact to disk - this is a MEMORY, "
@@ -96,9 +103,7 @@ class HaltedError(RuntimeError):
                 "keyboard right now, and it will not clear itself no matter "
                 "how long you wait - only an explicit human signal does. "
                 "Halting before the next write. To resume: after confirming "
-                "it is safe, run `python scripts/resume_after_halt.py` (repo "
-                "checkout) or the `amplifier-computer-use-resume` console "
-                "script (installed package, no checkout needed) for this "
+                f"it is safe, run `{resolve_resume_command()}` for this "
                 "backend."
             )
         else:
