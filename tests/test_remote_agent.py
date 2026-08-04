@@ -20,6 +20,8 @@ from amplifier_module_tool_computer_use.backend import (
     MonitorInfo,
     ProbeResult,
     ScreenGeometry,
+    WindowInfo,
+    WindowList,
 )
 from amplifier_module_tool_computer_use.remote_agent import RemoteAgent
 
@@ -30,6 +32,14 @@ class _FakeBackend:
     def __init__(self) -> None:
         self.moved_to: tuple[int, int] | None = None
         self.clicked: list[tuple] = []
+        self.mouse_downs: list[tuple] = []
+        self.mouse_ups: list[tuple] = []
+        self.dragged: list[tuple] = []
+        self.scrolled: list[tuple] = []
+        self.held_keys: list[tuple] = []
+        self.focused: str | None = None
+        self.clipboard = "initial clipboard"
+        self.set_clipboard_calls: list[str] = []
 
     def probe(self) -> ProbeResult:
         return ProbeResult(True, "")
@@ -52,11 +62,45 @@ class _FakeBackend:
     def click(self, x, y, button="left", count=1) -> None:
         self.clicked.append((x, y, button, count))
 
+    def mouse_down(self, x, y, button="left") -> None:
+        self.mouse_downs.append((x, y, button))
+
+    def mouse_up(self, x, y, button="left") -> None:
+        self.mouse_ups.append((x, y, button))
+
+    def drag(self, start, end) -> None:
+        self.dragged.append((start, end))
+
+    def scroll(self, x, y, direction, amount) -> None:
+        self.scrolled.append((x, y, direction, amount))
+
     def type_text(self, text: str) -> None:
         pass
 
     def key(self, combo: str) -> None:
         pass
+
+    def hold_key(self, combo: str, duration: float) -> None:
+        self.held_keys.append((combo, duration))
+
+    def list_windows(self) -> WindowList:
+        return WindowList(
+            windows=[
+                WindowInfo(handle="42", title="Notepad", minimized=False),
+                WindowInfo(handle="7", title="Hidden", minimized=True),
+            ],
+            foreground="42",
+        )
+
+    def focus_window(self, handle: str) -> None:
+        self.focused = handle
+
+    def get_clipboard(self) -> str:
+        return self.clipboard
+
+    def set_clipboard(self, text: str) -> None:
+        self.set_clipboard_calls.append(text)
+        self.clipboard = text
 
 
 def _lines(*requests: dict) -> io.StringIO:
@@ -176,6 +220,133 @@ def test_release_all_op_releases_everything_immediately():
     assert released == ["shift"]
     lines = [json.loads(x) for x in stdout.getvalue().strip().splitlines()]
     assert lines[2]["result"]["released"] == ["shift"]
+
+
+def test_mouse_down_up_drag_scroll_hold_key_dispatch_to_the_backend():
+    backend = _FakeBackend()
+    agent = RemoteAgent(backend, read_only=False)
+    stdin = _lines(
+        {"id": 1, "op": "mouse_down", "args": {"x": 1, "y": 2, "button": "left"}},
+        {"id": 2, "op": "mouse_up", "args": {"x": 1, "y": 2, "button": "left"}},
+        {
+            "id": 3,
+            "op": "drag",
+            "args": {"start": [1, 2], "end": [3, 4]},
+        },
+        {
+            "id": 4,
+            "op": "scroll",
+            "args": {"x": 5, "y": 6, "direction": "down", "amount": 3},
+        },
+        {"id": 5, "op": "hold_key", "args": {"combo": "ctrl+shift", "duration": 0.0}},
+        {"id": 6, "op": "bye", "args": {}},
+    )
+    stdout = io.StringIO()
+
+    agent.run(stdin, stdout)
+
+    assert backend.mouse_downs == [(1, 2, "left")]
+    assert backend.mouse_ups == [(1, 2, "left")]
+    assert backend.dragged == [((1, 2), (3, 4))]
+    assert backend.scrolled == [(5, 6, "down", 3)]
+    assert backend.held_keys == [("ctrl+shift", 0.0)]
+    lines = [json.loads(x) for x in stdout.getvalue().strip().splitlines()]
+    assert all(line["ok"] for line in lines[1:6])
+
+
+def test_mouse_down_is_ledger_tracked_and_released_on_eof():
+    """\u00a710.2: `left_mouse_down`/`left_mouse_up` can legitimately be split
+    across two separate tool calls by the model. If the link dies between
+    them, the ledger must release the button - proven here with a bare
+    `mouse_down` and no matching `mouse_up`, then EOF."""
+    backend = _FakeBackend()
+    agent = RemoteAgent(backend, read_only=False)
+    stdin = _lines({"id": 1, "op": "mouse_down", "args": {"x": 1, "y": 2}})
+    stdout = io.StringIO()
+
+    agent.run(stdin, stdout)
+
+    assert backend.mouse_downs == [(1, 2, "left")]
+    assert backend.mouse_ups == [(None, None, "left")], (
+        "ledger must call mouse_up on EOF when no explicit mouse_up arrived"
+    )
+
+
+def test_mouse_up_retires_the_ledger_entry_so_eof_does_not_double_release():
+    backend = _FakeBackend()
+    agent = RemoteAgent(backend, read_only=False)
+    stdin = _lines(
+        {"id": 1, "op": "mouse_down", "args": {"x": 1, "y": 2}},
+        {"id": 2, "op": "mouse_up", "args": {"x": 1, "y": 2}},
+    )
+    stdout = io.StringIO()
+
+    agent.run(stdin, stdout)
+
+    # Exactly one mouse_up: the explicit one. EOF must not fire a second
+    # (already-released) ledger entry.
+    assert backend.mouse_ups == [(1, 2, "left")]
+
+
+def test_list_windows_focus_window_clipboard_dispatch_to_the_backend():
+    backend = _FakeBackend()
+    agent = RemoteAgent(backend, read_only=False)
+    stdin = _lines(
+        {"id": 1, "op": "list_windows", "args": {}},
+        {"id": 2, "op": "focus_window", "args": {"handle": "42"}},
+        {"id": 3, "op": "get_clipboard", "args": {}},
+        {"id": 4, "op": "set_clipboard", "args": {"text": "hello"}},
+        {"id": 5, "op": "bye", "args": {}},
+    )
+    stdout = io.StringIO()
+
+    agent.run(stdin, stdout)
+
+    assert backend.focused == "42"
+    assert backend.set_clipboard_calls == ["hello"]
+    lines = [json.loads(x) for x in stdout.getvalue().strip().splitlines()]
+    list_windows_result = lines[1]["result"]
+    assert list_windows_result["foreground"] == "42"
+    assert list_windows_result["windows"][0] == {
+        "handle": "42",
+        "title": "Notepad",
+        "minimized": False,
+    }
+    assert lines[3]["result"] == {"text": "initial clipboard"}
+
+
+def test_read_only_blocks_the_new_write_ops():
+    backend = _FakeBackend()
+    agent = RemoteAgent(backend, read_only=True)
+    stdin = _lines(
+        {"id": 1, "op": "mouse_down", "args": {"x": 1, "y": 2}},
+        {"id": 2, "op": "drag", "args": {"end": [3, 4]}},
+        {"id": 3, "op": "scroll", "args": {"direction": "down", "amount": 1}},
+        {"id": 4, "op": "hold_key", "args": {"combo": "a", "duration": 0.0}},
+        {"id": 5, "op": "focus_window", "args": {"handle": "1"}},
+        {"id": 6, "op": "set_clipboard", "args": {"text": "x"}},
+        {"id": 7, "op": "list_windows", "args": {}},
+        {"id": 8, "op": "get_clipboard", "args": {}},
+        {"id": 9, "op": "bye", "args": {}},
+    )
+    stdout = io.StringIO()
+
+    agent.run(stdin, stdout)
+
+    lines = [json.loads(x) for x in stdout.getvalue().strip().splitlines()]
+    # ids 1-6 are WRITE ops: blocked under read_only.
+    for line in lines[1:7]:
+        assert line["ok"] is False, line
+        assert "read_only" in line["error"]["message"]
+    # ids 7-8 are READ ops: never blocked by read_only.
+    assert lines[7]["ok"] is True
+    assert lines[8]["ok"] is True
+    assert backend.mouse_downs == []
+    assert backend.dragged == []
+    assert backend.scrolled == []
+    assert backend.held_keys == []
+    assert backend.focused is None
+    assert backend.set_clipboard_calls == []
 
 
 def test_every_op_handler_is_reachable_via_the_dispatch_table():

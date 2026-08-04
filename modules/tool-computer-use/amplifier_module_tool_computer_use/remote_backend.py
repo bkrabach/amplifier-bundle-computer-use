@@ -18,6 +18,7 @@ from .backend import (
     MonitorInfo,
     ProbeResult,
     ScreenGeometry,
+    WindowInfo,
     WindowList,
 )
 from .ssh_transport import AgentStderrError, SshConnectError, SshTransport
@@ -241,22 +242,37 @@ class RemoteBackend:
         self._call("click", x=x, y=y, button=button, count=count)
 
     def mouse_down(self, x: int | None, y: int | None, button: str = "left") -> None:
-        raise BackendError("mouse_down over the wire is Phase 2 - see design doc")
+        """The agent registers this in its held-input ledger (\u00a710.2) so a
+        link death between this call and the matching `mouse_up` still
+        guarantees release - see `remote_agent.RemoteAgent._op_mouse_down`.
+        Anthropic's action set exposes `left_mouse_down`/`left_mouse_up`
+        independently, so the model can legitimately leave this half-open
+        across two separate tool calls."""
+        self._call("mouse_down", x=x, y=y, button=button)
 
     def mouse_up(self, x: int | None, y: int | None, button: str = "left") -> None:
-        raise BackendError("mouse_up over the wire is Phase 2 - see design doc")
+        self._call("mouse_up", x=x, y=y, button=button)
 
     def drag(self, start: tuple[int, int] | None, end: tuple[int, int]) -> None:
-        raise BackendError("drag over the wire is Phase 2 - see design doc")
+        """Stays ONE wire round trip, matching \u00a710.2's explicit instruction:
+        never decompose a drag into `mouse_down` + `move` + `mouse_up` across
+        the wire - a link failure between frames would strand a held button.
+        The agent's own `Backend.drag()` (already proven on all three
+        platforms) does the press/move/release atomically on the target."""
+        self._call(
+            "drag",
+            start=list(start) if start is not None else None,
+            end=list(end),
+        )
 
     def scroll(self, x: int | None, y: int | None, direction: str, amount: int) -> None:
-        raise BackendError("scroll over the wire is Phase 2 - see design doc")
+        self._call("scroll", x=x, y=y, direction=direction, amount=amount)
 
     def key(self, combo: str) -> None:
         self._call("key", combo=combo)
 
     def hold_key(self, combo: str, duration: float) -> None:
-        raise BackendError("hold_key over the wire is Phase 2 - see design doc")
+        self._call("hold_key", combo=combo, duration=duration)
 
     def type_text(self, text: str, guard: Any = None) -> None:
         """See `Backend.type_text` for the `guard` parameter's contract.
@@ -268,16 +284,24 @@ class RemoteBackend:
         self._call("type_text", text=text)
 
     def list_windows(self) -> WindowList:
-        raise BackendError("list_windows over the wire is Phase 2 - see design doc")
+        result = self._call("list_windows")
+        windows = [
+            WindowInfo(
+                str(w["handle"]), str(w["title"]), bool(w.get("minimized", False))
+            )
+            for w in result.get("windows", [])
+        ]
+        return WindowList(windows, result.get("foreground"))
 
     def focus_window(self, handle: str) -> None:
-        raise BackendError("focus_window over the wire is Phase 2 - see design doc")
+        self._call("focus_window", handle=handle)
 
     def get_clipboard(self) -> str:
-        raise BackendError("get_clipboard over the wire is Phase 2 - see design doc")
+        result = self._call("get_clipboard")
+        return result.get("text", "") if isinstance(result, dict) else str(result)
 
     def set_clipboard(self, text: str) -> None:
-        raise BackendError("set_clipboard over the wire is Phase 2 - see design doc")
+        self._call("set_clipboard", text=text)
 
     # -- Phase-1-only diagnostic op: the ledger proof (see remote_agent.py) ---
 

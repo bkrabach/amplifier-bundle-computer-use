@@ -50,6 +50,16 @@ class _FakeTransport:
             }
         elif req.op == "click":
             result = None
+        elif req.op == "list_windows":
+            result = {
+                "windows": [
+                    {"handle": "42", "title": "Notepad", "minimized": False},
+                    {"handle": "7", "title": "Hidden", "minimized": True},
+                ],
+                "foreground": "42",
+            }
+        elif req.op == "get_clipboard":
+            result = {"text": "clipboard contents"}
         else:
             result = {}
         return Response(id=req.id, ok=True, result=result).encode()
@@ -111,9 +121,86 @@ def test_not_connected_raises_backend_error_not_a_crash():
         backend.screen_geometry()
 
 
-def test_phase_2_ops_fail_loud_rather_than_silently_no_op():
-    backend, _ = _connected_backend()
-    with pytest.raises(BackendError, match="Phase 2"):
+def test_mouse_down_and_up_round_trip_through_the_wire():
+    backend, transport = _connected_backend()
+    backend.mouse_down(10, 20, "left")
+    backend.mouse_up(10, 20, "left")
+    ops = [c.op for c in transport.calls]
+    assert ops == ["mouse_down", "mouse_up"]
+    assert transport.calls[0].args == {"x": 10, "y": 20, "button": "left"}
+
+
+def test_drag_sends_start_and_end_in_one_call():
+    backend, transport = _connected_backend()
+    backend.drag((1, 2), (3, 4))
+    assert len(transport.calls) == 1, "drag must stay one wire round trip (\u00a710.2)"
+    assert transport.calls[0].op == "drag"
+    assert transport.calls[0].args == {"start": [1, 2], "end": [3, 4]}
+
+
+def test_drag_with_no_start_sends_null():
+    backend, transport = _connected_backend()
+    backend.drag(None, (3, 4))
+    assert transport.calls[0].args["start"] is None
+
+
+def test_scroll_round_trips_through_the_wire():
+    backend, transport = _connected_backend()
+    backend.scroll(5, 6, "down", 3)
+    assert transport.calls[0].op == "scroll"
+    assert transport.calls[0].args == {
+        "x": 5,
+        "y": 6,
+        "direction": "down",
+        "amount": 3,
+    }
+
+
+def test_hold_key_round_trips_through_the_wire():
+    backend, transport = _connected_backend()
+    backend.hold_key("ctrl+shift", 1.5)
+    assert transport.calls[0].op == "hold_key"
+    assert transport.calls[0].args == {"combo": "ctrl+shift", "duration": 1.5}
+
+
+def test_list_windows_deserializes_into_window_info():
+    backend, transport = _connected_backend()
+    result = backend.list_windows()
+    assert transport.calls[0].op == "list_windows"
+    assert result.foreground == "42"
+    assert len(result.windows) == 2
+    assert result.windows[0].handle == "42"
+    assert result.windows[0].title == "Notepad"
+    assert result.windows[0].minimized is False
+    assert result.windows[1].minimized is True
+
+
+def test_focus_window_round_trips_through_the_wire():
+    backend, transport = _connected_backend()
+    backend.focus_window("42")
+    assert transport.calls[0].op == "focus_window"
+    assert transport.calls[0].args == {"handle": "42"}
+
+
+def test_get_clipboard_returns_agent_text():
+    backend, transport = _connected_backend()
+    result = backend.get_clipboard()
+    assert transport.calls[0].op == "get_clipboard"
+    assert result == "clipboard contents"
+
+
+def test_set_clipboard_round_trips_through_the_wire():
+    backend, transport = _connected_backend()
+    backend.set_clipboard("hello")
+    assert transport.calls[0].op == "set_clipboard"
+    assert transport.calls[0].args == {"text": "hello"}
+
+
+def test_a_failed_mouse_down_is_not_retried():
+    """mouse_down/mouse_up/drag/scroll/hold_key/focus_window/set_clipboard are
+    all WRITE ops (\u00a76.3) - a failure must never be retried."""
+    backend, transport = _connected_backend()
+    transport.fail_next = True
+    with pytest.raises(BackendError):
         backend.mouse_down(0, 0)
-    with pytest.raises(BackendError, match="Phase 2"):
-        backend.drag((0, 0), (10, 10))
+    assert len([c for c in transport.calls if c.op == "mouse_down"]) == 1

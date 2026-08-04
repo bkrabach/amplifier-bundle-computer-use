@@ -208,6 +208,12 @@ class RemoteAgent:
         )
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
+        # Mutable coordinate box per held mouse button token (\u00a710.2) - see
+        # `_op_mouse_down`/`_op_mouse_up`. Lets an explicit `mouse_up` hand its
+        # real (x, y) to the SAME release_fn the ledger would otherwise call
+        # with synthetic (None, None) coordinates on a link-death release,
+        # without ever invoking `backend.mouse_up` twice for one press.
+        self._mouse_pending: dict[str, dict[str, int | None]] = {}
 
     def _on_release(self, kind: str, token: str) -> None:
         # \u00a710.2/\u00a73.3: this exact line, `RELEASED:<token>`, is the
@@ -440,6 +446,102 @@ class RemoteAgent:
     def _op_key(self, args: dict[str, Any]) -> None:
         self.backend.key(str(args["combo"]))
 
+    def _op_mouse_down(self, args: dict[str, Any]) -> None:
+        """Phase 2. Registered in the held-input ledger (\u00a710.2): Anthropic's
+        action set exposes `left_mouse_down`/`left_mouse_up` independently, so
+        the model can legitimately leave this half-open across two separate
+        tool calls, and a link death between them must still guarantee
+        release - the same guarantee `_op_hold`'s diagnostic modifier-hold
+        already proves end to end, applied here to the real action surface.
+
+        The release_fn reads its coordinates out of `self._mouse_pending[token]`
+        at the moment it actually fires, rather than closing over `(x, y)`
+        from THIS call - see `_op_mouse_up`, which mutates that box so an
+        explicit matching `mouse_up` releases at the coordinates it was
+        actually given, while a ledger-triggered release (deadman/EOF/signal,
+        no explicit `mouse_up` ever arrived) still safely defaults to
+        releasing at the current pointer position. This is what prevents
+        `backend.mouse_up` from being invoked TWICE for one press - once
+        directly here on the explicit path, once more via the release_fn.
+        """
+        x = args.get("x")
+        y = args.get("y")
+        button = str(args.get("button", "left"))
+        self.backend.mouse_down(x, y, button)
+        token = f"mouse:{button}"
+        pending: dict[str, int | None] = {"x": None, "y": None}
+        self._mouse_pending[token] = pending
+
+        def _release() -> None:
+            self.backend.mouse_up(pending["x"], pending["y"], button)
+            self._mouse_pending.pop(token, None)
+
+        self._ledger.hold("mouse", token, _release)
+
+    def _op_mouse_up(self, args: dict[str, Any]) -> None:
+        """If a matching `mouse_down` is still tracked in the ledger, release
+        THROUGH the ledger (supplying this call's real coordinates via
+        `_mouse_pending`) so `backend.mouse_up` is invoked exactly once and
+        the ledger entry is correctly retired in the same step - a second,
+        already-released `mouse_up`, or one with no matching `mouse_down` at
+        all (e.g. `read_only` toggled mid-session), still performs the real
+        action directly rather than silently dropping it."""
+        x = args.get("x")
+        y = args.get("y")
+        button = str(args.get("button", "left"))
+        token = f"mouse:{button}"
+        pending = self._mouse_pending.get(token)
+        if pending is not None:
+            pending["x"], pending["y"] = x, y
+            self._ledger.release(token)
+        else:
+            self.backend.mouse_up(x, y, button)
+
+    def _op_drag(self, args: dict[str, Any]) -> None:
+        """\u00a710.2: stays ONE call into `Backend.drag()` - never decomposed
+        into mouse_down/move/mouse_up here, so a link failure mid-drag cannot
+        strand a held button (the backend's own drag() is already atomic on
+        all three platforms)."""
+        start = args.get("start")
+        end = args["end"]
+        start_t = (int(start[0]), int(start[1])) if start else None
+        self.backend.drag(start_t, (int(end[0]), int(end[1])))
+
+    def _op_scroll(self, args: dict[str, Any]) -> None:
+        self.backend.scroll(
+            args.get("x"),
+            args.get("y"),
+            str(args["direction"]),
+            int(args.get("amount", 1)),
+        )
+
+    def _op_hold_key(self, args: dict[str, Any]) -> None:
+        """`Backend.hold_key` presses, sleeps for `duration`, and releases
+        within one synchronous call on all three platforms - the same
+        atomicity `drag` relies on, and why this is not additionally
+        threaded through the ledger: there is no wire round trip during
+        which a half-held key could be stranded by a link death."""
+        self.backend.hold_key(str(args["combo"]), float(args.get("duration", 1.0)))
+
+    def _op_list_windows(self, _args: dict[str, Any]) -> dict[str, Any]:
+        result = self.backend.list_windows()
+        return {
+            "windows": [
+                {"handle": w.handle, "title": w.title, "minimized": w.minimized}
+                for w in result.windows
+            ],
+            "foreground": result.foreground,
+        }
+
+    def _op_focus_window(self, args: dict[str, Any]) -> None:
+        self.backend.focus_window(str(args["handle"]))
+
+    def _op_get_clipboard(self, _args: dict[str, Any]) -> dict[str, Any]:
+        return {"text": self.backend.get_clipboard()}
+
+    def _op_set_clipboard(self, args: dict[str, Any]) -> None:
+        self.backend.set_clipboard(str(args.get("text", "")))
+
     def _op_hold(self, args: dict[str, Any]) -> dict[str, Any]:
         """Day-one ledger proof-of-mechanism (\u00a710.2): hold a single modifier
         key down, with NO matching up, tracked in the ledger until an explicit
@@ -474,8 +576,17 @@ class RemoteAgent:
         "capture_scaled": _op_capture_scaled,
         "move": _op_move,
         "click": _op_click,
+        "mouse_down": _op_mouse_down,
+        "mouse_up": _op_mouse_up,
+        "drag": _op_drag,
+        "scroll": _op_scroll,
         "type_text": _op_type_text,
         "key": _op_key,
+        "hold_key": _op_hold_key,
+        "list_windows": _op_list_windows,
+        "focus_window": _op_focus_window,
+        "get_clipboard": _op_get_clipboard,
+        "set_clipboard": _op_set_clipboard,
         "hold": _op_hold,
         # Coexistence presence read (docs/coexistence.md §5). Missing
         # this entry is why a real SSH session got
