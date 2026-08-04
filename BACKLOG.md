@@ -317,6 +317,47 @@ Holo and GUI-Owl both say "0–1000" and **mean different things**:
 Same family as the 261px miss. Verify against a known target empirically before
 trusting either doc.
 
+### EVALUATED 2026-08-03 — Holo3.1 4B and 9B are NOT viable
+
+Ran both sizes against real screenshots from two desktops, N=3 per target.
+Ground truth = where Anthropic and OpenAI independently agree (both already
+proven driving these exact desktops); disagreements >60px discarded rather than
+hand-labelled.
+
+|  | 4B | 9B |
+|---|---|---|
+| tool_call emission | 19/21 (90%) | 21/21 (100%) |
+| median error | 29px | 24px |
+| within 25px | 2/7 | 4/7 |
+| latency | 2.9s | 4.2s |
+| **worst single sample** | **1096px** | **312px** |
+
+**The integration is fine — the model is not.** H's coordinate formula
+(`x/1000 * width`, no smart_resize) is CONFIRMED correct; good samples land
+within 0–5px, impossible if the space were wrong.
+
+**The disqualifier is variance, not median.** Same image, same prompt, three
+samples: `start_button` 9B = 129px / 9px / 5px. `clock` = 237px / 1px / 0px.
+Median is the wrong statistic for a click agent — a 312px miss on a 1280px image
+clicks something else, and on a real desktop that is an action, not a retry.
+Going 4B→9B cut worst-case 1096→312px but did not remove it.
+
+Second mode: window-relative targets (`active_titlebar`, `close_button`) are
+wrong on ALL THREE samples at 9B, and 9B is *worse* than 4B on both. That is
+comprehension ("which window is frontmost"), not grounding, and it got worse
+with scale.
+
+**Bar to revisit:** worst-case inside ~25px across repeats. Not median. If
+35B-A3B clears that, the dialect work is small and now understood.
+
+**Two serving traps found:** the Spark-tuned vLLM already on the box fails with
+`Unrecognized keys in rope_parameters: {mrope_section, mrope_interleaved}` (too
+old for Qwen3.5-VL), and H's own published Spark line uses
+`--gpu-memory-utilization 0.8`, which fails on unified memory where only ~half
+of 121GB reads as free. 0.22 worked.
+
+Full data: `holo-eval/RESULTS.md` (workspace, not this repo).
+
 ### Ruled out
 
 - **GUI-Owl-1.5** (MIT, best open OSWorld with released weights, 56.5 @32B) —
