@@ -268,6 +268,71 @@ def test_pixel_to_point_round_trips_through_point_to_pixel(retina_backend):
         assert abs(ry - py) <= 1
 
 
+# -- _window_rect (real-hardware regression, 2026-08-04) ------------------------
+#
+# `kCGWindowBounds` is a `CFDictionary`, toll-free-bridged by PyObjC into a real
+# Objective-C `NSDictionary` - NOT a Python `dict` subclass. `_ProxyNSDictionary`
+# below reproduces exactly that: `.get()`/`.keys()`/`__getitem__` all work (the
+# same surface every real caller in this module relies on) but
+# `isinstance(x, dict)` is `False`, matching `type(bounds)` printing
+# `<objective-c class '__NSDictionaryI'>` when this was verified live against a
+# real Mac. A plain `{...}` literal (as every OTHER test in this file uses for
+# `kCGWindowBounds`) does NOT reproduce the bug - `isinstance({...}, dict)` is
+# `True` - which is exactly why the real defect shipped past 594 passing tests.
+
+
+class _ProxyNSDictionary:
+    """Duck-typed dict-alike that deliberately does NOT subclass `dict` -
+    reproducing the real `NSDictionary` bridge type `_window_rect` receives on
+    an actual Mac."""
+
+    def __init__(self, data: dict) -> None:
+        self._data = data
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def keys(self):
+        return self._data.keys()
+
+
+def test_window_rect_accepts_real_nsdictionary_bounds_not_just_plain_dict(
+    retina_backend,
+):
+    """The exact real-hardware defect: `isinstance(bounds, dict)` was `False`
+    for the genuine `NSDictionary` PyObjC hands back, so `_window_rect`
+    returned `None` for every window, every call. This must now resolve a
+    real rect instead of `None` for a non-`dict` but dict-*like* `bounds`."""
+    bounds = _ProxyNSDictionary({"X": 100.0, "Y": 50.0, "Width": 200.0, "Height": 80.0})
+    assert not isinstance(bounds, dict)  # this IS what real Quartz hands back
+
+    rect = retina_backend._window_rect(bounds)
+
+    assert rect is not None
+    left, top, right, bottom = rect
+    assert (left, top) == (200, 100)  # 2x Retina scale, per retina_backend fixture
+    assert (right - left, bottom - top) == (400, 160)
+
+
+def test_window_rect_still_accepts_plain_dict_bounds(retina_backend):
+    """Existing behavior (a real `dict`, as every other test/mocked caller in
+    this file uses) must keep working after dropping the `isinstance` gate."""
+    bounds = {"X": 10.0, "Y": 20.0, "Width": 30.0, "Height": 40.0}
+    rect = retina_backend._window_rect(bounds)
+    assert rect is not None
+
+
+def test_window_rect_none_for_none_bounds(retina_backend):
+    assert retina_backend._window_rect(None) is None
+
+
+def test_window_rect_none_for_bounds_missing_keys(retina_backend):
+    assert retina_backend._window_rect(_ProxyNSDictionary({"X": 1.0})) is None
+
+
 def test_screen_geometry_single_display(retina_backend):
     geo = retina_backend.screen_geometry()
     assert (geo.width, geo.height) == (2880, 1800)

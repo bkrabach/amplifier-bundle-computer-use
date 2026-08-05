@@ -1252,8 +1252,31 @@ class MacOSBackend:
         (`_point_to_pixel` itself only raises when there are zero active
         displays at all - that propagates, since a call with literally no
         display data cannot report window geometry either).
+
+        FIXED 2026-08-04 - real-hardware defect, "a function that returns
+        None for every input"
+        --------------------------------------------------------------------
+        This previously gated `bounds` with `isinstance(bounds, dict)`, never
+        verified against real hardware. Confirmed live on a Mac:
+        `entry.get("kCGWindowBounds")` hands back a genuine Objective-C
+        `NSDictionary` (`type(bounds)` prints `<objective-c class
+        '__NSDictionaryI'>`) - it supports `.get()`/`.keys()`/`__getitem__`
+        (all used elsewhere in this file) but is NOT a Python `dict`
+        subclass, so `isinstance(bounds, dict)` was `False` for every window,
+        every call - the function returned `None` before ever reading `X`/
+        `Y`/`Width`/`Height`, with no exception and no log line. This shipped
+        past 594 passing tests because every existing test double for
+        `kCGWindowBounds` used a plain Python `{...}` literal - a real
+        `dict` - which the `isinstance` check accepted; the mock was more
+        permissive than the real bridge type it stood in for. The fix drops
+        the type gate for plain `bounds is None` and leans on the
+        `try`/`except` immediately below (already present) to turn any
+        genuinely missing key or non-numeric value into the same honest
+        `None` - malformed/absent `bounds` is still `None`, but a
+        well-formed `NSDictionary` (the only kind real hardware produces) is
+        no longer rejected on the way in.
         """
-        if not isinstance(bounds, dict):
+        if bounds is None:
             return None
         try:
             px, py = float(bounds["X"]), float(bounds["Y"])
