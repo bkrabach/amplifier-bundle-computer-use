@@ -338,18 +338,35 @@ def test_sync_remote_announcement_state_read_failure_is_best_effort():
     assert guard.pause.is_paused is False
 
 
-# -- refusal must not leak the SSH connection --------------------------------
+# -- the announcement moved: mount() never builds it, first use does --------
+#
+# Regression tests for the double-mount defect (docs/designs/coexistence.md):
+# `amplifier_core`'s loader calls every tool module's `mount()` TWICE per real
+# session - once as a throwaway protocol-compliance probe
+# (`amplifier_core.validation.tool.ToolValidator._check_protocol_compliance`,
+# against a `MockCoordinator` whose result is discarded moments later) and
+# once for real. When `mount()` itself built the disclosure, the probe showed
+# a real dialog to a real human for a `ComputerTool`/`CoexistenceGuard` pair
+# about to be thrown away. `_ensure_announced` (called from `execute()`, not
+# `mount()`) closes that hole structurally: a validation probe never calls
+# `execute()`.
 
 
-def test_mount_closes_the_backend_when_announcement_is_refused(monkeypatch):
-    """Fails without the fix: before `mount()`'s `AnnouncementRefused`
-    handler called `backend.close()`, refusing a remote target after
-    `connect()` already spawned a live SSH subprocess + agent process left
-    that connection open for the life of the controller process."""
+def test_mount_never_builds_the_announcement_even_when_it_would_be_refused(
+    monkeypatch,
+):
+    """FAILS on the old design: `mount()` used to call `_build_announcement`
+    directly and could refuse to mount over it. Now `_build_announcement` is
+    only ever reached from `ComputerTool._ensure_announced`, at first real
+    use - `mount()` must mount unconditionally, even for a backend whose
+    announcement would be refused."""
 
     class _FakeCoordinator:
-        async def mount(self, *_a, **_k):
-            raise AssertionError("must not mount when announcement is refused")
+        def __init__(self) -> None:
+            self.mounted: list[str] = []
+
+        async def mount(self, _mount_point, module, name=None):
+            self.mounted.append(name or getattr(module, "name", "?"))
 
     class _RefusingBackend(_FakeRemoteBackend):
         def __init__(self) -> None:
@@ -364,23 +381,62 @@ def test_mount_closes_the_backend_when_announcement_is_refused(monkeypatch):
     monkeypatch.setattr(cu, "_build_coexistence_guard", lambda b, cfg: _guard("macos"))
 
     def _refuse(*_a, **_k):
+        raise AssertionError(
+            "_build_announcement must never be called from mount() - a "
+            "protocol-compliance probe calls mount() too, and must not be "
+            "able to trigger the disclosure"
+        )
+
+    monkeypatch.setattr(cu, "_build_announcement", _refuse)
+
+    import asyncio
+
+    coordinator = _FakeCoordinator()
+    result = asyncio.get_event_loop().run_until_complete(cu.mount(coordinator, {}))
+
+    assert coordinator.mounted == ["computer", "desktop"], (
+        "mount() must mount both tools unconditionally - refusal is no "
+        "longer a mount()-time concept"
+    )
+    assert result["provides"] == ["computer", "desktop"]
+    assert backend.closed is False, (
+        "mount() must not touch backend.close() at all any more - that "
+        "safety net moved to _ensure_announced's own refusal handling"
+    )
+
+
+def test_first_execute_closes_the_backend_when_announcement_is_refused(monkeypatch):
+    """The new home for the old `backend.close()` safety net: refusing a
+    remote target after `connect()` already spawned a live SSH subprocess +
+    agent process must not leak that connection - now proven at the point
+    the refusal actually happens, this session's first real `execute()`."""
+
+    class _RefusingBackend(_FakeRemoteBackend):
+        def __init__(self) -> None:
+            super().__init__("macos")
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    backend = _RefusingBackend()
+    guard = _guard("macos")
+    tool = cu.ComputerTool(backend, {"read_only": True})
+    tool._coexistence_guard = guard
+
+    def _refuse(*_a, **_k):
         raise cu.AnnouncementRefused("declined")
 
     monkeypatch.setattr(cu, "_build_announcement", _refuse)
 
     import asyncio
 
-    # Matches this test suite's own existing pattern (test_clipboard_policy.py's
-    # `_run` helper) rather than `asyncio.run()` - which tears down and clears
-    # the thread's current event loop on exit and breaks every OTHER test in
-    # the same pytest session still using the deprecated
-    # `asyncio.get_event_loop()` pattern.
     result = asyncio.get_event_loop().run_until_complete(
-        cu.mount(_FakeCoordinator(), {})
+        tool.execute({"action": "screenshot"})
     )
 
+    assert result.success is False
     assert backend.closed is True, (
         "backend.close() must be called when a refused announcement leaves "
-        "mount() with nothing to return"
+        "this session with nothing it may do"
     )
-    assert result["provides"] == []

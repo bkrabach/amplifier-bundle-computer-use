@@ -204,6 +204,10 @@ class ComputerTool:
     def __init__(self, backend: Backend, config: dict[str, Any] | None = None) -> None:
         cfg = config or {}
         self._backend = backend
+        # Kept for `_ensure_announced` (see that method): the announcement is
+        # no longer built at mount() time, so the config it needs must be
+        # available later, at first real use.
+        self._cfg: dict[str, Any] = cfg
         self._max_edge = int(cfg.get("max_edge", 1280))
         self._max_pixels = int(cfg.get("max_pixels", 1_150_000))
         self._enable_zoom = bool(cfg.get("enable_zoom", True))
@@ -367,13 +371,33 @@ class ComputerTool:
         # not (yet) exist - see `presence.GUARD_MEASURED` - so this feature
         # never claims detection it cannot back with evidence.
         self._coexistence_guard: CoexistenceGuard | None = None
-        # The session-start disclosure channel `mount()` built for this
-        # backend (`_build_announcement`) - an overlay object to keep alive
-        # for the tool's lifetime, or `None` for a one-shot channel (macOS's
-        # dialog) or a backend with no channel at all. Held here (not just a
-        # local in `mount()`) so it is not garbage-collected out from under
-        # its own background poll thread.
+        # The session-start disclosure channel `_ensure_announced` builds for
+        # this backend (`_build_announcement`) on this session's FIRST real
+        # action - an overlay object to keep alive for the tool's lifetime,
+        # or `None` for a one-shot channel (macOS's dialog) or a backend with
+        # no channel at all. Held here (not just a local) so it is not
+        # garbage-collected out from under its own background poll thread.
         self._announcement: Any | None = None
+        # -- session-start disclosure: gated at FIRST REAL USE, not mount() --
+        # See `_ensure_announced` for the full rationale (docs/designs/
+        # coexistence.md \u00a77, and the double-mount defect this closes: a
+        # protocol-compliance probe calls mount() on a throwaway
+        # MockCoordinator before every real session - see amplifier_core's
+        # validation.tool.ToolValidator._check_protocol_compliance). This
+        # lock is per-INSTANCE (not the module-level `_announcement_lock`,
+        # which guards the cross-instance/cross-process channel cache) - it
+        # serializes this instance's own check-then-act sequence against two
+        # actions racing to be "first".
+        self._announce_lock: threading.Lock = threading.Lock()
+        self._announced: bool = False
+        # Sticky for the life of this instance (this mount, this session):
+        # once set, every later call to `_ensure_announced` - from any
+        # thread, for `computer` OR `desktop` - re-raises this SAME error
+        # immediately, without touching the backend again. This is what
+        # makes a refusal mean "stop driving" structurally: `_ensure_announced`
+        # is the one gate both tools' `execute()` call before doing anything
+        # else, so there is no second door a refused session can get through.
+        self._announce_refused: AnnouncementRefused | None = None
         # Remote-only (docs/designs/coexistence.md \u00a78.1/\u00a79.1): the target's
         # own persistent overlay is invisible to this controller until asked
         # (see `_sync_remote_announcement_state`) - nothing observes the
@@ -952,6 +976,108 @@ class ComputerTool:
             self._remote_pause_seen = True
             _on_overlay_pause(guard, self._backend.name)
 
+    # -- session-start disclosure: fired at first real use, not mount() ---------
+    def _ensure_announced(self) -> None:
+        """Fire the session-start disclosure (docs/designs/coexistence.md \u00a77) on
+        THIS session's first real action, and never before.
+
+        Why not `mount()` (the defect this closes): `amplifier_core`'s loader
+        calls every tool module's `mount()` TWICE per real session - once as a
+        throwaway protocol-compliance probe
+        (`amplifier_core.validation.tool.ToolValidator._check_protocol_compliance`,
+        against a fresh `MockCoordinator` whose `mount()` result is discarded
+        and torn down in a `finally` block a few lines later - see that
+        module's source), and once for real
+        (`loader.mount_with_config_ep`/`mount_with_config_direct_ep`). Both
+        calls run the module's real `mount()` function with the real config.
+        Building the disclosure inside `mount()` meant the FIRST dialog a
+        human ever answered could be for the discarded probe - and any
+        consent given applied to a `ComputerTool`/`CoexistenceGuard` pair
+        about to be thrown away, not the one actually about to drive
+        anything. Gating here instead means a validation probe - which never
+        calls `execute()` on the tool it mounted, only `mount()` itself -
+        cannot trigger this at all: there is no code path from
+        `_check_protocol_compliance` to this method.
+
+        What counts as "first use": ANY action on `computer` or `desktop`,
+        not just a mutating one. Both classes' `execute()` call this before
+        doing anything else (`ComputerTool.execute` directly;
+        `DesktopTool.execute` via `self._computer._ensure_announced()`), so a
+        pure read - `screenshot`, `zoom`, `list_windows`, `get_clipboard` - is
+        gated identically to a click or a keystroke. A screenshot IS a
+        capture of a human's screen; gating only writes would let an agent
+        silently see everything on the target's display before ever
+        disclosing that it was watching, which defeats the entire purpose of
+        a session-start disclosure. There is exactly one gate, not one gate
+        for writes and a silent hole for reads.
+
+        Ordering: because this runs synchronously (via `asyncio.to_thread`,
+        same as `_run` itself) as the very first statement of `execute()`,
+        the announcement fully COMPLETES - dialog answered, overlay actually
+        shown, or the channel's own failure policy resolved - before any
+        backend call for that action begins. Not concurrent with the first
+        action, not merely started before it: this call returns (or raises)
+        before `execute()`'s own dispatch logic ever runs.
+
+        Concurrency: idempotent and thread-safe. Two actions issued by the
+        model in the same turn can race to be "first" on two different
+        worker threads. `self._announce_lock` is a per-instance lock
+        (distinct from the module-level `_announcement_lock`, which guards
+        the cross-instance/cross-process channel cache in
+        `_build_announcement`) - double-checked so the actual
+        dialog/overlay/RPC call, which can genuinely block (a countdown
+        timer, an SSH round trip), only ever runs once per instance; every
+        other caller either returns immediately (already announced) or
+        blocks briefly on the lock and then reuses whatever the winner
+        decided.
+
+        Refusal is STICKY for the life of this instance (this mount, this
+        session): once `self._announce_refused` is set, every later call -
+        from this thread or any other, for `computer` OR `desktop` -
+        re-raises the SAME `AnnouncementRefused` immediately, without
+        touching the backend again. Combined with there being exactly one
+        gate both tools' `execute()` methods call, this makes "refused" mean
+        "stop driving" structurally, not by convention: no action from
+        either tool can reach the backend without passing through here
+        first, and once refused this method never again returns normally.
+        """
+        if self._announce_refused is not None:
+            raise self._announce_refused
+        if self._announced:
+            return
+        with self._announce_lock:
+            # Double-checked: another thread may have already announced (or
+            # been refused) while this thread waited for the lock above.
+            if self._announce_refused is not None:
+                raise self._announce_refused
+            if self._announced:
+                return
+            try:
+                self._announcement = _build_announcement(
+                    self._backend,
+                    self._coexistence_guard,
+                    self._cfg,
+                    self.resolve_display(),
+                )
+            except AnnouncementRefused as exc:
+                self._announce_refused = exc
+                # Same best-effort, idempotent, refcounted cleanup mount()
+                # used to perform on a mount-time refusal. Safe for a REMOTE
+                # backend too - `close()` only decrements THIS handle's own
+                # refcount (see shared_transport.py); it can never tear down
+                # a connection a different, already-consented session is
+                # using against the same target.
+                try:
+                    self._backend.close()
+                except Exception:  # noqa: BLE001 - best-effort cleanup on refusal
+                    logger.debug(
+                        "tool-computer-use: backend.close() failed after a "
+                        "first-use announcement refusal",
+                        exc_info=True,
+                    )
+                raise
+            self._announced = True
+
     # -- execution --------------------------------------------------------------
     def _run(self, action: str, params: dict[str, Any]) -> tuple[str, str | None]:
         """Run one Anthropic computer-tool action against `self._backend`.
@@ -1264,7 +1390,19 @@ class ComputerTool:
         one-element batch, and the loop below is identical for both. The one
         genuine per-dialect difference is what a result must carry -
         `result_must_carry_screenshot`.
+
+        The very first thing this does - before parsing the call, before
+        anything else - is `_ensure_announced()` (see that method): the
+        session-start disclosure gate, moved here from `mount()` so a
+        throwaway protocol-compliance probe can never trigger it.
         """
+        try:
+            await asyncio.to_thread(self._ensure_announced)
+        except AnnouncementRefused as exc:
+            return ToolResult(
+                success=False,
+                error={"message": str(exc), "type": "AnnouncementRefused"},
+            )
         dialect, calls = read_call(input, self.image_space)
 
         last_summary = ""
@@ -1509,6 +1647,22 @@ class DesktopTool:
         }
 
     async def execute(self, input: dict[str, Any]) -> ToolResult:
+        # Same gate `computer` runs first (see `ComputerTool._ensure_announced`
+        # and `ComputerTool.execute`'s own docstring) - `desktop` shares the
+        # SAME `ComputerTool` instance, so this reuses (and, if this is the
+        # first action of either tool this session, actually fires) the exact
+        # same disclosure decision. A pure read like `get_clipboard` never
+        # reaches `ComputerTool._run()` (it calls `backend.get_clipboard()`
+        # directly, below) - so this explicit call, not `_run()` alone, is
+        # what makes the gate cover every `desktop` action too, not just the
+        # ones that happen to share `_run()` with `computer`.
+        try:
+            await asyncio.to_thread(self._computer._ensure_announced)
+        except AnnouncementRefused as exc:
+            return ToolResult(
+                success=False,
+                error={"message": str(exc), "type": "AnnouncementRefused"},
+            )
         action = str(input.get("action") or "").strip()
         if action not in DESKTOP_ACTIONS:
             return ToolResult(
@@ -1799,11 +1953,15 @@ class AnnouncementRefused(RuntimeError):
 
 def _channel_failure_snapshot(guard: CoexistenceGuard) -> PresenceSnapshot:
     """A live presence read taken at the moment a disclosure channel failed
-    to display - safe to call here because `_build_announcement` only ever
-    runs from `mount()`, before any tool call is dispatched, so there is no
-    concurrent thread that could also be mutating `guard.presence` (unlike
-    the overlay's own click callbacks - see `_on_overlay_cancel` below,
-    which deliberately does NOT call this)."""
+    to display - safe to call here because every caller of `_build_announcement`
+    (`ComputerTool._ensure_announced`) holds that instance's own
+    `_announce_lock` for the whole call, so there is at most one thread per
+    `ComputerTool` inside `_build_announcement`/`_dispatch_announcement` at a
+    time, and that thread is the only one touching this `guard` this early -
+    every other action on the same instance blocks on `_ensure_announced`
+    before it can reach anything that mutates `guard.presence` (unlike the
+    overlay's own click callbacks - see `_on_overlay_cancel` below, which
+    deliberately does NOT call this)."""
     return guard.presence.sample()
 
 
@@ -2060,8 +2218,11 @@ def _build_announcement(
     disp: Display,
 ) -> Any | None:
     """Build (and show) the session-start disclosure this backend supports,
-    or refuse to mount via `AnnouncementRefused` (\u00a77.3/\u00a77.6). `mount()` calls
-    this once, right after the coexistence guard, before returning.
+    or refuse via `AnnouncementRefused` (\u00a77.3/\u00a77.6). Called exactly once per
+    `ComputerTool` instance, from `ComputerTool._ensure_announced` on that
+    session's first real action - NOT from `mount()` (see that function's
+    own comment for why: a throwaway protocol-compliance probe also calls
+    `mount()`, and must never be able to trigger this).
 
     Returns whatever handle (if any) needs to stay alive for this tool's
     lifetime (an overlay object) so it is not garbage-collected - `None` for
@@ -2406,40 +2567,28 @@ async def mount(
     computer._coexistence_guard = _build_coexistence_guard(backend, cfg)
     # Session-start disclosure (docs/designs/coexistence.md §7) - the
     # Linux/Windows overlay or the macOS announce-and-acknowledge dialog,
-    # whichever this backend supports. On by default (§7.1: "an announcement
-    # that failed to render is a stop button the human cannot reach" - a
-    # flag nobody sets is the same as dead code). May refuse to mount via
-    # `AnnouncementRefused` (§7.3/§7.6: a human detected present with no
-    # working disclosure channel) - handled exactly like `NoBackendAvailable`.
-    try:
-        computer._announcement = _build_announcement(
-            backend, computer._coexistence_guard, cfg, computer.resolve_display()
-        )
-    except AnnouncementRefused as exc:
-        logger.warning("tool-computer-use: not mounting - %s", exc)
-        # A refused announcement is the first path (local or remote) that can
-        # reach this point AFTER a real resource was already acquired -
-        # `select_backend()` above already called `RemoteBackend.connect()`,
-        # which spawned a live SSH subprocess + target-side agent process.
-        # Without this, refusing to mount a remote target would leak that
-        # connection for the life of the controller process. `Backend.close()`
-        # is documented best-effort/idempotent/safe-to-never-call, so this is
-        # safe for every backend type, not only remote ones.
-        try:
-            backend.close()
-        except Exception:  # noqa: BLE001 - best-effort cleanup on a refusal path
-            logger.debug(
-                "tool-computer-use: backend.close() failed after an "
-                "announcement refusal",
-                exc_info=True,
-            )
-        return {
-            "name": "tool-computer-use",
-            "version": __version__,
-            "provides": [],
-            "description": f"computer-use not mounted: {exc}",
-        }
-
+    # whichever this backend supports - is deliberately NOT built here.
+    #
+    # It used to be: `mount()` called `_build_announcement()` directly, right
+    # after the coexistence guard, and could refuse to mount via
+    # `AnnouncementRefused`. That broke the moment a REAL session started:
+    # `amplifier_core`'s loader calls every tool module's `mount()` TWICE -
+    # once as a throwaway protocol-compliance probe
+    # (`amplifier_core.validation.tool.ToolValidator._check_protocol_compliance`,
+    # against a `MockCoordinator` whose result is discarded and torn down a
+    # few lines later) and once for real. Both calls ran this module's real
+    # `mount()` with the real config, so the probe showed a real dialog to a
+    # real human for a `ComputerTool`/`CoexistenceGuard` pair that was about
+    # to be thrown away - and any consent given applied to that discarded
+    # pair, not the one actually about to drive anything.
+    #
+    # The disclosure now fires on THIS session's first real action instead -
+    # see `ComputerTool._ensure_announced`, called at the top of both
+    # `ComputerTool.execute()` and `DesktopTool.execute()`. A validation
+    # probe never calls `execute()`, only `mount()`, so it cannot trigger
+    # this at all. `mount()` therefore always proceeds to mount both tools
+    # below; refusal (and the same backend.close() safety net that used to
+    # live here) happens later, at first use.
     await coordinator.mount("tools", computer, name=computer.name)
     desktop = DesktopTool(computer)
     await coordinator.mount("tools", desktop, name=desktop.name)
