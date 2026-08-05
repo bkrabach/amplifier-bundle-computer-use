@@ -213,6 +213,20 @@ class LinuxX11Backend:
             if not result.available:
                 raise BackendError(f"linux-x11 backend not available: {result.reason}")
 
+    @property
+    def display(self) -> Any:
+        """The live Xlib `Display` connection this backend already holds open.
+
+        The coexistence overlay (`overlay_linux.LinuxOverlay`,
+        `docs/designs/coexistence.md` \u00a77.3) must create its window on the SAME
+        connection this backend drives input through - not a second one -
+        so its lifetime is tied to this backend's own connection (module
+        docstring's "ghost-free by construction" property). `_ensure_connected()`
+        guarantees this is non-`None` by the time a caller reaches here.
+        """
+        self._ensure_connected()
+        return self._display
+
     def _check_discrete_input_available(self) -> None:
         """XTEST discrete input (buttons/keys) requires that no other client on
         this X session holds an exclusive core-protocol grab on the pointer or

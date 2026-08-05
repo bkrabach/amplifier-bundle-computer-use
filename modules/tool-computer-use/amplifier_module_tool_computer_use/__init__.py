@@ -25,12 +25,14 @@ reads a plain in-memory value and can never block.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import base64
 import hashlib
 import inspect
 import json
 import logging
 import os
+import socket
 import time
 import uuid
 from contextlib import contextmanager
@@ -39,6 +41,9 @@ from typing import Any
 
 from amplifier_core.models import ToolResult
 
+from .announce_macos import DEFAULT_TIMEOUT_SECONDS as MACOS_ANNOUNCE_TIMEOUT_SECONDS
+from .announce_macos import AnnounceError
+from .announce_macos import announce as macos_announce
 from .backend import Backend, BackendError, MonitorInfo
 from .coexistence_guard import CoexistenceGuard, HaltedError
 from .geometry import Display, ImageSpace, compute_display
@@ -50,8 +55,19 @@ from .halt_state import (
 )
 from .imaging import capture_scaled_b64
 from .ledger import HeldInputLedger
+from .linux_x11 import LinuxX11Backend
+from .macos import MacOSBackend
 from .monitors import PRIMARY, VIRTUAL_DESKTOP, attribute_monitor, select_monitor
-from .presence import GUARD_MS, PresenceMonitor
+from .overlay_linux import LinuxOverlay
+from .overlay_windows import WindowsOverlay
+from .presence import (
+    GUARD_MS,
+    Confidence,
+    IdleUnreadableError,
+    PresenceMonitor,
+    PresenceSnapshot,
+    PresenceState,
+)
 from .providers import dialect_for_tool_type, read_call
 from .registry import NoBackendAvailable, select_backend
 from .tool_versions import (
@@ -60,6 +76,7 @@ from .tool_versions import (
     resolve_tool_version,
 )
 from .type_pacing import resolve_type_pacing_ms
+from .windows import WindowsBackend
 
 logger = logging.getLogger(__name__)
 
@@ -347,6 +364,13 @@ class ComputerTool:
         # not (yet) exist - see `presence.GUARD_MEASURED` - so this feature
         # never claims detection it cannot back with evidence.
         self._coexistence_guard: CoexistenceGuard | None = None
+        # The session-start disclosure channel `mount()` built for this
+        # backend (`_build_announcement`) - an overlay object to keep alive
+        # for the tool's lifetime, or `None` for a one-shot channel (macOS's
+        # dialog) or a backend with no channel at all. Held here (not just a
+        # local in `mount()`) so it is not garbage-collected out from under
+        # its own background poll thread.
+        self._announcement: Any | None = None
         # Defect 1 (halt surfacing): every `HaltedError` this session hits is
         # recorded here (`execute()`), and `hook-computer-use` reads this
         # list on every `tool:post` to inject a standing reminder into the
@@ -652,7 +676,12 @@ class ComputerTool:
             "Control the user's real desktop: capture the screen, move and click the "
             "mouse, drag, scroll, type text, press key combinations, and list or focus windows. "
             "Coordinates are in the pixel space of the screenshots returned by this tool. "
-            "Always take a screenshot before acting so you can see where things are."
+            "Always take a screenshot before acting so you can see where things are. "
+            "This machine may be in use by a human at the same time you are driving it: "
+            "your keystrokes and theirs can interleave, so a command you believe you typed "
+            "verbatim may land with extra or missing characters. If a result looks off "
+            "(an unexpected error, a typo, output that doesn't match), verify what actually "
+            "landed before assuming your own input was wrong."
         )
 
     @property
@@ -1379,7 +1408,11 @@ class DesktopTool:
             "Clipboard access is the reliable way to pull exact text out of an app "
             "(select, copy, then get_clipboard). On a multi-monitor desktop, use "
             "`list_monitors` to see what's available and `select_monitor` to target one - "
-            "`computer` is scoped to a single monitor by default so screenshots stay legible."
+            "`computer` is scoped to a single monitor by default so screenshots stay legible. "
+            "This machine may be in use by a human at the same time as you: a window's "
+            "focus or clipboard contents can change from something other than your own "
+            "actions between calls, so re-check with `list_windows`/`get_clipboard` rather "
+            "than assuming the state you last set still holds."
         )
 
     @property
@@ -1685,6 +1718,297 @@ def _build_coexistence_guard(
     return guard
 
 
+class AnnouncementRefused(RuntimeError):
+    """The session-start announcement gate refused to let this session begin
+    driving (`docs/designs/coexistence.md` \u00a77.3/\u00a77.6).
+
+    Distinct from `NoBackendAvailable`: the backend itself is fine (the
+    display, the injector, the guard all work) - what refused is the
+    disclosure gate. Caught by `mount()` exactly like `NoBackendAvailable`:
+    logged plainly, nothing mounted, no traceback.
+    """
+
+
+def _channel_failure_snapshot(guard: CoexistenceGuard) -> PresenceSnapshot:
+    """A live presence read taken at the moment a disclosure channel failed
+    to display - safe to call here because `_build_announcement` only ever
+    runs from `mount()`, before any tool call is dispatched, so there is no
+    concurrent thread that could also be mutating `guard.presence` (unlike
+    the overlay's own click callbacks - see `_on_overlay_cancel` below,
+    which deliberately does NOT call this)."""
+    return guard.presence.sample()
+
+
+def _handle_channel_failure(
+    guard: CoexistenceGuard, backend_name: str, channel: str, exc: Exception
+) -> None:
+    """\u00a77.6's rule, applied uniformly to every disclosure channel (Linux
+    overlay, Windows overlay, macOS dialog): a human detected present, with
+    no working way to tell them an agent is about to drive this machine, is
+    refused outright. Nobody detected present -> proceed, but LOUDLY (an
+    `logger.error`, not a swallowed exception) - this is the \"loud, not
+    silent\" requirement: a channel that failed to display must never look,
+    from the caller's side, identical to a channel that was never attempted.
+    """
+    try:
+        snap = _channel_failure_snapshot(guard)
+        human_present = snap.state is PresenceState.HUMAN_ACTIVE
+    except IdleUnreadableError:
+        # \u00a79.6: an unreadable idle counter is a hard error, never guessed as
+        # "quiet" - the same fail-safe direction applies here: treat it as if
+        # a human were detected.
+        human_present = True
+    if human_present:
+        raise AnnouncementRefused(
+            f"{channel} failed to display on backend {backend_name!r} ({exc}) "
+            "and a human is currently detected at this machine - refusing to "
+            "begin driving with no working disclosure channel "
+            "(docs/designs/coexistence.md \u00a77.6). Not overridable by default; "
+            "see that section for the explicit, logged per-target opt-out."
+        ) from exc
+    logger.error(
+        "coexistence: %s failed to display on backend %r (%s) - no human is "
+        "currently detected, so this session proceeds WITHOUT a disclosure "
+        "channel. This is loud, not silent: if a human sits down mid-session "
+        "there is nothing to warn them beyond the halt invariant itself.",
+        channel,
+        backend_name,
+        exc,
+    )
+
+
+def _on_overlay_pause(guard: CoexistenceGuard, backend_name: str) -> None:
+    """Wired as the overlay's Pause button callback - runs on the overlay's
+    own background poll thread (`overlay_linux.LinuxOverlay._poll_events` /
+    `overlay_windows.WindowsOverlay._poll_events`), never on the guard's
+    usual single-threaded call path. This is safe BY DESIGN, not by luck:
+    `pause.PauseController` exists specifically so a human, via the overlay,
+    may set pause (`HUMAN_SOURCES` names `\"overlay_click\"` explicitly in its
+    own docstring) - this is that wiring, not a new one invented here.
+    """
+    guard.pause.set("overlay_click", reason="human clicked Pause on the overlay")
+    logger.warning("coexistence: human paused via overlay (backend=%r)", backend_name)
+
+
+def _on_overlay_cancel(guard: CoexistenceGuard, backend_name: str) -> None:
+    """Wired as the overlay's Cancel button callback (\u00a78.5: cancel is
+    terminal, unlike pause). Runs on the SAME background poll thread as
+    `_on_overlay_pause` above.
+
+    Deliberately does NOT call `guard.seed_halted()` or `guard.presence.sample()`
+    directly from this thread - both mutate multi-field state
+    (`CoexistenceGuard._halted`/`_halt_snapshot`, `PresenceMonitor`'s internal
+    fields) that `before_event()` reads/writes from the guard's own
+    single-threaded call path, and doing so from a second thread would be a
+    genuinely NEW race this codebase does not otherwise have (unlike
+    `PauseController.set()`, which was built for exactly this cross-thread
+    call). Instead this only writes the DURABLE halt record
+    (`halt_state.record_halt`) - the exact mechanism `_poll_durable_halt()`
+    already polls for, from the guard's own thread, on the very next
+    `before_event()` call. That is what actually latches `_halted=True`;
+    this function only ever gets the fact onto disk.
+    """
+    guard.release_all("cancelled_via_overlay")
+    snap = PresenceSnapshot(
+        state=PresenceState.HUMAN_ACTIVE,
+        confidence=Confidence.HIGH,
+        basis="overlay_cancel",
+        last_human_input_ago_ms=0.0,
+        margin_ms=None,
+        guard_ms=guard.presence.guard_ms,
+        guard_measured=guard.presence.guard_measured,
+        sample_interval_ms=None,
+        latched_until_ms=None,
+    )
+    record_halt(backend_name, snap, reason="cancelled via overlay Cancel button")
+    logger.warning(
+        "coexistence: human clicked Cancel via overlay (backend=%r) - a "
+        "durable halt record was written; every write on this backend is "
+        "refused starting with the next guard check, this session and any "
+        "future one, until a human explicitly clears it (see "
+        "halt_state.resolve_resume_command())",
+        backend_name,
+    )
+
+
+def _handle_macos_announce(
+    guard: CoexistenceGuard, backend_name: str, cfg: dict[str, Any]
+) -> None:
+    """One announce-and-acknowledge dialog at session start, before the first
+    write (`docs/designs/coexistence.md` \u00a77.3) - implements that section's
+    three rules exactly:
+
+    1. The dialog text discloses the timeout in plain language (enforced by
+       `announce_macos._build_script`, not re-checked here).
+    2. `gave_up=True` is never treated as consent.
+    3. What a non-answer permits is decided by a FRESH presence sample taken
+       at the moment of timeout, not by the clock: `quiet` -> proceed,
+       anything else -> refuse.
+
+    The dialog's actual buttons are \"Pause\"/\"Continue\" (the tested,
+    implemented contract in `announce_macos.py` - see `tests/test_announce_macos.py`),
+    not the illustrative \"Don't allow\"/\"Allow\" mockup text in the design
+    doc's prose; this follows the code that was actually built and tested.
+    """
+    coexistence_cfg = dict(cfg.get("coexistence") or {})
+    timeout = int(
+        coexistence_cfg.get("announce_timeout_seconds", MACOS_ANNOUNCE_TIMEOUT_SECONDS)
+    )
+    message = (
+        "An automated agent (Amplifier computer-use) wants to drive this Mac "
+        f"from {socket.gethostname()}.\n\n"
+        f"This prompt closes in {timeout} seconds.\n"
+        "If nobody answers and this Mac is idle, driving will start.\n"
+        "If nobody answers and someone is using this Mac, driving will NOT "
+        "start.\n\n"
+        "Click Continue to allow driving to begin, or Pause to refuse."
+    )
+    try:
+        result = macos_announce(message, timeout_seconds=timeout)
+    except AnnounceError as exc:
+        _handle_channel_failure(guard, backend_name, "macOS announce dialog", exc)
+        return
+    if result.acknowledged:
+        if result.button == "Continue":
+            logger.info(
+                "coexistence: macOS announce dialog acknowledged (Continue) "
+                "- driving begins (backend=%r)",
+                backend_name,
+            )
+            return
+        raise AnnouncementRefused(
+            f"macOS announce dialog was answered {result.button!r} - the "
+            "human explicitly declined to allow driving to begin this "
+            "session (docs/designs/coexistence.md \u00a77.3)."
+        )
+    # gave_up: a countdown nobody answered is never consent (rule 2). What it
+    # permits is decided by a fresh presence sample, not the clock (rule 3).
+    try:
+        snap = guard.presence.sample()
+    except IdleUnreadableError as exc:
+        raise AnnouncementRefused(
+            "macOS announce dialog timed out with no answer, and presence "
+            f"could not be read to decide what that permits ({exc}) - "
+            "refusing to begin driving (docs/designs/coexistence.md \u00a77.3)."
+        ) from exc
+    if snap.state is PresenceState.QUIET:
+        logger.info(
+            "coexistence: macOS announce dialog timed out with nobody there "
+            "to answer (presence=quiet) - proceeding, per "
+            "docs/designs/coexistence.md \u00a77.3 rule 3 (backend=%r)",
+            backend_name,
+        )
+        return
+    raise AnnouncementRefused(
+        "macOS announce dialog timed out (gave_up) and presence sampled "
+        f"{snap.state.value!r} at that moment - a non-answer while someone "
+        "may be at the machine is treated as a refusal, never as consent "
+        "(docs/designs/coexistence.md \u00a77.3 rules 2-3)."
+    )
+
+
+def _build_announcement(
+    backend: Backend,
+    guard: CoexistenceGuard | None,
+    cfg: dict[str, Any],
+    disp: Display,
+) -> Any | None:
+    """Build (and show) the session-start disclosure this backend supports,
+    or refuse to mount via `AnnouncementRefused` (\u00a77.3/\u00a77.6). `mount()` calls
+    this once, right after the coexistence guard, before returning.
+
+    Returns whatever handle (if any) needs to stay alive for this tool's
+    lifetime (an overlay object) so it is not garbage-collected - `None` for
+    a one-shot channel (macOS's dialog) or when no channel exists at all.
+
+    `cfg[\"coexistence\"][\"announce\"]` (default `True`): the on/off switch for
+    this feature, symmetric with `_build_coexistence_guard`'s own `enabled`
+    key - \"on by default\" per the design brief, with the same kind of
+    explicit, logged opt-out the rest of this module already uses for other
+    policy knobs.
+    """
+    coexistence_cfg = dict(cfg.get("coexistence") or {})
+    if not bool(coexistence_cfg.get("announce", True)):
+        logger.info(
+            "coexistence: announcement disabled by config for backend %r",
+            backend.name,
+        )
+        return None
+    if guard is None:
+        # No presence detector at all for this backend (\u00a75.5) - there is no
+        # way to apply \u00a77.6's human-detected-vs-not policy, so nothing can be
+        # safely built here. Loud, not silent: this backend has neither halt
+        # protection nor a disclosure channel.
+        logger.warning(
+            "coexistence: backend %r has no presence detector, so no "
+            "announcement channel can be safely gated either "
+            "(docs/designs/coexistence.md \u00a77.6) - this session has neither "
+            "halt protection nor a disclosure channel",
+            backend.name,
+        )
+        return None
+
+    if isinstance(backend, LinuxX11Backend):
+        try:
+            overlay = LinuxOverlay(
+                backend.display,
+                screen_width=disp.screen_width,
+                screen_x=disp.origin_x,
+                screen_y=disp.origin_y,
+                exclusion=guard.exclusion,
+                on_pause=lambda: _on_overlay_pause(guard, backend.name),
+                on_cancel=lambda: _on_overlay_cancel(guard, backend.name),
+            )
+            overlay.show()
+        except Exception as exc:  # noqa: BLE001 - any failure -> the shared \u00a77.6 policy
+            _handle_channel_failure(guard, backend.name, "Linux overlay", exc)
+            return None
+        logger.info("coexistence: Linux overlay shown for backend %r", backend.name)
+        return overlay
+
+    if isinstance(backend, WindowsBackend):
+        overlay = WindowsOverlay(
+            screen_width=disp.screen_width,
+            screen_x=disp.origin_x,
+            screen_y=disp.origin_y,
+            exclusion=guard.exclusion,
+            on_pause=lambda: _on_overlay_pause(guard, backend.name),
+            on_cancel=lambda: _on_overlay_cancel(guard, backend.name),
+            powershell_path=cfg.get("powershell_path"),
+        )
+        try:
+            overlay.show()
+        except Exception as exc:  # noqa: BLE001 - any failure -> the shared \u00a77.6 policy
+            _handle_channel_failure(guard, backend.name, "Windows overlay", exc)
+            return None
+        # No cross-process handle ties this detached PID's life to this
+        # agent process's (see overlay_windows.py's module docstring, Phase
+        # C5/transport Phase 4) - `atexit` is the honest, minimal stand-in:
+        # best-effort cleanup on every normal exit path this process has.
+        atexit.register(overlay.hide)
+        logger.info("coexistence: Windows overlay shown for backend %r", backend.name)
+        return overlay
+
+    if isinstance(backend, MacOSBackend):
+        _handle_macos_announce(guard, backend.name, cfg)
+        return None
+
+    # Deliberate scope boundary, not a silent gap: none of the three
+    # existing announcement modules were built with a remote target in mind
+    # (each is architected around a LOCAL injection call site - see their
+    # own module docstrings) - see BACKLOG.md for the remote/Windows-Phase-4
+    # follow-up work this leaves open.
+    logger.warning(
+        "coexistence: no announcement channel implemented for backend %r - "
+        "a deliberate scope boundary (see BACKLOG.md), not a silent gap: "
+        "the halt invariant (\u00a76.0) still enforces stop-on-detected-human for "
+        "this backend, but there is no proactive disclosure to a human who "
+        "sits down mid-session",
+        backend.name,
+    )
+    return None
+
+
 async def mount(
     coordinator: Any, config: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -1737,6 +2061,25 @@ async def mount(
     # `_build_coexistence_guard`). `None` on every other backend, unchanged
     # from before this feature existed.
     computer._coexistence_guard = _build_coexistence_guard(backend, cfg)
+    # Session-start disclosure (docs/designs/coexistence.md §7) - the
+    # Linux/Windows overlay or the macOS announce-and-acknowledge dialog,
+    # whichever this backend supports. On by default (§7.1: "an announcement
+    # that failed to render is a stop button the human cannot reach" - a
+    # flag nobody sets is the same as dead code). May refuse to mount via
+    # `AnnouncementRefused` (§7.3/§7.6: a human detected present with no
+    # working disclosure channel) - handled exactly like `NoBackendAvailable`.
+    try:
+        computer._announcement = _build_announcement(
+            backend, computer._coexistence_guard, cfg, computer.resolve_display()
+        )
+    except AnnouncementRefused as exc:
+        logger.warning("tool-computer-use: not mounting - %s", exc)
+        return {
+            "name": "tool-computer-use",
+            "version": __version__,
+            "provides": [],
+            "description": f"computer-use not mounted: {exc}",
+        }
 
     await coordinator.mount("tools", computer, name=computer.name)
     desktop = DesktopTool(computer)
