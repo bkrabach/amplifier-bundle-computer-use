@@ -210,7 +210,12 @@ def _resolve_uv_command(user_host: str, ssh_path: str = "ssh") -> str:
     cmd = [ssh_path, "-n", *_SSH_OPTS, user_host, f"sh -lc {shlex.quote(probe)}"]
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=15, check=False
+            cmd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
         )
     except subprocess.TimeoutExpired as exc:
         raise SshConnectError(f"timed out probing for uv on {user_host}") from exc

@@ -241,6 +241,7 @@ class WindowsOverlay:
             ]
             proc = subprocess.run(
                 [self.powershell, *args],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -323,6 +324,7 @@ class WindowsOverlay:
                         "-Command",
                         f"Stop-Process -Id {self._pid} -Force -ErrorAction SilentlyContinue",
                     ],
+                    stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
@@ -369,6 +371,7 @@ class WindowsOverlay:
                     "-Command",
                     win_path,
                 ],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

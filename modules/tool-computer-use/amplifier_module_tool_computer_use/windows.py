@@ -70,6 +70,7 @@ def _parse_rect(raw: Any) -> tuple[int, int, int, int] | None:
 def _translate(path: str, flag: str) -> str:
     proc = subprocess.run(
         ["wslpath", flag, str(path)],
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -235,6 +236,7 @@ class WindowsBackend:
                     "-RequestFile",
                     _translate(req_path, "-w"),
                 ],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

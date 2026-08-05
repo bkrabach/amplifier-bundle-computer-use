@@ -124,6 +124,7 @@ def announce(
     try:
         proc = subprocess.run(
             [osascript_path, "-e", script],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",

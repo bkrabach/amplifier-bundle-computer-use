@@ -336,6 +336,7 @@ def _macos_session_state() -> tuple[str, str]:
     try:
         proc = subprocess.run(
             [exe, "-n", "Root", "-d1", "-a"],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -1344,6 +1345,7 @@ class MacOSBackend:
 
         proc = subprocess.run(
             ["osascript", "-e", script],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -1366,6 +1368,7 @@ class MacOSBackend:
             )
         proc = subprocess.run(
             [exe],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",

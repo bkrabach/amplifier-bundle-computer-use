@@ -675,6 +675,7 @@ class LinuxX11Backend:
             raise BackendError("xclip not found on PATH; required for clipboard access")
         proc = subprocess.run(
             [exe, "-selection", "clipboard", "-o"],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",
