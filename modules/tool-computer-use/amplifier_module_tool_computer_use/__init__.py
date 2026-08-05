@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import socket
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -1990,6 +1991,68 @@ def _handle_macos_announce(
     _apply_macos_announce_result(guard, backend_name, result)
 
 
+#: Guards `_announcement_decisions` below. A plain `threading.Lock`, not
+#: per-key: contention is momentary (dict read/write only - never held
+#: across the actual dialog/overlay/RPC call, see `_build_announcement`) and
+#: mount() itself is rare enough in any one process that a single lock is
+#: not a bottleneck worth complicating.
+_announcement_lock = threading.Lock()
+
+#: One decision per PHYSICAL disclosure channel, cached for the life of this
+#: controller process - see `_channel_identity` for what "physical channel"
+#: means and `_build_announcement` for why this exists. The defect this
+#: fixes: a parent session's own `mount()` and a delegated child session's
+#: `mount()` (`tool-delegate` inherits the parent's tool config, including
+#: any `target:` - see `amplifier_module_tool_delegate._merge_tools`) each
+#: used to independently decide whether to proceed, against the SAME
+#: machine, without knowing the other had already asked.
+#: `shared_transport.py` already solved this exact "more than one consumer
+#: in this process talks to the same target" problem for the SSH connection
+#: itself (see that module's own docstring); this dict is the same fix one
+#: layer up, for the disclosure gate.
+_announcement_decisions: dict[str, _AnnouncementDecision] = {}
+
+
+@dataclass(frozen=True)
+class _AnnouncementDecision:
+    """The outcome of the FIRST mount() to ask this channel's question -
+    reused verbatim by every later mount() in this process rather than
+    asking (or refusing) again. Exactly one of `handle`/`refused` is
+    meaningful; `refused is not None` means the channel was declined, and
+    every subsequent mount() for this channel refuses too, without
+    re-showing anything - re-asking after a human already said no is worse
+    than not asking at all (it trains people to click through)."""
+
+    handle: Any
+    refused: AnnouncementRefused | None
+
+
+def _channel_identity(backend: Backend) -> str:
+    """A stable identity for the PHYSICAL machine a disclosure channel would
+    target - the same identity for every `ComputerTool` mount in this
+    process that would show a dialog/overlay on the SAME desktop, however
+    many separate `mount()` calls (parent session, delegated child session,
+    a second delegated child, ...) each independently construct their own
+    `Backend`/`ComputerTool` instances for it.
+
+    Remote: `user_host` (added to `RemoteBackend` alongside this fix) - the
+    actual `user@host` string, not `backend.name` (which is
+    `"remote-ssh:<platform>"` - identical for any two DIFFERENT hosts that
+    happen to run the same platform, e.g. two macOS targets). Falls back to
+    `backend.name` only if some future `Backend` sets `is_remote = True`
+    without a `user_host` - never true for `RemoteBackend` itself past
+    `connect()`.
+
+    Local: `backend.name` alone (e.g. "linux-x11", "windows-wsl2", "macos")
+    - a controller process only ever drives one local desktop, so the
+    backend type is already a unique-enough key.
+    """
+    if bool(getattr(backend, "is_remote", False)):
+        host = getattr(backend, "user_host", None)
+        return f"remote:{host}" if host else f"remote:{backend.name}"
+    return f"local:{backend.name}"
+
+
 def _build_announcement(
     backend: Backend,
     guard: CoexistenceGuard | None,
@@ -2030,6 +2093,56 @@ def _build_announcement(
             backend.name,
         )
         return None
+
+    channel_key = _channel_identity(backend)
+    with _announcement_lock:
+        cached = _announcement_decisions.get(channel_key)
+    if cached is not None:
+        if cached.refused is not None:
+            logger.warning(
+                "coexistence: NOT re-asking for %r - an earlier mount() in "
+                "this process already asked and the human declined (%s). "
+                "This mount is refused without showing anything again: "
+                "re-asking after a refusal is worse than not asking at all.",
+                channel_key,
+                cached.refused,
+            )
+            raise AnnouncementRefused(str(cached.refused))
+        logger.info(
+            "coexistence: reusing the disclosure decision an earlier "
+            "mount() in this process already made for %r - a delegated "
+            "child session (or a second tool config) targeting the same "
+            "machine does not get its own dialog/overlay",
+            channel_key,
+        )
+        return cached.handle
+
+    try:
+        handle = _dispatch_announcement(backend, guard, cfg, disp)
+    except AnnouncementRefused as exc:
+        with _announcement_lock:
+            _announcement_decisions.setdefault(
+                channel_key, _AnnouncementDecision(handle=None, refused=exc)
+            )
+        raise
+    with _announcement_lock:
+        _announcement_decisions.setdefault(
+            channel_key, _AnnouncementDecision(handle=handle, refused=None)
+        )
+    return handle
+
+
+def _dispatch_announcement(
+    backend: Backend,
+    guard: CoexistenceGuard,
+    cfg: dict[str, Any],
+    disp: Display,
+) -> Any | None:
+    """The actual per-backend-type disclosure logic `_build_announcement`
+    memoizes above - unchanged from before that cache existed. Split out so
+    the memoization wrapper never has to duplicate (or risk drifting from)
+    any of these branches; `guard` is narrowed to non-None here because
+    `_build_announcement` already returned early for that case."""
 
     if isinstance(backend, LinuxX11Backend):
         try:

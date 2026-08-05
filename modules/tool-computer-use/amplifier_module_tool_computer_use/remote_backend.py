@@ -85,6 +85,21 @@ class RemoteBackend:
         # until `connect()` completes a handshake.
         self.presence_platform: str | None = None
 
+    @property
+    def user_host(self) -> str:
+        """The actual `user@host` (or bare `host`) string this backend talks
+        to - unlike `self.name` (`"remote-ssh:<platform>"`, identical for
+        any two different hosts running the same platform), this is unique
+        per TARGET. Used by `__init__.py`'s `_channel_identity` to key the
+        one-disclosure-decision-per-machine cache; every consumer that
+        shares the same target already shares one `SshTransport`/
+        `SharedTransportHandle` via `registry._build_ssh_transport`
+        (`shared_transport.py`), so `self._transport.user_host` is the same
+        string for all of them. `"?"` only if no transport was ever
+        configured (should not happen via `registry.select_backend`).
+        """
+        return self._transport.user_host if self._transport is not None else "?"
+
     # -- connection lifecycle (used by registry.select_backend) -------------
 
     def connect(
