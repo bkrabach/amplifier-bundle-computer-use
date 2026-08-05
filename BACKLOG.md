@@ -263,6 +263,18 @@ Two separable pieces of work, smallest first:
   built around, but it is an unverified assumption, not a measured finding — treat this
   bullet as a direction to investigate, not a design. Note the prior art already surveyed
   in this file's *Also relevant* section carries the identical X11-only constraint.
+### Remote Linux — untested, no eligible target has existed
+
+Every other transport/platform pair has real-hardware proof. Remote Linux does not, and the
+reason is availability rather than defect: the reachable Linux box is **headless** —
+`loginctl` session type `tty`, `/tmp/.X11-unix/` empty, no X display to drive.
+
+The code path is shared with remote Windows and remote macOS (same `RemoteBackend`, same
+`ssh_transport`, same wire), so there is no known reason it would not work. That is an
+argument, not evidence, and this entry exists so nobody mistakes one for the other.
+
+Needs: any Linux machine with a real X11 session reachable over SSH.
+
 
 ---
 
@@ -273,6 +285,38 @@ Two separable pieces of work, smallest first:
   same persistent-NDJSON pattern already used for the remote agent applies one
   layer down. This is the single largest latency win available on Windows, and
   remote SSH stacks on top of it rather than fixing it.
+
+---
+
+## Remote transport — phases 3, 4, 5
+
+`docs/designs/remote-transport.md` §13 defines a five-phase ladder. **Phases 1 and 2 are
+complete**; the remaining three are recorded here so the ladder is visible from the backlog
+rather than only from the design doc.
+
+### Phase 3 — Contention
+
+Today the coexistence guard halts writes when it detects human input at the target, and that
+is the only policy available. The design calls for the contention signal to be **always
+computed and attached to results** as a mechanism, with a separate policy knob —
+`contention: exclusive | observe | partition | detect-and-halt` — plus a monitor-constrained
+`focus_window` for partition mode.
+
+The honest limit, stated in the design doc: per-monitor partitioning gives correct screenshots
+and clicks on a specific monitor but **cannot confine keystrokes**, because focus is global.
+
+### Phase 4 — Persistent PowerShell
+
+See *Performance → Persistent PowerShell bridge* above; this is the same work, and it is the
+single largest latency win available on Windows (currently roughly 780ms per action). Recorded
+here as well because it is a numbered phase, not only an optimization. The design sequences it
+late deliberately: it is the riskiest change to the most-verified backend.
+
+### Phase 5 — Controller portability, then optimization
+
+Running the CLI from macOS or Linux or WSL, driving local or remote. Mostly free — the
+controller side is already platform-agnostic. Then, **only if measurement justifies it**:
+binary framing (the `enc` field is already reserved on the wire) and framebuffer deltas.
 
 ---
 
