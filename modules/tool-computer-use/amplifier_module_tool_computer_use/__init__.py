@@ -36,16 +36,18 @@ import socket
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from amplifier_core.models import ToolResult
 
 from .announce_macos import DEFAULT_TIMEOUT_SECONDS as MACOS_ANNOUNCE_TIMEOUT_SECONDS
-from .announce_macos import AnnounceError
+from .announce_macos import AnnounceError, AnnounceResult
 from .announce_macos import announce as macos_announce
 from .backend import Backend, BackendError, MonitorInfo
 from .coexistence_guard import CoexistenceGuard, HaltedError
+from .exclusion import Rect
 from .geometry import Display, ImageSpace, compute_display
 from .halt_state import (
     load_halt,
@@ -371,6 +373,15 @@ class ComputerTool:
         # local in `mount()`) so it is not garbage-collected out from under
         # its own background poll thread.
         self._announcement: Any | None = None
+        # Remote-only (docs/designs/coexistence.md \u00a78.1/\u00a79.1): the target's
+        # own persistent overlay is invisible to this controller until asked
+        # (see `_sync_remote_announcement_state`) - nothing observes the
+        # target's real input events directly. Edge-triggered, not level:
+        # each flips true at most once per session, so a human clicking
+        # Pause/Cancel is applied to this session's guard exactly once, not
+        # once per guarded write for the remainder of the session.
+        self._remote_pause_seen: bool = False
+        self._remote_cancel_seen: bool = False
         # Defect 1 (halt surfacing): every `HaltedError` this session hits is
         # recorded here (`execute()`), and `hook-computer-use` reads this
         # list on every `tool:post` to inject a standing reminder into the
@@ -877,6 +888,8 @@ class ComputerTool:
         if guard is None:
             yield
             return
+        if self._is_remote and self._announcement is not None:
+            self._sync_remote_announcement_state(guard)
         guard.check_start_permission()
         guard.bind_target()
         guard.before_event(coord=coord)
@@ -885,6 +898,58 @@ class ComputerTool:
         finally:
             guard.after_event()
             guard.release_target()
+
+    def _sync_remote_announcement_state(self, guard: CoexistenceGuard) -> None:
+        """Pull the target-side overlay's Pause/Cancel state
+        (docs/designs/coexistence.md \u00a78.1/\u00a79.1) into THIS session's guard
+        before every guarded write. The overlay lives entirely on the
+        target (only that process can draw on that desktop, or observe a
+        real click there) - a click is otherwise invisible to this
+        controller until asked. Piggybacked on the exact cadence
+        `before_event()`'s own presence sample already uses for a remote
+        backend (\u00a75.2/\u00a75.7) rather than a second background thread or a
+        parallel polling channel - the same once-per-guarded-write wire
+        round trip discipline `presence_idle` already established, applied
+        to a second fact instead of a new mechanism.
+
+        Reuses `_on_overlay_pause`/`_on_overlay_cancel` verbatim - the same
+        functions a LOCAL overlay's own click callback already calls
+        in-process - so a remote pause/cancel is handled identically to a
+        local one from this point forward (guard.pause.set(...) /
+        durable-halt-record + release_all). Edge-triggered via
+        `_remote_pause_seen`/`_remote_cancel_seen`: each fires at most once
+        per session, since the target's own flags are latched
+        (level-triggered, never cleared - see `RemoteAgent
+        ._op_announcement_status`) and calling `_on_overlay_cancel` twice
+        would write a redundant durable halt record for no benefit.
+
+        Best-effort: a read failure here must never block the write path
+        this guard already protects - \u00a76.0's halt invariant and this
+        session's own live presence sample apply regardless of whether this
+        secondary signal could be read this time.
+        """
+        status_fn = getattr(self._backend, "announcement_status", None)
+        if status_fn is None:
+            return
+        try:
+            status = status_fn()
+        except BackendError as exc:
+            logger.warning(
+                "coexistence: remote announcement_status read failed "
+                "(backend=%r): %s - a human's Pause/Cancel click on the "
+                "remote overlay would be invisible to this controller until "
+                "the next successful read",
+                self._backend.name,
+                exc,
+            )
+            return
+        if status.get("cancelled") and not self._remote_cancel_seen:
+            self._remote_cancel_seen = True
+            _on_overlay_cancel(guard, self._backend.name)
+            return
+        if status.get("paused") and not self._remote_pause_seen:
+            self._remote_pause_seen = True
+            _on_overlay_pause(guard, self._backend.name)
 
     # -- execution --------------------------------------------------------------
     def _run(self, action: str, params: dict[str, Any]) -> tuple[str, str | None]:
@@ -1137,6 +1202,8 @@ class ComputerTool:
                 )
             if guard_active:
                 assert guard is not None
+                if self._is_remote and self._announcement is not None:
+                    self._sync_remote_announcement_state(guard)
                 # \u00a75.2/\u00a78.6: bind the delivery target once at operation
                 # start; `backend.type_text` re-checks it (via the guard)
                 # before EVERY keystroke, and records a fresh injection
@@ -1831,43 +1898,34 @@ def _on_overlay_cancel(guard: CoexistenceGuard, backend_name: str) -> None:
     )
 
 
-def _handle_macos_announce(
-    guard: CoexistenceGuard, backend_name: str, cfg: dict[str, Any]
-) -> None:
-    """One announce-and-acknowledge dialog at session start, before the first
-    write (`docs/designs/coexistence.md` \u00a77.3) - implements that section's
-    three rules exactly:
-
-    1. The dialog text discloses the timeout in plain language (enforced by
-       `announce_macos._build_script`, not re-checked here).
-    2. `gave_up=True` is never treated as consent.
-    3. What a non-answer permits is decided by a FRESH presence sample taken
-       at the moment of timeout, not by the clock: `quiet` -> proceed,
-       anything else -> refuse.
-
-    The dialog's actual buttons are \"Pause\"/\"Continue\" (the tested,
-    implemented contract in `announce_macos.py` - see `tests/test_announce_macos.py`),
-    not the illustrative \"Don't allow\"/\"Allow\" mockup text in the design
-    doc's prose; this follows the code that was actually built and tested.
+def _macos_announce_message(timeout: int, *, controller_host: str) -> str:
+    """The \u00a77.3 disclosed-timeout dialog text, shared by the local and
+    remote paths - `controller_host` is the machine driving the Mac (its own
+    hostname when local, the actual controller's hostname when remote), so
+    the same sentence is honest in both deployment shapes.
     """
-    coexistence_cfg = dict(cfg.get("coexistence") or {})
-    timeout = int(
-        coexistence_cfg.get("announce_timeout_seconds", MACOS_ANNOUNCE_TIMEOUT_SECONDS)
-    )
-    message = (
+    return (
         "An automated agent (Amplifier computer-use) wants to drive this Mac "
-        f"from {socket.gethostname()}.\n\n"
+        f"from {controller_host}.\n\n"
         f"This prompt closes in {timeout} seconds.\n"
         "If nobody answers and this Mac is idle, driving will start.\n"
         "If nobody answers and someone is using this Mac, driving will NOT "
         "start.\n\n"
         "Click Continue to allow driving to begin, or Pause to refuse."
     )
-    try:
-        result = macos_announce(message, timeout_seconds=timeout)
-    except AnnounceError as exc:
-        _handle_channel_failure(guard, backend_name, "macOS announce dialog", exc)
-        return
+
+
+def _apply_macos_announce_result(
+    guard: CoexistenceGuard, backend_name: str, result: AnnounceResult
+) -> None:
+    """The \u00a77.3 policy (rules 1-3), applied to an `AnnounceResult` -
+    shared by `_handle_macos_announce` (the dialog ran in THIS process,
+    because this process IS the Mac) and `_handle_remote_macos_announce`
+    (the dialog ran on a DIFFERENT Mac, relayed back over the wire). The
+    decision rules do not care which; only where the dialog physically
+    displayed differs, and that distinction is already resolved by the time
+    an `AnnounceResult` reaches this function.
+    """
     if result.acknowledged:
         if result.button == "Continue":
             logger.info(
@@ -1905,6 +1963,31 @@ def _handle_macos_announce(
         "may be at the machine is treated as a refusal, never as consent "
         "(docs/designs/coexistence.md \u00a77.3 rules 2-3)."
     )
+
+
+def _handle_macos_announce(
+    guard: CoexistenceGuard, backend_name: str, cfg: dict[str, Any]
+) -> None:
+    """One announce-and-acknowledge dialog at session start, before the first
+    write (`docs/designs/coexistence.md` \u00a77.3) - implements that section's
+    three rules exactly (see `_apply_macos_announce_result`).
+
+    The dialog's actual buttons are "Pause"/"Continue" (the tested,
+    implemented contract in `announce_macos.py` - see `tests/test_announce_macos.py`),
+    not the illustrative "Don't allow"/"Allow" mockup text in the design
+    doc's prose; this follows the code that was actually built and tested.
+    """
+    coexistence_cfg = dict(cfg.get("coexistence") or {})
+    timeout = int(
+        coexistence_cfg.get("announce_timeout_seconds", MACOS_ANNOUNCE_TIMEOUT_SECONDS)
+    )
+    message = _macos_announce_message(timeout, controller_host=socket.gethostname())
+    try:
+        result = macos_announce(message, timeout_seconds=timeout)
+    except AnnounceError as exc:
+        _handle_channel_failure(guard, backend_name, "macOS announce dialog", exc)
+        return
+    _apply_macos_announce_result(guard, backend_name, result)
 
 
 def _build_announcement(
@@ -1993,20 +2076,167 @@ def _build_announcement(
         _handle_macos_announce(guard, backend.name, cfg)
         return None
 
-    # Deliberate scope boundary, not a silent gap: none of the three
-    # existing announcement modules were built with a remote target in mind
-    # (each is architected around a LOCAL injection call site - see their
-    # own module docstrings) - see BACKLOG.md for the remote/Windows-Phase-4
-    # follow-up work this leaves open.
+    if bool(getattr(backend, "is_remote", False)):
+        return _build_remote_announcement(backend, guard, cfg, disp)
+
+    # Deliberate scope boundary, not a silent gap: a genuinely new backend
+    # type this module does not yet know how to announce for.
     logger.warning(
         "coexistence: no announcement channel implemented for backend %r - "
-        "a deliberate scope boundary (see BACKLOG.md), not a silent gap: "
-        "the halt invariant (\u00a76.0) still enforces stop-on-detected-human for "
-        "this backend, but there is no proactive disclosure to a human who "
-        "sits down mid-session",
+        "a deliberate scope boundary, not a silent gap: the halt invariant "
+        "(\u00a76.0) still enforces stop-on-detected-human for this backend, but "
+        "there is no proactive disclosure to a human who sits down "
+        "mid-session",
         backend.name,
     )
     return None
+
+
+@dataclass(frozen=True)
+class _RemoteAnnouncementHandle:
+    """Truthy sentinel stored in `ComputerTool._announcement` when a REMOTE
+    target's persistent overlay was raised successfully - there is nothing
+    LOCAL to keep alive for it (no thread, no subprocess: the overlay lives
+    entirely in the target-side `RemoteAgent`, torn down by ITS OWN shutdown
+    path - see `remote_agent.RemoteAgent._teardown_overlay`, wired into the
+    same `finally`/signal-handler paths that already guarantee held-input
+    release for a remote session). Its only job is to tell
+    `ComputerTool._sync_remote_announcement_state` that a channel exists and
+    is worth polling before every guarded write - `bool(handle)` is always
+    `True` for a real instance, so `self._announcement is not None` alone
+    already means \"poll it\".
+    """
+
+    backend_name: str
+
+
+def _build_remote_announcement(
+    backend: Backend, guard: CoexistenceGuard, cfg: dict[str, Any], disp: Display
+) -> Any | None:
+    """The remote counterpart of the three local branches above
+    (docs/designs/coexistence.md \u00a77, \u00a710.3) - closes the gap the prior
+    pass left as a deliberate scope boundary (see BACKLOG.md): every
+    existing announcement module was architected around running in the
+    SAME process that owns the injection call site, which for a remote
+    session is the TARGET-side `RemoteAgent`, never this controller. This
+    function only ever asks the target to raise its own channel
+    (`RemoteBackend.announce_raise`, forwarding to
+    `remote_agent.RemoteAgent._op_announce_raise`) and applies the exact
+    same \u00a77.3/\u00a77.6 policy the local branches already enforce to whatever
+    comes back.
+
+    `presence_platform` (set on `RemoteBackend` from its own handshake, the
+    same field `_build_coexistence_guard` already uses to resolve
+    `GUARD_MS`) - not `backend.name`, which for a remote backend is the
+    composite `"remote-ssh:<platform>"` identifier - selects which flavor
+    of channel to ask for.
+    """
+    platform = getattr(backend, "presence_platform", None)
+    if platform == "macos":
+        _handle_remote_macos_announce(backend, guard, cfg)
+        return None
+    if platform in ("linux-x11", "windows-wsl2"):
+        return _handle_remote_overlay_announce(backend, guard, disp)
+    logger.warning(
+        "coexistence: no announcement channel implemented for remote "
+        "platform %r (backend=%r) - a deliberate scope boundary, not a "
+        "silent gap: the halt invariant (\u00a76.0) still enforces "
+        "stop-on-detected-human for this backend, but there is no proactive "
+        "disclosure to a human who sits down mid-session",
+        platform,
+        backend.name,
+    )
+    return None
+
+
+def _handle_remote_macos_announce(
+    backend: Backend, guard: CoexistenceGuard, cfg: dict[str, Any]
+) -> None:
+    """Remote counterpart of `_handle_macos_announce`: the dialog runs ON
+    the target (`remote_agent.RemoteAgent._op_announce_raise`), blocking
+    THAT process, not this one, for up to `timeout` seconds - session start
+    only, exactly like the local case, never on the injection path. The
+    message discloses THIS controller's own hostname (`socket.gethostname()`
+    here IS the controller, unlike the local case where it is the Mac
+    naming itself) so the human at the far end knows where the session is
+    coming from.
+    """
+    coexistence_cfg = dict(cfg.get("coexistence") or {})
+    timeout = int(
+        coexistence_cfg.get("announce_timeout_seconds", MACOS_ANNOUNCE_TIMEOUT_SECONDS)
+    )
+    message = _macos_announce_message(timeout, controller_host=socket.gethostname())
+    announce_raise = getattr(backend, "announce_raise", None)
+    if announce_raise is None:
+        _handle_channel_failure(
+            guard,
+            backend.name,
+            "macOS announce dialog (remote)",
+            RuntimeError("remote backend has no announce_raise()"),
+        )
+        return
+    try:
+        raw = announce_raise(message=message, timeout_seconds=timeout)
+    except BackendError as exc:
+        _handle_channel_failure(
+            guard, backend.name, "macOS announce dialog (remote)", exc
+        )
+        return
+    result = AnnounceResult(
+        button=raw.get("button"), gave_up=bool(raw.get("gave_up")), raw_stdout=""
+    )
+    _apply_macos_announce_result(guard, backend.name, result)
+
+
+def _handle_remote_overlay_announce(
+    backend: Backend, guard: CoexistenceGuard, disp: Display
+) -> Any | None:
+    """Remote counterpart of the local Linux/Windows overlay branches: ask
+    the target to raise its OWN persistent overlay
+    (`remote_agent.RemoteAgent._op_announce_raise`), at the exact screen
+    geometry this session already resolved for that target (`disp`, from
+    `RemoteBackend.screen_geometry()`/`list_monitors()` - already proven to
+    work over the wire). On success, registers the overlay's own
+    Pause/Cancel button rects into `guard.exclusion` (\u00a77.5) so THIS
+    session's own synthetic clicks refuse to land on them, exactly as the
+    local branches already do via `exclusion=guard.exclusion` - the only
+    difference is the rects are reported back over the wire rather than
+    read off a local object, since the buttons themselves were drawn on
+    the target, not here.
+    """
+    announce_raise = getattr(backend, "announce_raise", None)
+    if announce_raise is None:
+        _handle_channel_failure(
+            guard,
+            backend.name,
+            "remote overlay",
+            RuntimeError("remote backend has no announce_raise()"),
+        )
+        return None
+    try:
+        raw = announce_raise(
+            screen_width=disp.screen_width,
+            screen_x=disp.origin_x,
+            screen_y=disp.origin_y,
+        )
+    except BackendError as exc:
+        _handle_channel_failure(guard, backend.name, "remote overlay", exc)
+        return None
+    if not raw.get("shown"):
+        _handle_channel_failure(
+            guard,
+            backend.name,
+            "remote overlay",
+            RuntimeError(f"target reported the overlay was not shown: {raw!r}"),
+        )
+        return None
+    for name, rect in (raw.get("buttons") or {}).items():
+        if isinstance(rect, (list, tuple)) and len(rect) == 4:
+            guard.exclusion.register(
+                f"overlay_{name}_button", Rect(*(int(v) for v in rect))
+            )
+    logger.info("coexistence: remote overlay shown for backend %r", backend.name)
+    return _RemoteAnnouncementHandle(backend.name)
 
 
 async def mount(
@@ -2074,6 +2304,22 @@ async def mount(
         )
     except AnnouncementRefused as exc:
         logger.warning("tool-computer-use: not mounting - %s", exc)
+        # A refused announcement is the first path (local or remote) that can
+        # reach this point AFTER a real resource was already acquired -
+        # `select_backend()` above already called `RemoteBackend.connect()`,
+        # which spawned a live SSH subprocess + target-side agent process.
+        # Without this, refusing to mount a remote target would leak that
+        # connection for the life of the controller process. `Backend.close()`
+        # is documented best-effort/idempotent/safe-to-never-call, so this is
+        # safe for every backend type, not only remote ones.
+        try:
+            backend.close()
+        except Exception:  # noqa: BLE001 - best-effort cleanup on a refusal path
+            logger.debug(
+                "tool-computer-use: backend.close() failed after an "
+                "announcement refusal",
+                exc_info=True,
+            )
         return {
             "name": "tool-computer-use",
             "version": __version__,

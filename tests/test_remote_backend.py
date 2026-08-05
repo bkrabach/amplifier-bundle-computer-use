@@ -60,6 +60,10 @@ class _FakeTransport:
             }
         elif req.op == "get_clipboard":
             result = {"text": "clipboard contents"}
+        elif req.op == "announce_raise":
+            result = {"shown": True, "buttons": {"pause": [1, 2, 3, 4]}}
+        elif req.op == "announcement_status":
+            result = {"paused": False, "cancelled": False}
         else:
             result = {}
         return Response(id=req.id, ok=True, result=result).encode()
@@ -194,6 +198,25 @@ def test_set_clipboard_round_trips_through_the_wire():
     backend.set_clipboard("hello")
     assert transport.calls[0].op == "set_clipboard"
     assert transport.calls[0].args == {"text": "hello"}
+
+
+def test_announce_raise_forwards_args_and_returns_the_targets_result():
+    backend, transport = _connected_backend()
+    result = backend.announce_raise(screen_width=1920, screen_x=0, screen_y=0)
+    assert transport.calls[0].op == "announce_raise"
+    assert transport.calls[0].args == {
+        "screen_width": 1920,
+        "screen_x": 0,
+        "screen_y": 0,
+    }
+    assert result == {"shown": True, "buttons": {"pause": [1, 2, 3, 4]}}
+
+
+def test_announcement_status_forwards_to_the_target():
+    backend, transport = _connected_backend()
+    result = backend.announcement_status()
+    assert transport.calls[0].op == "announcement_status"
+    assert result == {"paused": False, "cancelled": False}
 
 
 def test_a_failed_mouse_down_is_not_retried():

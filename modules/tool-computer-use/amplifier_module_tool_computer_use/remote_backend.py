@@ -177,6 +177,39 @@ class RemoteBackend:
             )
         return float(value)
 
+    # -- coexistence announcement channel (docs/designs/coexistence.md §7) ----
+
+    def announce_raise(self, **kwargs: Any) -> dict[str, Any]:
+        """Ask the target to raise its OWN session-start disclosure channel -
+        the macOS announce-and-acknowledge dialog, or the persistent Linux/
+        Windows overlay - via the `announce_raise` CONTROL op
+        (§10.3). The channel always runs on the target (only that process
+        can draw on that desktop, or has a console session to prompt) -
+        this method only ever asks for it over the already-open transport
+        and reports back what happened; `__init__.py`'s
+        `_build_remote_announcement` applies the same §7.3/§7.6 policy to
+        the result that the local branches already apply to a LOCAL
+        `announce_macos.announce()`/overlay call.
+
+        `**kwargs` are forwarded verbatim as the op's `args` - `message`/
+        `timeout_seconds` for the macOS dialog, `screen_width`/`screen_x`/
+        `screen_y` for a persistent overlay (see `remote_agent.RemoteAgent
+        ._op_announce_raise` for what each backend actually reads).
+        """
+        result = self._call("announce_raise", **kwargs)
+        return result if isinstance(result, dict) else {}
+
+    def announcement_status(self) -> dict[str, Any]:
+        """Has a human clicked Pause/Cancel on the target's own persistent
+        overlay since the caller last asked (§8.1/§9.1)? The overlay lives
+        entirely on the target - a click there is otherwise invisible to
+        this controller, since nothing here observes the target's real
+        input events. Forwards the `announcement_status` READ op; `{}`
+        (never fabricated) if the target reports something unusable.
+        """
+        result = self._call("announcement_status")
+        return result if isinstance(result, dict) else {}
+
     # -- Backend protocol -----------------------------------------------------
 
     def probe(self) -> ProbeResult:

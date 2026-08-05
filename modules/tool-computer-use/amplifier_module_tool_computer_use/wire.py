@@ -45,6 +45,11 @@ READ_OPS = frozenset(
         # to the remote agent's own backend.presence_idle_ms(). Idempotent by
         # construction (a query, no side effect), so READ is the correct class.
         "presence_idle",
+        # Coexistence announcement-status read (docs/designs/coexistence.md
+        # \u00a78.1/\u00a79.1/\u00a710.3) - has a human clicked Pause/Cancel on the
+        # target's own persistent overlay since the last read? A query, no
+        # side effect - the same idempotency argument as `presence_idle`.
+        "announcement_status",
     }
 )
 WRITE_OPS = frozenset(
@@ -63,7 +68,19 @@ WRITE_OPS = frozenset(
         "set_clipboard",
     }
 )
-CONTROL_OPS = frozenset({"hello", "release_all", "bye"})
+CONTROL_OPS = frozenset(
+    {
+        "hello",
+        "release_all",
+        "bye",
+        # Raise this target's own session-start disclosure channel
+        # (docs/designs/coexistence.md \u00a77, \u00a710.3) - the macOS dialog or the
+        # Linux/Windows persistent overlay, whichever `presence_platform`
+        # implies. Session-lifecycle, not injected input - CONTROL, matching
+        # the design doc's own classification, not WRITE.
+        "announce_raise",
+    }
+)
 
 ALL_OPS = READ_OPS | WRITE_OPS | CONTROL_OPS
 

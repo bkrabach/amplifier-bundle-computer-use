@@ -77,7 +77,7 @@ def test_write_ops_are_never_retryable(op: str):
     assert is_retryable(op) is False
 
 
-@pytest.mark.parametrize("op", ["hello", "release_all", "bye"])
+@pytest.mark.parametrize("op", ["hello", "release_all", "bye", "announce_raise"])
 def test_control_ops_are_retryable(op: str):
     assert classify_op(op) == "control"
     assert is_retryable(op) is True
@@ -86,6 +86,15 @@ def test_control_ops_are_retryable(op: str):
 def test_unknown_op_raises_rather_than_guessing_retry_safety():
     with pytest.raises(UnknownOpError):
         classify_op("delete_everything")
+
+
+# -- coexistence announcement ops (docs/designs/coexistence.md \u00a710.3) --------
+
+
+def test_announcement_status_is_a_retryable_read():
+    """A query, no side effect - same idempotency argument as `presence_idle`."""
+    assert classify_op("announcement_status") == "read"
+    assert is_retryable("announcement_status") is True
 
 
 # -- handshake validation -----------------------------------------------------

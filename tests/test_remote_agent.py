@@ -359,6 +359,297 @@ def test_read_only_blocks_the_new_write_ops():
     assert backend.set_clipboard_calls == []
 
 
+# -- coexistence announcement channel (docs/designs/coexistence.md \u00a77, \u00a710.3) -
+#
+# Regression tests for the gap `a4943a1` deliberately left open: none of
+# `announce_macos.py`/`overlay_linux.py`/`overlay_windows.py` had a target-side
+# caller, so a `target: ssh://...` session never announced itself no matter
+# who was sitting at the keyboard. Before this pass, `RemoteAgent` had no
+# `_op_announce_raise`/`_op_announcement_status` at all - every test below
+# would fail with `AttributeError`, not merely a wrong assertion.
+
+
+class _FakeMacOSBackend(_FakeBackend):
+    name = "macos"
+
+
+class _FakeLinuxBackend(_FakeBackend):
+    name = "linux-x11"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._display = object()  # LinuxOverlay only needs a truthy handle here
+
+
+class _FakeWindowsBackend(_FakeBackend):
+    name = "windows-wsl2"
+
+
+def test_announce_raise_on_macos_calls_announce_macos_and_returns_its_result(
+    monkeypatch,
+):
+    from amplifier_module_tool_computer_use import announce_macos
+    from amplifier_module_tool_computer_use.announce_macos import AnnounceResult
+
+    called = {}
+
+    def _fake_announce(message, *, timeout_seconds):
+        called["message"] = message
+        called["timeout_seconds"] = timeout_seconds
+        return AnnounceResult(button="Continue", gave_up=False, raw_stdout="")
+
+    monkeypatch.setattr(announce_macos, "announce", _fake_announce)
+
+    agent = RemoteAgent(_FakeMacOSBackend(), read_only=False)
+    stdin = _lines(
+        {
+            "id": 1,
+            "op": "announce_raise",
+            "args": {"message": "hi, closes in 20 seconds", "timeout_seconds": 20},
+        },
+        {"id": 2, "op": "bye", "args": {}},
+    )
+    stdout = io.StringIO()
+
+    agent.run(stdin, stdout)
+
+    assert called == {"message": "hi, closes in 20 seconds", "timeout_seconds": 20}
+    lines = [json.loads(x) for x in stdout.getvalue().strip().splitlines()]
+    assert lines[1] == {
+        "id": 1,
+        "ok": True,
+        "result": {"button": "Continue", "gave_up": False},
+    }
+
+
+def test_announce_raise_on_macos_surfaces_announce_error_as_backend_error(
+    monkeypatch,
+):
+    from amplifier_module_tool_computer_use import announce_macos
+
+    def _boom(message, *, timeout_seconds):
+        raise announce_macos.AnnounceError("osascript exited 1")
+
+    monkeypatch.setattr(announce_macos, "announce", _boom)
+
+    agent = RemoteAgent(_FakeMacOSBackend(), read_only=False)
+    stdin = _lines(
+        {
+            "id": 1,
+            "op": "announce_raise",
+            "args": {"message": "hi (20 seconds)", "timeout_seconds": 20},
+        },
+        {"id": 2, "op": "bye", "args": {}},
+    )
+    stdout = io.StringIO()
+
+    agent.run(stdin, stdout)  # must not raise out of run()
+
+    lines = [json.loads(x) for x in stdout.getvalue().strip().splitlines()]
+    assert lines[1]["ok"] is False
+    assert "osascript exited 1" in lines[1]["error"]["message"]
+
+
+def test_announce_raise_on_linux_shows_the_real_overlay_class(monkeypatch):
+    """Not a wiring-only test - this proves `LinuxOverlay.show()` (the real
+    class, not a stub) is actually invoked, with the real display handle and
+    geometry args, exactly like `test_announcement_wiring.py` proves for the
+    LOCAL path."""
+    shown = {"called": False}
+
+    class _SpyOverlay:
+        def __init__(self, display, **kwargs):
+            self.display = display
+            self.kwargs = kwargs
+            self.shown = False
+            self.buttons = [
+                type(
+                    "B",
+                    (),
+                    {
+                        "name": "pause",
+                        "rect": type("R", (), {"x1": 1, "y1": 2, "x2": 3, "y2": 4})(),
+                    },
+                )()
+            ]
+
+        def show(self):
+            self.shown = True
+            shown["called"] = True
+
+        def hide(self):
+            self.shown = False
+
+    from amplifier_module_tool_computer_use import remote_agent as ra
+
+    monkeypatch.setattr(ra, "LinuxOverlay", _SpyOverlay)
+
+    agent = RemoteAgent(_FakeLinuxBackend(), read_only=False)
+    stdin = _lines(
+        {
+            "id": 1,
+            "op": "announce_raise",
+            "args": {"screen_width": 1920, "screen_x": 0, "screen_y": 0},
+        },
+        {"id": 2, "op": "bye", "args": {}},
+    )
+    stdout = io.StringIO()
+
+    agent.run(stdin, stdout)
+
+    assert shown["called"] is True
+    lines = [json.loads(x) for x in stdout.getvalue().strip().splitlines()]
+    assert lines[1]["ok"] is True
+    assert lines[1]["result"]["shown"] is True
+    assert lines[1]["result"]["buttons"] == {"pause": [1, 2, 3, 4]}
+
+
+def test_announce_raise_is_idempotent_does_not_reshow_an_already_shown_overlay(
+    monkeypatch,
+):
+    show_calls = {"count": 0}
+
+    class _SpyOverlay:
+        def __init__(self, **kwargs):
+            self.shown = False
+            self.buttons = []
+
+        def show(self):
+            show_calls["count"] += 1
+            self.shown = True
+
+        def hide(self):
+            self.shown = False
+
+    from amplifier_module_tool_computer_use import remote_agent as ra
+
+    monkeypatch.setattr(ra, "WindowsOverlay", _SpyOverlay)
+
+    agent = RemoteAgent(_FakeWindowsBackend(), read_only=False)
+    stdin = _lines(
+        {"id": 1, "op": "announce_raise", "args": {"screen_width": 1920}},
+        {"id": 2, "op": "announce_raise", "args": {"screen_width": 1920}},
+        {"id": 3, "op": "bye", "args": {}},
+    )
+    stdout = io.StringIO()
+
+    agent.run(stdin, stdout)
+
+    assert show_calls["count"] == 1, (
+        "a second announce_raise must report the existing overlay, not "
+        "construct/show a second one on top of it"
+    )
+
+
+def test_announce_raise_overlay_failure_surfaces_as_backend_error():
+    class _BoomOverlay:
+        def __init__(self, **kwargs):
+            pass
+
+        def show(self):
+            raise RuntimeError("powershell.exe not found")
+
+    import amplifier_module_tool_computer_use.remote_agent as ra_mod
+
+    agent = RemoteAgent(_FakeWindowsBackend(), read_only=False)
+    agent_module_overlay = ra_mod.WindowsOverlay
+    ra_mod.WindowsOverlay = _BoomOverlay
+    try:
+        stdin = _lines(
+            {"id": 1, "op": "announce_raise", "args": {"screen_width": 1920}},
+            {"id": 2, "op": "bye", "args": {}},
+        )
+        stdout = io.StringIO()
+        agent.run(stdin, stdout)
+    finally:
+        ra_mod.WindowsOverlay = agent_module_overlay
+
+    lines = [json.loads(x) for x in stdout.getvalue().strip().splitlines()]
+    assert lines[1]["ok"] is False
+    assert "powershell.exe not found" in lines[1]["error"]["message"]
+
+
+def test_announcement_status_reports_paused_and_cancelled_from_overlay_clicks(
+    monkeypatch,
+):
+    """The target-side half of \u00a78.1/\u00a79.1: a click on the overlay must be
+    readable by the controller via a plain status read, not lost."""
+    captured_callbacks = {}
+
+    class _SpyOverlay:
+        def __init__(self, **kwargs):
+            captured_callbacks["on_pause"] = kwargs["on_pause"]
+            captured_callbacks["on_cancel"] = kwargs["on_cancel"]
+            self.shown = False
+            self.buttons = []
+
+        def show(self):
+            self.shown = True
+
+        def hide(self):
+            self.shown = False
+
+    from amplifier_module_tool_computer_use import remote_agent as ra
+
+    monkeypatch.setattr(ra, "WindowsOverlay", _SpyOverlay)
+
+    agent = RemoteAgent(_FakeWindowsBackend(), read_only=False)
+    stdin = _lines(
+        {"id": 1, "op": "announce_raise", "args": {"screen_width": 1920}},
+        {"id": 2, "op": "announcement_status", "args": {}},
+        {"id": 3, "op": "bye", "args": {}},
+    )
+    stdout = io.StringIO()
+
+    agent.run(stdin, stdout)
+
+    lines = [json.loads(x) for x in stdout.getvalue().strip().splitlines()]
+    assert lines[2]["result"] == {"paused": False, "cancelled": False}
+
+    # Simulate a real human click firing the overlay's own callback.
+    captured_callbacks["on_pause"]()
+    assert agent._op_announcement_status({}) == {"paused": True, "cancelled": False}
+    captured_callbacks["on_cancel"]()
+    assert agent._op_announcement_status({}) == {"paused": True, "cancelled": True}
+
+
+def test_overlay_is_torn_down_on_stdin_eof_even_with_no_bye():
+    """THE regression proof for \u00a79.1/\u00a79.2: an SSH link drop (stdin EOF, no
+    `bye`) must not strand a window on the human's own desktop. Fails
+    without the fix: before `_teardown_overlay()` was wired into `run()`'s
+    `finally`, `self._overlay` was never torn down on EOF at all."""
+
+    class _SpyOverlay:
+        def __init__(self, **kwargs):
+            self.shown = False
+            self.hidden_count = 0
+            self.buttons = []
+
+        def show(self):
+            self.shown = True
+
+        def hide(self):
+            self.hidden_count += 1
+            self.shown = False
+
+    from amplifier_module_tool_computer_use import remote_agent as ra
+
+    monkeypatch_overlay = ra.WindowsOverlay
+    ra.WindowsOverlay = _SpyOverlay
+    try:
+        agent = RemoteAgent(_FakeWindowsBackend(), read_only=False)
+        stdin = _lines(
+            {"id": 1, "op": "announce_raise", "args": {"screen_width": 1920}}
+        )  # then EOF, no bye
+        stdout = io.StringIO()
+
+        agent.run(stdin, stdout)
+
+        assert agent._overlay is None, "overlay reference must be cleared on teardown"
+    finally:
+        ra.WindowsOverlay = monkeypatch_overlay
+
+
 def test_every_op_handler_is_reachable_via_the_dispatch_table():
     """Every `_op_*` method must be wired into `_HANDLERS`.
 

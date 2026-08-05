@@ -57,8 +57,12 @@ from typing import Any, ClassVar
 # Package-relative imports: this module always runs as part of the
 # `amplifier_module_tool_computer_use` (locally) or a same-shaped extracted
 # package (remotely) - see `ssh_transport.PAYLOAD_MODULES`.
+from . import announce_macos
 from .backend import Backend, BackendError
+from .exclusion import ExclusionZone
 from .ledger import DEFAULT_DEADMAN_SECONDS, HeldInputLedger
+from .overlay_linux import LinuxOverlay
+from .overlay_windows import WindowsOverlay
 from .registry import NoBackendAvailable, select_backend
 from .wire import PROTOCOL_VERSION, Request, Response, classify_op
 
@@ -214,6 +218,17 @@ class RemoteAgent:
         # with synthetic (None, None) coordinates on a link-death release,
         # without ever invoking `backend.mouse_up` twice for one press.
         self._mouse_pending: dict[str, dict[str, int | None]] = {}
+        # Coexistence announcement (docs/designs/coexistence.md \u00a77, \u00a710.3):
+        # the persistent overlay's own object (Linux/macOS has none - its
+        # dialog is one-shot and blocking, see `_op_announce_raise`), and the
+        # latched pause/cancel flags a click on that overlay sets. Latched,
+        # never cleared here - the controller decides how many times it has
+        # already acted on a given transition (see `announcement_status`'s
+        # docstring and `__init__.py`'s `_sync_remote_announcement_state`).
+        self._overlay: LinuxOverlay | WindowsOverlay | None = None
+        self._exclusion = ExclusionZone()
+        self._announce_paused = False
+        self._announce_cancelled = False
 
     def _on_release(self, kind: str, token: str) -> None:
         # \u00a710.2/\u00a73.3: this exact line, `RELEASED:<token>`, is the
@@ -222,12 +237,144 @@ class RemoteAgent:
         # is already gone by the time release happens.
         print(f"RELEASED:{token}", file=sys.stderr, flush=True)
 
+    # -- coexistence announcement channel (docs/designs/coexistence.md \u00a77) ---
+    #
+    # Every existing announcement module (`announce_macos.py`,
+    # `overlay_linux.py`, `overlay_windows.py`) was built assuming it runs in
+    # the SAME process that owns the injection call site (each module's own
+    # docstring says so) - which, for a remote session, is HERE, never the
+    # controller (`__init__.py` imports none of them for a `RemoteBackend`).
+    # These three methods are that missing target-side half.
+
+    def _mark_paused(self) -> None:
+        # Same stderr-proof-line discipline as `_on_release` above - a
+        # human's own click is exactly the kind of fact that must survive
+        # even if this process is torn down moments later.
+        self._announce_paused = True
+        print("ANNOUNCE:paused", file=sys.stderr, flush=True)
+
+    def _mark_cancelled(self) -> None:
+        self._announce_cancelled = True
+        print("ANNOUNCE:cancelled", file=sys.stderr, flush=True)
+
+    def _overlay_status_payload(self) -> dict[str, Any]:
+        assert self._overlay is not None
+        return {
+            "shown": True,
+            "buttons": {
+                b.name: [b.rect.x1, b.rect.y1, b.rect.x2, b.rect.y2]
+                for b in self._overlay.buttons
+            },
+        }
+
+    def _op_announce_raise(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Raise THIS target's own session-start disclosure channel - the
+        macOS announce-and-acknowledge dialog, or the persistent Linux/
+        Windows overlay (docs/designs/coexistence.md \u00a77.3). The controller
+        (`__init__.py`'s `_build_remote_announcement`) applies the exact
+        same \u00a77.3/\u00a77.6 policy to this method's result that it already
+        applies to a LOCAL `announce_macos.announce()`/overlay call - only
+        WHERE the channel physically runs differs.
+
+        Idempotent for the persistent-overlay case: a lost response must
+        never cause a second overlay to be raised on top of the first, so
+        an already-shown overlay is reported as-is rather than re-shown.
+        The macOS dialog has no such state to remember - each call is a
+        fresh, one-shot, blocking prompt, matching `announce_macos.announce`
+        itself.
+        """
+        if self.backend.name == "macos":
+            message = str(args["message"])
+            timeout_seconds = int(
+                args.get("timeout_seconds", announce_macos.DEFAULT_TIMEOUT_SECONDS)
+            )
+            try:
+                result = announce_macos.announce(
+                    message, timeout_seconds=timeout_seconds
+                )
+            except announce_macos.AnnounceError as exc:
+                raise BackendError(f"macOS announce dialog failed: {exc}") from exc
+            return {"button": result.button, "gave_up": result.gave_up}
+
+        if self._overlay is not None and self._overlay.shown:
+            return self._overlay_status_payload()
+
+        screen_width = int(args["screen_width"])
+        screen_x = int(args.get("screen_x", 0))
+        screen_y = int(args.get("screen_y", 0))
+        if self.backend.name.startswith("linux"):
+            display = getattr(self.backend, "_display", None)
+            if display is None:
+                raise BackendError(
+                    "linux-x11 backend has no live display connection to "
+                    "attach an announcement overlay to"
+                )
+            overlay: LinuxOverlay | WindowsOverlay = LinuxOverlay(
+                display,
+                screen_width=screen_width,
+                screen_x=screen_x,
+                screen_y=screen_y,
+                exclusion=self._exclusion,
+                on_pause=self._mark_paused,
+                on_cancel=self._mark_cancelled,
+            )
+        elif self.backend.name == "windows-wsl2":
+            overlay = WindowsOverlay(
+                screen_width=screen_width,
+                screen_x=screen_x,
+                screen_y=screen_y,
+                exclusion=self._exclusion,
+                on_pause=self._mark_paused,
+                on_cancel=self._mark_cancelled,
+            )
+        else:
+            raise UnsupportedOpError(
+                f"'announce_raise' has no persistent-overlay implementation "
+                f"for backend {self.backend.name!r}"
+            )
+        try:
+            overlay.show()
+        except Exception as exc:  # noqa: BLE001 - surfaced to the controller as a channel failure
+            raise BackendError(
+                f"failed to raise remote announcement overlay: {exc}"
+            ) from exc
+        self._overlay = overlay
+        return self._overlay_status_payload()
+
+    def _op_announcement_status(self, _args: dict[str, Any]) -> dict[str, Any]:
+        """Has a human clicked Pause/Cancel on `self._overlay` since this
+        agent started? Latched, level-triggered state - it is the
+        CONTROLLER's job (`__init__.py`'s `_sync_remote_announcement_state`)
+        to track which transitions it has already acted on, not this
+        agent's, so a slow or missed poll never loses the fact.
+        """
+        return {"paused": self._announce_paused, "cancelled": self._announce_cancelled}
+
+    def _teardown_overlay(self) -> None:
+        """Best-effort teardown, called from every exit path this agent
+        already has (`run()`'s `finally`, and every installed signal
+        handler) - so an SSH link drop, a `bye`, or stdin EOF never strands
+        a window on the human's own desktop (\u00a79.1/\u00a79.2). The SAME already-
+        proven mechanism the held-input ledger uses for its own cleanup
+        (`\u00a710.2`/`\u00a73.3`: stdin EOF -> this process's `finally` block runs) -
+        not a new one. A no-op when no overlay was ever raised (macOS's
+        dialog is one-shot and never sets `self._overlay` at all).
+        """
+        if self._overlay is None:
+            return
+        try:
+            self._overlay.hide()
+        except Exception:  # noqa: BLE001 - best-effort on every exit path
+            logger.debug("teardown: overlay hide failed", exc_info=True)
+        self._overlay = None
+
     # -- lifecycle ------------------------------------------------------------
 
     def install_signal_handlers(self) -> None:
         def _handler(signum: int, _frame: Any) -> None:
             logger.warning("agent: signal %s received - releasing and exiting", signum)
             self._ledger.stop()
+            self._teardown_overlay()
             _sys.exit(0)
 
         for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
@@ -297,8 +444,13 @@ class RemoteAgent:
             # \u00a710.2 primary path: stdin EOF (the loop above ends when the
             # iterator is exhausted, i.e. the pipe closed) triggers release
             # here, unconditionally, whether the loop ended via EOF, `bye`, or
-            # an exception.
+            # an exception. `_teardown_overlay()` rides the SAME already-
+            # proven guarantee, for the same reason (\u00a79.1/\u00a79.2): a link
+            # drop that never runs another line of Python here would leave
+            # both a held key AND a stranded overlay - one guarantee, one
+            # call site, for both.
             self._ledger.stop()
+            self._teardown_overlay()
 
     # -- dispatch ---------------------------------------------------------------
 
@@ -608,6 +760,11 @@ class RemoteAgent:
         # constructed (platform=windows-wsl2, guard_ms=20.0) and then raised
         # IdleUnreadableError on its first sample.
         "presence_idle": _op_presence_idle,
+        # Coexistence announcement channel (docs/designs/coexistence.md
+        # \u00a77, \u00a710.3) - see `_op_announce_raise`/`_op_announcement_status`'s
+        # own docstrings for why this target-side half was missing.
+        "announce_raise": _op_announce_raise,
+        "announcement_status": _op_announcement_status,
         "release_all": _op_release_all,
         "bye": _op_bye,
     }

@@ -47,6 +47,18 @@ PAYLOAD_MODULES = (
     "wire.py",
     "ledger.py",
     "remote_agent.py",
+    # The session-start disclosure channel (docs/designs/coexistence.md
+    # \u00a77, \u00a710.3) closes the remote-transport gap BACKLOG.md recorded:
+    # every one of these three modules was built assuming it runs in the
+    # SAME process that owns the injection call site - which, for a remote
+    # session, is HERE on the target (`remote_agent.RemoteAgent`), never the
+    # controller. `exclusion.py` is `overlay_linux.py`/`overlay_windows.py`'s
+    # own dependency (button-rect bookkeeping, pure logic, no display
+    # dependency) and is shipped for the same reason those two are.
+    "exclusion.py",
+    "announce_macos.py",
+    "overlay_linux.py",
+    "overlay_windows.py",
     # NOT a Python module, and required anyway: `windows.py` resolves
     # `BRIDGE_PS1 = Path(__file__).parent / "bridge.ps1"` and invokes it with
     # `powershell.exe -File`. Omitting it does not fail at import - it fails at
@@ -57,6 +69,11 @@ PAYLOAD_MODULES = (
     # `screen_info` returned "Copyright (C) Microsoft Corporation..." until this
     # file was shipped.
     "bridge.ps1",
+    # Same reasoning as `bridge.ps1` above, for `overlay_windows.py`'s own
+    # `OVERLAY_PS1 = Path(__file__).parent / "overlay_windows.ps1"` - the
+    # remote Windows persistent overlay would otherwise fail at
+    # `announce_raise` time with the identical "missing file" shape.
+    "overlay_windows.ps1",
 )
 
 _PACKAGE_NAME = "amplifier_cu_agent"
