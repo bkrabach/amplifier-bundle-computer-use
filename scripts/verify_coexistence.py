@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ship gate: C1 evidence item 2 of `docs/coexistence.md` \u00a711 - the
+"""Ship gate: C1 evidence item 2 of `docs/designs/coexistence.md` \u00a711 - the
 sustained-injection interleave test, run for real, at statistical scale.
 
     "Sustained-injection interleave test, per platform - the incident's actual
@@ -25,7 +25,7 @@ This is NOT a mock and NOT a single-process simulation. Each trial:
      code path - `modules/tool-computer-use/.../linux_x11.py:536`,
      `coexistence_guard.py`), one character at a time at a fixed
      production-representative cadence (`CADENCE_S`, matching the exact
-     figure `docs/coexistence-probes.md` O5 measured against and
+     figure `docs/designs/coexistence-probes.md` O5 measured against and
      `coexistence.md` \u00a75.2 cites - the shipped `type_text` has no inherent
      per-character delay of its own, so this harness supplies the cadence
      explicitly, exactly as O5's own probe did).
@@ -347,7 +347,7 @@ def _run_gate(n_trials: int, display_name: str) -> int:
     print()
     print("=" * 78)
     print(
-        "SHIP GATE: sustained-injection interleave test (docs/coexistence.md \u00a711)"
+        "SHIP GATE: sustained-injection interleave test (docs/designs/coexistence.md \u00a711)"
     )
     print("=" * 78)
     print("platform:                  linux-x11")

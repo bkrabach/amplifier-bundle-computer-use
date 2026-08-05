@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Explicit human resume signal for a durable coexistence halt - checkout entry point.
 
-`docs/coexistence.md` \u00a713 D3: "resume is manual when a console user
+`docs/designs/coexistence.md` \u00a713 D3: "resume is manual when a console user
 is present." `halt_state.py` (`modules/tool-computer-use/...`) persists a
 durable halt record the moment a real human is detected touching a driven
 machine, so that a NEW driving session (a fresh `mount()` - a new sub-agent,
