@@ -450,6 +450,103 @@ def test_announce_raise_on_macos_surfaces_announce_error_as_backend_error(
     assert "osascript exited 1" in lines[1]["error"]["message"]
 
 
+# -- handshake permission probe must never do a real screen capture ---------
+#
+# Regression for the intermittent 30s handshake timeout: `_probe_permissions`
+# used to call `backend.capture()` (a real, unbounded Core Graphics call on
+# macOS) just to infer the Screen Recording grant as a boolean. That sits on
+# the handshake's fixed-budget critical path (`SshTransport.connect`'s
+# `connect_timeout`) even under `read_only=True`, where nothing has asked to
+# view the screen. It must use the cheap, prompt-free, already-existing
+# `macos._cg_preflight_screen_capture_access()` instead - these tests prove
+# `capture()` is never invoked by the permission probe, and that its result
+# still ends up in the handshake's `permissions` dict.
+
+
+class _CaptureAssertsNeverCalledBackend(_FakeMacOSBackend):
+    """`capture()` raising proves the permission probe cannot be using it -
+    a passing test here would be silently vacuous against the old code path
+    (which called `backend.capture()` directly), so this must fail loud if
+    that call ever comes back."""
+
+    def capture(self, region=None) -> bytes:
+        raise AssertionError(
+            "handshake permission probe must not perform a real screen "
+            "capture - use macos._cg_preflight_screen_capture_access() "
+            "instead (see _probe_permissions's docstring)"
+        )
+
+
+def test_handshake_screen_recording_probe_never_calls_backend_capture(monkeypatch):
+    from amplifier_module_tool_computer_use import macos
+
+    monkeypatch.setattr(macos, "_cg_preflight_screen_capture_access", lambda: True)
+    monkeypatch.setattr(macos, "_ax_is_process_trusted", lambda: True)
+
+    agent = RemoteAgent(_CaptureAssertsNeverCalledBackend(), read_only=True)
+    stdin = _lines({"id": 1, "op": "bye", "args": {}})
+    stdout = io.StringIO()
+
+    agent.run(stdin, stdout)  # must not raise - proves capture() was never hit
+
+    handshake = json.loads(stdout.getvalue().strip().splitlines()[0])
+    assert handshake["result"]["permissions"] == {
+        "accessibility": True,
+        "screen_recording": True,
+    }
+
+
+class _CaptureReturnsRealPngBackend(_FakeMacOSBackend):
+    """`capture()` succeeds with a real-looking PNG - the old capture-based
+    code path would read this as `screen_recording: True`. Paired with a
+    preflight mock returning `False`, this discriminates the fixed code path
+    (reports the preflight's answer) from the old one (would report `True`
+    from this fake's `capture()` succeeding) - unlike asserting against a
+    `capture()` that merely raises, which the old code's broad `except
+    Exception` also maps to `False`, coincidentally matching either way."""
+
+    def capture(self, region=None) -> bytes:
+        return b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+
+
+def test_handshake_screen_recording_reflects_preflight_result(monkeypatch):
+    from amplifier_module_tool_computer_use import macos
+
+    monkeypatch.setattr(macos, "_cg_preflight_screen_capture_access", lambda: False)
+    monkeypatch.setattr(macos, "_ax_is_process_trusted", lambda: True)
+
+    agent = RemoteAgent(_CaptureReturnsRealPngBackend(), read_only=True)
+    stdin = _lines({"id": 1, "op": "bye", "args": {}})
+    stdout = io.StringIO()
+
+    agent.run(stdin, stdout)
+
+    handshake = json.loads(stdout.getvalue().strip().splitlines()[0])
+    assert handshake["result"]["permissions"]["screen_recording"] is False
+
+
+def test_handshake_omits_screen_recording_when_preflight_cannot_determine(
+    monkeypatch,
+):
+    """`None` (no `CGPreflightScreenCaptureAccess` symbol - old macOS/pyobjc)
+    must never be guessed as True or False - the key is left out entirely,
+    which `wire.validate_handshake` already treats as not-granted (fail
+    closed) for any caller that requires it."""
+    from amplifier_module_tool_computer_use import macos
+
+    monkeypatch.setattr(macos, "_cg_preflight_screen_capture_access", lambda: None)
+    monkeypatch.setattr(macos, "_ax_is_process_trusted", lambda: True)
+
+    agent = RemoteAgent(_CaptureAssertsNeverCalledBackend(), read_only=True)
+    stdin = _lines({"id": 1, "op": "bye", "args": {}})
+    stdout = io.StringIO()
+
+    agent.run(stdin, stdout)
+
+    handshake = json.loads(stdout.getvalue().strip().splitlines()[0])
+    assert "screen_recording" not in handshake["result"]["permissions"]
+
+
 def test_announce_raise_on_linux_shows_the_real_overlay_class(monkeypatch):
     """Not a wiring-only test - this proves `LinuxOverlay.show()` (the real
     class, not a stub) is actually invoked, with the real display handle and

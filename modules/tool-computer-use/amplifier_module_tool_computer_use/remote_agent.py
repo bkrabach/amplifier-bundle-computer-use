@@ -93,6 +93,32 @@ def _probe_permissions(backend: Backend) -> dict[str, bool]:
     attach to the *responsible* process, which can differ depending on the
     launch chain (`python3` directly vs. `uv run`) - so this probes for real,
     every connection, rather than trusting a value cached from a previous run.
+
+    Both checks below are deliberately PROMPT-FREE and NON-CAPTURING: this
+    runs unconditionally on the handshake's critical path (a fixed 30s
+    budget - see `SshTransport.connect`'s `connect_timeout`), even when
+    `read_only=True` and nothing has asked to view the screen yet. A real
+    `backend.capture()` used to stand in here as a proxy for "is Screen
+    Recording granted?" - but `capture()` (`macos.py`) is a straight-line,
+    UNBOUNDED Core Graphics call (`CGDisplayCreateImage`/
+    `CGWindowListCreateImage`) with no timeout and no cancellation path,
+    plumbed through a lock-state check that shells out to `ioreg` first.
+    Measured live (12+ trials against an idle macOS target): that whole
+    path is normally cheap (tens to a few hundred ms), but nothing bounds
+    its worst case - a WindowServer that is mid-transition (display
+    sleep/wake, lock/unlock, external-monitor negotiation) can legitimately
+    block a Core Graphics capture call for an unbounded time, which
+    previously exhausted the entire handshake budget with no error at all
+    (`RemoteTargetUnavailable: no handshake ... within 30.0s`). Screen
+    Recording status has a purpose-built, instant, non-invasive query -
+    `CGPreflightScreenCaptureAccess` (already used by `macos.py`'s own
+    `_capture_none_error` for exactly this reason) - so this asks that
+    question directly instead of inferring it from a real capture's side
+    effects. `None` (older macOS/pyobjc without the symbol) is a genuine
+    "could not determine" - the key is left out of `permissions` rather
+    than guessed; `wire.validate_handshake` already treats a missing
+    permission key as not-granted (fail closed), which is the only safe
+    default here.
     """
     permissions: dict[str, bool] = {}
     if backend.name != "macos":
@@ -105,10 +131,13 @@ def _probe_permissions(backend: Backend) -> dict[str, bool]:
         logger.exception("permission probe: accessibility check failed")
         permissions["accessibility"] = False
     try:
-        png = backend.capture()
-        permissions["screen_recording"] = len(png) > 0 and png[:8] == (
-            b"\x89PNG\r\n\x1a\n"
-        )
+        from . import macos as _macos  # local import: only exists/imports on Darwin
+
+        granted = _macos._cg_preflight_screen_capture_access()
+        if granted is not None:
+            permissions["screen_recording"] = granted
+        # else: could not determine (no CGPreflightScreenCaptureAccess symbol on
+        # this OS/pyobjc) - omit rather than guess; see docstring above.
     except Exception:
         logger.exception("permission probe: screen_recording check failed")
         permissions["screen_recording"] = False
