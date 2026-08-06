@@ -69,7 +69,26 @@ def _read_line_with_timeout(stream, timeout: float) -> bytes | None:
 
 def test_stub_removes_its_own_scratch_dir_on_normal_exit():
     """THE fix: the exact stub text sent to every real target must clean up
-    the scratch dir it creates once the process it spawns exits normally."""
+    the scratch dir it creates once the process it spawns exits normally.
+
+    On a machine with no backend available (this test's headless dev-box/CI
+    environment), `remote_agent.main()`'s no-backend branch writes the
+    handshake and returns within the same handful of Python bytecodes - there
+    is no blocking `agent.run()` read loop holding the process open in
+    between. That means the scratch dir's entire lifetime, in this branch,
+    can be over before a single post-handshake `glob()` in the *parent*
+    process gets scheduled: a snapshot taken right after reading the
+    handshake line reliably loses that race (confirmed: the directory is
+    gone every time by then, even after an extra 50ms grace sleep).
+
+    `mkdtemp()` itself runs early in the stub - well before backend
+    selection, argv setup, or the handshake is even built - so the directory
+    does exist for a real, observable span of wall-clock time; the problem is
+    purely *when* the parent looks. A background thread that polls
+    continuously from the moment the payload is sent (not a single
+    point-in-time check after the read) reliably observes it regardless of
+    how short-lived the no-backend branch's process turns out to be.
+    """
     payload = ssh_transport_mod._build_payload(PACKAGE_DIR)
     stub = ssh_transport_mod._bootstrap_stub(deadman_seconds=5.0, read_only=True)
 
@@ -80,6 +99,23 @@ def test_stub_removes_its_own_scratch_dir_on_normal_exit():
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+
+    seen_dirs: set[str] = set()
+    stop_polling = threading.Event()
+
+    def _poll_for_scratch_dir() -> None:
+        # Tight loop, no sleep: the no-backend branch's post-handshake
+        # window can be sub-millisecond, so any polling interval risks
+        # missing it entirely. Bounded by `stop_polling` from the main
+        # thread (set once the handshake has been read, or in `finally`).
+        while not stop_polling.is_set():
+            found = _agent_scratch_dirs() - before
+            if found:
+                seen_dirs.update(found)
+                return
+
+    poller = threading.Thread(target=_poll_for_scratch_dir, daemon=True)
+    poller.start()
     try:
         assert proc.stdin is not None and proc.stdout is not None
         proc.stdin.write(f"{len(payload)}\n".encode())
@@ -95,16 +131,6 @@ def test_stub_removes_its_own_scratch_dir_on_normal_exit():
         )
         handshake = json.loads(line)
         assert handshake["ok"] is True
-
-        after_handshake = _agent_scratch_dirs()
-        new_dirs = after_handshake - before
-        assert len(new_dirs) == 1, (
-            f"expected exactly one new scratch dir, got {new_dirs}"
-        )
-        scratch_dir = new_dirs.pop()
-        assert os.path.isdir(scratch_dir), (
-            "stub's own handshake claims a dir it never made"
-        )
 
         # Ordinary shutdown: ask for a clean stop if the agent is still
         # reading requests (real backend available), then close stdin (EOF) -
@@ -122,11 +148,25 @@ def test_stub_removes_its_own_scratch_dir_on_normal_exit():
         returncode = proc.wait(timeout=10)
         assert returncode is not None
 
+        # Give the poller a last moment to notice a dir created very late
+        # (has-backend branch, torn down only by the `bye`/EOF above), then
+        # stop it - the process has now fully exited either way.
+        poller.join(timeout=1.0)
+        stop_polling.set()
+        poller.join(timeout=1.0)
+
+        assert len(seen_dirs) == 1, (
+            f"expected exactly one new scratch dir to ever appear, saw {seen_dirs}"
+        )
+        scratch_dir = seen_dirs.pop()
+
         assert not os.path.exists(scratch_dir), (
             f"scratch dir {scratch_dir!r} was not cleaned up after normal exit "
             "(this is the leak - see ssh_transport._bootstrap_stub)"
         )
     finally:
+        stop_polling.set()
+        poller.join(timeout=2.0)
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)

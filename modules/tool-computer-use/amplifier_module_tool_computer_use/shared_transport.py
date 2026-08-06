@@ -60,12 +60,15 @@ already serializes request/response pairs with its own internal lock (see
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable
 from typing import Any
 
 from .ssh_transport import SshConnectError, SshTransport
 from .wire import validate_handshake
+
+logger = logging.getLogger(__name__)
 
 #: (ssh_path, host) -> _SharedEntry. Guarded exclusively by `_registry_lock` -
 #: every read and write of this dict, and every mutation of `refcount`/
@@ -232,10 +235,44 @@ def _release(entry: _SharedEntry) -> None:
 
 
 def _mark_broken(entry: _SharedEntry) -> None:
+    """Retire a broken entry AND tear down its underlying transport.
+
+    A broken entry is evicted here and, per this module's "Sharing contract"
+    (see the module docstring), is never handed out or reconnected again -
+    the next `acquire_shared_transport()` for this target builds an entirely
+    fresh entry. That guarantee means the OLD `SshTransport` is provably
+    unreachable through this module from this point on, exactly the
+    condition `_release()` tears one down under when refcount reaches zero -
+    so the same teardown belongs here too.
+
+    Without this, a `connect()`/`send()` failure (e.g. a handshake timeout)
+    left the transport's `ssh` subprocess - and whatever bootstrap or agent
+    process it was still driving on the remote target - to Python's
+    reference-counting GC, which drops the object but does not terminate a
+    still-running child process. On a target where a *second* connect is
+    then retried (a fresh entry, a fresh `ssh`/agent process against the
+    SAME host), an abandoned-but-still-alive straggler from the first
+    attempt is precisely the "two concurrent agent processes against the
+    same macOS target" hazard this module's own docstring describes -
+    reached through the failed-connect door instead of a missing explicit
+    `close()`.
+
+    Best-effort: a failure while closing an already-broken transport must
+    never mask the original error that got the caller here.
+    """
     with _registry_lock:
         entry.broken = True
+        entry._closed = (
+            True  # this transport is retired; a later _release() must not re-close it
+        )
         if _registry.get(entry.key) is entry:
             del _registry[entry.key]
+    try:
+        entry.transport.close()
+    except Exception:  # noqa: BLE001 - best-effort teardown of an already-broken transport
+        logger.exception(
+            "shared-transport: close() on broken entry for %r failed", entry.host
+        )
 
 
 def _registry_size() -> int:

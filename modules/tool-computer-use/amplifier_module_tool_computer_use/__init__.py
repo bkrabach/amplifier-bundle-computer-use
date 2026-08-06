@@ -2513,6 +2513,89 @@ def _handle_remote_overlay_announce(
     return _RemoteAnnouncementHandle(backend.name)
 
 
+class ComputerUseUnavailableTool:
+    """Registered in place of `computer`/`desktop` whenever `mount()` could not
+    obtain a working backend (see `_mount_unavailable`).
+
+    Defect 2 fix: D1's refusal to mount `computer`/`desktop` for a backend that
+    cannot serve them is correct and is NOT changed by this class - what was
+    wrong is what happened *after* that refusal. Previously `mount()` returned
+    a manifest with `provides: []` and logged a line nobody was watching; the
+    session then continued with computer-use simply absent - no tool, no
+    error, no trace in the model's own context. A live session hit exactly
+    this: the model, given no `computer`/`desktop` tool and no indication one
+    was ever supposed to exist, silently improvised its own `ssh`+`screencapture`
+    workaround instead of telling the user computer-use was unavailable.
+
+    This tool is NOT a degraded form of `computer`/`desktop` - it never
+    attempts to serve a single real action, so it does not weaken D1's "do not
+    pretend to work" invariant. It exists purely to make the refusal visible in
+    the one place a silently-omitted tool cannot be: the tool declarations
+    sent with *every* provider request, whether or not the model ever calls
+    it. Its `execute()` is a fallback for the (unlikely, since its own
+    description says not to) case the model calls it anyway - still an honest,
+    immediate failure, never a hang or a fabricated result.
+
+    Deliberately a distinct name (`computer_use_unavailable`), not `computer`/
+    `desktop`: those names are reserved for a tool that can actually act
+    (`ComputerTool`/`DesktopTool`) - reusing them here for a stub would blur
+    "the tool exists but is broken" with "the tool never existed" in the
+    model's own tool list, and defeats the whole point of a distinct signal.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self._reason = reason
+
+    @property
+    def name(self) -> str:
+        return "computer_use_unavailable"
+
+    @property
+    def description(self) -> str:
+        return (
+            "computer-use ('computer'/'desktop': screen capture, mouse, keyboard, "
+            "window control) is NOT available this session and those tools were "
+            f"NOT mounted. Reason: {self._reason} This placeholder tool always "
+            "fails - it exists only so this is visible to you instead of silently "
+            "absent. Do not attempt to see or control a screen this session; tell "
+            "the user computer-use is unavailable and why, rather than improvising "
+            "a workaround (e.g. driving a remote machine over a shell tool)."
+        )
+
+    @property
+    def input_schema(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {}}
+
+    async def execute(self, input: dict[str, Any]) -> ToolResult:
+        del input
+        return ToolResult(
+            success=False,
+            error={"message": self._reason, "type": "ComputerUseUnavailable"},
+        )
+
+
+async def _mount_unavailable(coordinator: Any, reason: str) -> dict[str, Any]:
+    """Shared "not mounted" path for every branch of `mount()` that cannot
+    obtain a working backend - see `ComputerUseUnavailableTool` for why a
+    stub tool, not just a log line, is what actually closes Defect 2.
+
+    ERROR, not WARNING (this bundle's previous level for the D1/no-local-
+    backend case): this bundle is only ever mounted because an operator opted
+    into computer-use, so failing to deliver it is always worth their
+    attention, whether the cause is an expected platform gap or an
+    unreachable remote target.
+    """
+    logger.error("tool-computer-use: NOT MOUNTING computer/desktop - %s", reason)
+    stub = ComputerUseUnavailableTool(reason)
+    await coordinator.mount("tools", stub, name=stub.name)
+    return {
+        "name": "tool-computer-use",
+        "version": __version__,
+        "provides": [stub.name],
+        "description": f"computer-use not mounted: {reason}",
+    }
+
+
 async def mount(
     coordinator: Any, config: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -2520,21 +2603,17 @@ async def mount(
 
     D1 fix: this used to construct `WindowsBridge` and mount both tools
     unconditionally - on any platform. Now every configured backend is probed
-    first (`registry.select_backend`); if none can serve this machine, nothing is
-    mounted, the reason is logged, and this function returns normally (it does not
-    raise - a missing backend is not a bundle-load failure).
+    first (`registry.select_backend`); if none can serve this machine, `computer`/
+    `desktop` are not mounted at all - this function still returns normally (it
+    does not raise - a missing backend is not a bundle-load failure) - but see
+    `_mount_unavailable`/`ComputerUseUnavailableTool`: D1's refusal to mount a
+    non-functional backend is unchanged, only what happens instead of silence.
     """
     cfg = config or {}
     try:
         backend = select_backend(cfg)
     except NoBackendAvailable as exc:
-        logger.warning("tool-computer-use: not mounting - %s", exc)
-        return {
-            "name": "tool-computer-use",
-            "version": __version__,
-            "provides": [],
-            "description": f"computer-use not mounted: {exc}",
-        }
+        return await _mount_unavailable(coordinator, str(exc))
     except (ValueError, TypeError) as exc:
         # A malformed config (e.g. `target: user@host` instead of
         # `target: ssh://user@host`) raises out of `select_backend`, NOT as
@@ -2543,18 +2622,36 @@ async def mount(
         # log line, nothing in the session to explain the absence. Observed for
         # real: a session was asked to drive a remote desktop, found no tool, and
         # silently improvised its own ssh+screencapture workaround instead.
+        return await _mount_unavailable(coordinator, f"invalid configuration: {exc}")
+    except Exception as exc:
+        # Defect 2 fix: `select_backend`'s remote branch raises
+        # `RemoteTargetUnavailable` (`.remote_backend`) for an explicitly
+        # configured target that could not be reached, and - unlike
+        # `NoBackendAvailable` - that exception is deliberately NOT caught
+        # above (registry.py's own docstring: "an unreachable target fails
+        # loud... never falls back to a local backend"). That design assumed
+        # an uncaught exception here would be loud on its own. It is not:
+        # `amplifier_core._session_init` wraps every tool module's `mount()`
+        # in a blanket `except Exception` and merely logs a WARNING before
+        # continuing the session - so this exception was reaching that
+        # handler, being logged at a level nobody was watching, and the
+        # session was silently proceeding with no computer-use tool and no
+        # signal to the model. That kernel behavior is out of this bundle's
+        # control; this module closes its own end of the gap instead of
+        # relying on an escape that gets swallowed one layer up.
         #
-        # Deliberately ERROR, not WARNING: an unavailable backend is a fact about
-        # the machine, but a malformed target is a mistake someone made and can
-        # fix, and they cannot fix what they cannot see. Still non-fatal - a bad
-        # config for one tool must not take down the whole bundle load.
-        logger.error("tool-computer-use: NOT MOUNTING - invalid configuration: %s", exc)
-        return {
-            "name": "tool-computer-use",
-            "version": __version__,
-            "provides": [],
-            "description": f"computer-use not mounted (invalid config): {exc}",
-        }
+        # Imported here, not at module top: `remote_backend.py` pulls in
+        # `ssh_transport.py` (subprocess/tarfile), which a local-only mount
+        # (no `target:` configured) has no reason to load - same discipline
+        # `registry.select_backend` already applies to this same import. By
+        # the time this line runs, `remote_backend` is already in
+        # `sys.modules` regardless (the exception could only have originated
+        # from code that already imported it), so this costs nothing extra.
+        from .remote_backend import RemoteTargetUnavailable
+
+        if not isinstance(exc, RemoteTargetUnavailable):
+            raise
+        return await _mount_unavailable(coordinator, str(exc))
 
     computer = ComputerTool(backend, cfg)
     # D2: resolve display once, here, before the tool ever answers a provider
