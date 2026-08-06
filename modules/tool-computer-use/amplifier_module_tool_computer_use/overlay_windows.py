@@ -16,26 +16,62 @@ owns the instant its connection dies, `SIGKILL` included).
 `WindowsBackend` has no equivalent live connection: every action crosses
 the WSL2/Win32 boundary through a *fresh* `powershell.exe` subprocess
 (`windows.py`), so there is nothing in-process to tie an overlay's lifetime
-to. This module instead launches the overlay as its own DETACHED Windows
-process (`overlay_windows.ps1`, invoked with `-Detached`) and tracks its
-PID explicitly. Teardown (`hide()`) kills that PID with
-`Stop-Process -Force` (Windows' `SIGKILL` equivalent - PowerShell cannot
-intercept or ignore it). This is not a weaker guarantee than Linux's: Win32
-guarantees every window and GDI resource owned by a process is destroyed
-the instant that process terminates, by clean exit OR by force, exactly the
-same "resource lifetime == process lifetime" property U6 proved for X11 -
-just enforced by a different OS subsystem. See `verify_windows_overlay.py`
-for the real-hardware proof of this, and the honest caveat: unlike X11's
-*automatic* teardown on socket death, an unexpected death of the AGENT's
-own WSL2-side process does not automatically kill this Windows-side PID
-today (there is no live handle spanning that boundary) - killing it
-requires an explicit `hide()` call. Tying the two together is exactly what
-`docs/designs/coexistence.md` \u00a77's Phase C5 (folded into transport Phase 4,
-one persistent process serving injection + presence + overlay together)
-is for; this module is the overlay half, built and proven standalone ahead
-of that integration, matching this codebase's existing pattern of shipping
-`overlay_linux.py` unwired into `ComputerTool.mount()` until its consumer
-lands.
+to. This module instead launches `overlay_windows.ps1` directly as a
+single long-lived process and tracks its PID explicitly. Teardown
+(`hide()`) kills that PID with `Stop-Process -Force` (Windows' `SIGKILL`
+equivalent - PowerShell cannot intercept or ignore it).
+
+Lifetime binding - the leaked-overlay defect this closes
+--------------------------------------------------------------------------
+An earlier revision launched this as a DETACHED process (self-relaunched
+via `Start-Process -WindowStyle Hidden`, passing `-Detached`) with
+`atexit.register(overlay.hide)` (still present, one layer up in
+`__init__.py`) as the ONLY teardown path. `atexit` only runs on this
+process's own CLEAN exit - never on `SIGKILL`, a hard crash, or a closed
+terminal. Those are exactly the common cases in daily use, and exactly
+what an external report found: 25 orphaned always-on-top bands
+accumulated on one machine in a single afternoon, invisible to Alt-Tab and
+the taskbar (`WS_EX_TOOLWINDOW`, `ShowInTaskbar=false`), with no ordinary
+way for a user to find or close them.
+
+A Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) was considered
+first, since it is the standard Win32 answer to "reap this on ANY parent
+death." It does not reach across this particular boundary: a job object
+ties a process's life to a HANDLE held by another WINDOWS process, and
+there is no persistent Windows-side process in this architecture whose own
+life is 1:1 with the WSL2 agent's - every backend action is a fresh,
+one-shot `powershell.exe` subprocess (see `windows.py`'s module docstring).
+Building that persistent bridge is `docs/designs/coexistence.md` \u00a77's
+Phase C5 (folded into transport Phase 4) - a real, larger change, not this
+fix.
+
+What IS reachable, and used here: this module now launches the overlay
+directly (no self-relaunch hop) via `subprocess.Popen(..., stdin=PIPE)`
+and keeps that pipe's write end open, in this process, for as long as the
+overlay should exist. `overlay_windows.ps1` blocks a background thread on
+its OWN stdin; the read returns EOF the instant the pipe's write end
+closes, which the OS guarantees happens when this process's file
+descriptor table is torn down - UNCONDITIONALLY, on every exit path
+including `SIGKILL` (a kernel guarantee, not a user-space hook that can
+simply fail to run). Verified on real hardware for this exact WSL2/Windows
+interop boundary: a Linux process holding the pipe's write end was
+`kill -9`'d and the Windows-side `Console.In.ReadLine()` unblocked with EOF
+within the same second - see the task's evidence log for the raw run.
+
+Precise, honest characterization of what this is (and is not): this is
+NOT a Windows Job Object and does not carry the OS's own "terminate on
+handle close" primitive - it is a real pipe whose EOF the OS delivers
+unconditionally on the writer's exit, observed and acted on by
+`overlay_windows.ps1`'s own code once it is delivered. The residual risk
+this leaves - the watcher thread itself failing to run in the target
+process - is why `show()` also sweeps and removes pre-existing orphaned
+overlays (the `-Detached` command-line shape only the OLD, pre-fix code
+could ever have produced) before launching a new one; see
+`_sweep_legacy_orphans`.
+
+`verify_windows_overlay.py` still holds the real-hardware proof of the
+band's own rendering/no-steal-focus/teardown properties, unaffected by
+this change.
 
 Click-without-activate, the Win32 way
 --------------------------------------
@@ -108,8 +144,11 @@ import json
 import logging
 import subprocess
 import threading
+import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .exclusion import ExclusionZone, Rect
@@ -118,6 +157,19 @@ from .windows import BackendError, _translate, _which_powershell
 logger = logging.getLogger(__name__)
 
 OVERLAY_PS1 = Path(__file__).parent / "overlay_windows.ps1"
+
+#: How long `show()` polls the events file for the "ready" event before
+#: giving up on a launched process and treating it as a failure (killing
+#: it rather than leaving a never-ready process running - see `show()`).
+#: Reuses the constructor's own `timeout` value by default (same knob that
+#: used to bound the old blocking `subprocess.run` call), not a second
+#: configuration surface.
+READY_POLL_INTERVAL_SECONDS = 0.1
+
+#: Bounded timeout for the one-shot legacy-orphan sweep query
+#: (`_sweep_legacy_orphans`) - a single `Get-CimInstance` round trip, never
+#: on the critical path for long.
+SWEEP_TIMEOUT_SECONDS = 15.0
 
 #: Same geometry constants as `overlay_linux.py` - a thin strip along the
 #: top edge with two right-aligned buttons. Kept as an independent literal
@@ -148,11 +200,17 @@ class OverlayButton:
 
 class WindowsOverlay:
     """An always-on-top status band with Pause/Cancel buttons, hosted as a
-    detached Windows process across the WSL2/Win32 boundary.
+    single long-lived Windows process across the WSL2/Win32 boundary, with
+    its lifetime tied to THIS process via a live stdin pipe (see the module
+    docstring's "Lifetime binding" section for why, and the real-hardware
+    proof it depends on).
 
     `powershell_path`/`timeout` mirror `WindowsBackend`'s own constructor
     knobs (see `windows.py`) rather than inventing a second configuration
-    surface for the same underlying resolution problem.
+    surface for the same underlying resolution problem. `timeout` now
+    bounds how long `show()` waits for the launched process to prove it is
+    actually alive (reach the "ready" event) rather than bounding a single
+    blocking subprocess call - see `show()`.
     """
 
     def __init__(
@@ -181,6 +239,12 @@ class WindowsOverlay:
         self._poll_thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._shown = False
+        # The live process handle AND its stdin pipe - held open for the
+        # overlay's entire life. Closing `self._proc.stdin` (in `hide()`) or
+        # this whole Python process dying for ANY reason (the fix this
+        # module exists for) is what the overlay process's own stdin
+        # watcher reacts to - see the module docstring.
+        self._proc: subprocess.Popen[bytes] | None = None
 
     # -- geometry (pure, unit-testable without any Windows dependency) -------
     def _button_rects(self) -> list[OverlayButton]:
@@ -209,7 +273,34 @@ class WindowsOverlay:
 
     # -- lifecycle ------------------------------------------------------------
     def show(self) -> None:
-        """Launch the detached overlay process. Idempotent."""
+        """Launch the overlay process directly (no self-relaunch hop) and
+        verify it actually comes up before returning. Idempotent.
+
+        Order of operations, and why:
+        1. Register button rects (unchanged from before).
+        2. `_sweep_legacy_orphans()` - best-effort, never blocks or fails
+           this call - removes any pre-existing overlay processes carrying
+           the OLD `-Detached` command-line shape (impossible for current
+           code to produce), self-healing against leaks from before this
+           fix shipped or from any residual edge case (see that method).
+        3. Launch via `subprocess.Popen(..., stdin=PIPE)`, NOT `.run()` -
+           this process is meant to outlive this call and its lifetime
+           must be tied to the pipe staying open (see module docstring).
+           `proc.pid` is NOT the overlay's real Windows PID - verified on
+           real hardware: WSL2 interop's `Popen.pid` names the LOCAL
+           interop launcher, a different number from the actual Windows
+           process's own `$PID` (e.g. local 1427133 vs the real remote
+           70116, observed in the same launch). The real PID is read back
+           from the "ready" event's own `pid` field instead - see
+           `_wait_for_ready`.
+        4. Poll the events file for the "ready" event, bounded by
+           `self._timeout`. A launched-but-never-ready process is a real
+           failure, not a success with unknown side effects: it is killed
+           and reported loudly (`BackendError`), never left running - this
+           is what the overlay leak report's recommendations 4/5 ask for
+           (bound the failure, surface it) at the one place in this
+           codebase that can actually observe it.
+        """
         if self._shown:
             return
         self._buttons = self._button_rects()
@@ -217,7 +308,16 @@ class WindowsOverlay:
             for btn in self._buttons:
                 self._exclusion.register(f"overlay_{btn.name}_button", btn.rect)
 
+        self._sweep_legacy_orphans()
+
         pause, cancel = self._buttons[0].rect, self._buttons[1].rect
+        # A nonce this exact invocation could not have seen before, echoed
+        # back verbatim in the "ready" event - see `_wait_for_ready`'s
+        # docstring for why readiness is verified this way (neither PID
+        # matching nor file-mtime freshness survived real-hardware testing
+        # across the WSL2/Windows boundary).
+        token = uuid.uuid4().hex
+        proc: subprocess.Popen[bytes] | None = None
         try:
             args = [
                 "-NoProfile",
@@ -238,22 +338,15 @@ class WindowsOverlay:
                 f"{pause.x1},{pause.y1},{pause.x2},{pause.y2}",
                 "-CancelRect",
                 f"{cancel.x1},{cancel.y1},{cancel.x2},{cancel.y2}",
+                "-Token",
+                token,
             ]
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 [self.powershell, *args],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self._timeout,
-                check=False,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
             )
-        except subprocess.TimeoutExpired as exc:
-            if self._exclusion is not None:
-                for btn in self._buttons:
-                    self._exclusion.unregister(f"overlay_{btn.name}_button")
-            raise BackendError(f"overlay launch timed out: {exc}") from exc
         except Exception:
             # Any failure building the launch args or resolving/invoking
             # powershell.exe itself (path translation failing, powershell
@@ -265,26 +358,30 @@ class WindowsOverlay:
                     self._exclusion.unregister(f"overlay_{btn.name}_button")
             raise
 
-        pid_line = next(
-            (
-                ln
-                for ln in (proc.stdout or "").splitlines()
-                if ln.strip().startswith("PID=")
-            ),
-            None,
-        )
-        if proc.returncode != 0 or pid_line is None:
+        real_pid, detail = self._wait_for_ready(proc, token)
+        if real_pid is None:
+            self._kill_failed_launch(proc)
             if self._exclusion is not None:
                 for btn in self._buttons:
                     self._exclusion.unregister(f"overlay_{btn.name}_button")
-            raise BackendError(
-                f"failed to launch windows overlay (rc={proc.returncode}): "
-                f"stdout={(proc.stdout or '').strip()[:400]!r} "
-                f"stderr={(proc.stderr or '').strip()[:400]!r}"
+            logger.error(
+                "windows coexistence overlay: local process (interop pid=%s) "
+                "never reached 'ready' within %.1fs - killed rather than left "
+                "running unverified. %s",
+                proc.pid,
+                self._timeout,
+                detail,
             )
-        self._pid = int(pid_line.split("=", 1)[1].strip())
+            raise BackendError(
+                f"overlay process (interop pid={proc.pid}) did not reach "
+                f"ready within {self._timeout:.1f}s: {detail}"
+            )
+
+        self._proc = proc
+        self._pid = real_pid
         self._shown = True
         self._stop.clear()
+        self._write_attribution()
         if self._on_pause is not None or self._on_cancel is not None:
             self._poll_thread = threading.Thread(
                 target=self._poll_events, name="cu-overlay-win-poll", daemon=True
@@ -292,7 +389,8 @@ class WindowsOverlay:
             self._poll_thread.start()
         logger.info(
             "windows coexistence overlay shown: pid=%s band=%dx%d at (%d,%d), "
-            "buttons=%s",
+            "buttons=%s, stdin-guarded (dies with this process, including "
+            "SIGKILL - see module docstring)",
             self._pid,
             self._screen_width,
             BAND_HEIGHT,
@@ -301,19 +399,214 @@ class WindowsOverlay:
             [b.name for b in self._buttons],
         )
 
-    def hide(self) -> None:
-        """Kill the detached process and unregister exclusion rects.
+    def _wait_for_ready(
+        self, proc: subprocess.Popen[bytes], token: str
+    ) -> tuple[int | None, str]:
+        """Poll the events file for `{"event": "ready", "token": token, ...}`
+        and return the REAL Windows PID it reports.
 
-        Windows tears down every window/GDI resource owned by a process the
-        instant it terminates - `Stop-Process -Force` is Windows'
-        `SIGKILL` equivalent (uncatchable, unmaskable) - so this is the
-        same "resource lifetime == process lifetime" guarantee U6 proved
-        for X11, just invoked explicitly rather than falling out of a
-        socket dying on its own.
+        Two things that look like they should work here do NOT, both
+        verified on real hardware before landing on the design below:
+
+        - Matching `proc.pid`: `Popen.pid` names the LOCAL WSL2 interop
+          launcher, not the actual Windows-side process - e.g. local
+          1430327 vs the real remote 69396 observed for the same launch.
+          `show()`'s docstring has the same note.
+        - Freshness by file mtime: the script deletes and recreates this
+          events file as its first action on every launch, and an
+          `st_mtime >= spawn_time` check assumes the two machines' clocks
+          agree closely - they do not reliably: a >60s drift was measured
+          between the WSL2 clock and the mounted Windows temp directory's
+          own mtime stamps on this exact box, mid-task.
+
+        What DOES work, and is used here: `token` is a nonce generated
+        fresh in `show()` for this exact invocation and passed as
+        `-Token`. This process could not have produced it before being
+        launched, so a `ready` event carrying it is unambiguously THIS
+        launch's own - no shared clock, no shared PID space required.
+
+        Also treats the process exiting on its own (before ever reaching
+        ready) as an immediate failure rather than waiting out the full
+        timeout - see `show()`.
+        """
+        wsl_path: str | None = None
+        deadline = time.monotonic() + self._timeout
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                stderr = b""
+                try:
+                    if proc.stderr is not None:
+                        stderr = proc.stderr.read()
+                except Exception:
+                    pass
+                return None, (
+                    f"process exited early (rc={proc.returncode}) "
+                    f"stderr={stderr.decode('utf-8', 'replace').strip()[:400]!r}"
+                )
+            if wsl_path is None:
+                wsl_path = self._events_path_wsl()
+            if wsl_path is not None:
+                try:
+                    lines = Path(wsl_path).read_text(encoding="utf-8").splitlines()
+                except OSError:
+                    lines = []
+                for line in lines:
+                    try:
+                        evt = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if evt.get("event") == "ready" and evt.get("token") == token:
+                        pid = evt.get("pid")
+                        if isinstance(pid, int):
+                            return pid, "ready"
+            time.sleep(READY_POLL_INTERVAL_SECONDS)
+        return None, "timed out waiting for the 'ready' event"
+
+    def _kill_failed_launch(self, proc: subprocess.Popen[bytes]) -> None:
+        """A launch that never reached ready must not be left running -
+        that is exactly the "silent failure loop" the overlay leak report
+        flagged (recommendation 5). Kill it directly rather than relying on
+        the stdin watcher (which requires the script to have gotten far
+        enough to start that thread - not guaranteed for every failure
+        mode, e.g. an `Add-Type` compile error)."""
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            logger.debug(
+                "windows overlay: error killing failed launch pid=%s",
+                proc.pid,
+                exc_info=True,
+            )
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
+
+    def _sweep_legacy_orphans(self) -> None:
+        """Best-effort startup sweep: find and kill any overlay process
+        still carrying the OLD self-relaunched `-Detached` command-line
+        shape - the exact signature of the leaked processes the overlay
+        leak report found accumulating (25 on one machine in an
+        afternoon). Current code never launches with `-Detached` (see the
+        module docstring's "Lifetime binding" section), so any process
+        matching it is unambiguously an orphan from before this fix, or
+        from an older cached build of this module - never a live sibling
+        session's overlay (which would match by `overlay_windows.ps1`
+        alone, but never `-Detached`).
+
+        Deliberately conservative: does NOT touch overlay processes
+        without `-Detached` in their command line, so a concurrent,
+        legitimate sibling session's overlay (this codebase has no
+        cross-process dedup for that case - see `_channel_identity`'s own
+        docstring) is never killed by this sweep.
+
+        Never raises and never blocks `show()` for long: any failure here
+        (powershell unavailable, the query itself failing, a timeout) is
+        logged and swallowed - a failed sweep is not a reason to refuse
+        showing the new overlay.
+        """
+        try:
+            ps = self.powershell
+        except BackendError:
+            return
+        try:
+            proc = subprocess.run(
+                [
+                    ps,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | "
+                    "Where-Object { $_.CommandLine -like '*overlay_windows.ps1*' -and "
+                    "$_.CommandLine -like '*-Detached*' } | "
+                    "ForEach-Object { "
+                    "Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; "
+                    'Write-Output "KILLED=$($_.ProcessId)" }',
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=SWEEP_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except Exception:
+            logger.debug("windows overlay: legacy-orphan sweep failed", exc_info=True)
+            return
+        killed = [
+            ln.split("=", 1)[1].strip()
+            for ln in (proc.stdout or "").splitlines()
+            if ln.strip().startswith("KILLED=")
+        ]
+        if killed:
+            logger.warning(
+                "windows coexistence overlay: swept %d orphaned legacy overlay "
+                "process(es) before launching a new one (pids=%s) - these "
+                "predate the stdin-liveness fix and could not have been "
+                "reaped any other way",
+                len(killed),
+                killed,
+            )
+
+    def _write_attribution(self) -> None:
+        """Best-effort: record this overlay's pid + start time next to the
+        events file, so a human (or a future cleanup tool) can identify a
+        running overlay by a direct lookup instead of enumerating and
+        string-matching every `powershell.exe` command line on the
+        machine (the overlay leak report's recommendation 3). Deleted in
+        `hide()`. Never raises - attribution is a convenience, not a
+        correctness requirement."""
+        wsl_path = self._events_path_wsl()
+        if wsl_path is None or self._pid is None:
+            return
+        try:
+            attribution = Path(wsl_path).parent / f"overlay-{self._pid}.json"
+            attribution.write_text(
+                json.dumps(
+                    {
+                        "pid": self._pid,
+                        "started_at": datetime.now(timezone.utc).isoformat(),
+                        "stdin_guarded": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            logger.debug(
+                "windows overlay: failed to write attribution file", exc_info=True
+            )
+
+    def hide(self) -> None:
+        """Tear down the overlay and unregister exclusion rects.
+
+        Two independent teardown signals now, not one:
+        1. Closing `self._proc.stdin` here - the overlay's own stdin
+           watcher sees EOF and exits itself (the same path a `SIGKILL` of
+           THIS process triggers - see module docstring).
+        2. The explicit `Stop-Process -Force` below (Windows' `SIGKILL`
+           equivalent - uncatchable, unmaskable), kept as a fast,
+           deterministic guarantee that does not depend on the watcher
+           thread noticing EOF in any particular amount of time.
+
+        Windows tears down every window/GDI resource owned by a process
+        the instant it terminates, by clean exit or by force - the same
+        "resource lifetime == process lifetime" guarantee U6 proved for
+        X11, just invoked explicitly rather than falling out of a socket
+        dying on its own.
         """
         if not self._shown:
             return
         self._stop.set()
+        if self._proc is not None:
+            try:
+                if self._proc.stdin is not None:
+                    self._proc.stdin.close()
+            except Exception:
+                pass
         if self._pid is not None:
             try:
                 subprocess.run(
@@ -336,10 +629,35 @@ class WindowsOverlay:
                 logger.debug(
                     "windows overlay: error stopping pid=%s", self._pid, exc_info=True
                 )
+        if self._proc is not None:
+            try:
+                self._proc.wait(timeout=5)
+            except Exception:
+                logger.debug(
+                    "windows overlay: local process handle did not reap cleanly "
+                    "for pid=%s",
+                    self._pid,
+                    exc_info=True,
+                )
+            for stream in (self._proc.stdout, self._proc.stderr):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except Exception:
+                    pass
+        wsl_path = self._events_path_wsl()
+        if wsl_path is not None and self._pid is not None:
+            try:
+                (Path(wsl_path).parent / f"overlay-{self._pid}.json").unlink(
+                    missing_ok=True
+                )
+            except OSError:
+                pass
         if self._exclusion is not None:
             for btn in self._buttons:
                 self._exclusion.unregister(f"overlay_{btn.name}_button")
         self._pid = None
+        self._proc = None
         self._shown = False
 
     @property
@@ -360,16 +678,27 @@ class WindowsOverlay:
         same Windows->WSL direction `WindowsBackend.capture()` already
         proves works for screenshot files, so this reuses a proven path
         rather than the untested reverse (WSL->Windows UNC write)
-        direction."""
+        direction.
+
+        `$env:TEMP` (PowerShell environment-variable syntax), NOT `%TEMP%`
+        (that is cmd.exe/batch syntax) - verified on real hardware that
+        passing the literal string `%TEMP%\\...` as a `-Command` makes
+        PowerShell try to load a MODULE named `%TEMP%` ("The module
+        '%TEMP%' could not be loaded") rather than expand anything, so
+        this always returned `None` and silently disabled both readiness
+        verification and the pause/cancel click poll (`_poll_events`) -
+        the latter with no test coverage able to catch it, since every
+        existing test mocks this method rather than exercising the real
+        command string.
+        """
         try:
-            win_path = f"%TEMP%\\amplifier-computer-use\\{EVENTS_FILENAME}"
             expanded = subprocess.run(
                 [
                     self.powershell,
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    win_path,
+                    f"Write-Output ([IO.Path]::Combine($env:TEMP, 'amplifier-computer-use', {EVENTS_FILENAME!r}))",
                 ],
                 stdin=subprocess.DEVNULL,
                 capture_output=True,

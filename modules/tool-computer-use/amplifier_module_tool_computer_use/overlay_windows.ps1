@@ -6,18 +6,64 @@
   click-without-activate technique, and why geometry is passed in rather than
   recomputed here).
 
-  Usage (normal invocation - what WindowsOverlay.show() actually runs):
+  Usage (the only invocation - what WindowsOverlay.show() actually runs):
     powershell.exe -File overlay_windows.ps1 -ScreenX 0 -ScreenY 0 -ScreenWidth 1920 `
       -BandHeight 36 -PauseRect "x1,y1,x2,y2" -CancelRect "x1,y1,x2,y2"
 
-  This process immediately relaunches ITSELF as a separate, detached, hidden
-  process (passing -Detached), prints that child's PID to stdout as
-  "PID=<n>", and exits. The caller captures the PID and is responsible for
-  killing it later (Stop-Process -Force) - see overlay_windows.py's
-  WindowsOverlay.hide().
+  SINGLE-HOP by design (this used to relaunch itself via `Start-Process
+  -Detached`, a separate top-level Windows process with no lifetime tie to
+  its caller - see git history / the overlay leak report this closes for
+  why that was the defect, not a feature). `WindowsOverlay.show()` now
+  launches THIS invocation directly via `subprocess.Popen(..., stdin=PIPE)`
+  and never lets it exit; there is no second hop, and the process this
+  script runs as IS the overlay process for its entire life. Two direct
+  consequences:
 
-  The -Detached invocation is the one that actually builds the window and
-  runs the message loop; it never exits on its own.
+  1. `overlay_windows.py`'s caller gets the REAL overlay PID back immediately
+     (`Popen.pid`) - no more parsing a "PID=<n>" line off an intermediary
+     process's stdout to learn a DIFFERENT process's identity.
+  2. This script's own stdin is now the caller's live pipe, which is exactly
+     what the stdin watcher below depends on (see that section).
+
+  Stdin-EOF watchdog: the real fix for the leaked-window defect
+  --------------------------------------------------------------------------
+  `atexit.register(overlay.hide)` (still present, in `overlay_windows.py`)
+  only runs on the AGENT process's own CLEAN exit - never on SIGKILL, a hard
+  crash, or a closed terminal, which are exactly the common cases that
+  produced the reported leak (25 orphaned bands accumulated on one machine
+  in an afternoon). A Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`)
+  was considered and is NOT reachable from here: it ties a process's life to
+  another WINDOWS process holding a job handle, and there is no persistent
+  Windows-side process in this architecture whose own life is 1:1 with the
+  WSL2 agent's (every backend action is a fresh, one-shot `powershell.exe`
+  subprocess - see `windows.py`'s module docstring). Building that persistent
+  bridge is `docs/designs/remote-transport.md`'s deferred Phase C5/4, not
+  this fix.
+
+  What IS reachable, and used here instead: the caller keeps this process's
+  OWN stdin as a live pipe (`subprocess.Popen(..., stdin=subprocess.PIPE)`)
+  for as long as the overlay should exist. A background thread below blocks
+  on `Console.In.ReadLine()`; the read returns `null` (EOF) the instant the
+  pipe's write end closes - which the OS guarantees happens when the owning
+  Linux/WSL2 process's file descriptor table is torn down, UNCONDITIONALLY,
+  on every exit path including `SIGKILL` (this is a kernel-level guarantee,
+  not a user-space hook like `atexit` that can simply fail to run). Verified
+  on real hardware for this exact WSL2/Windows-interop boundary before this
+  was written: a Linux process holding the pipe's write end was `kill -9`'d,
+  and the Windows-side `[Console]::In.ReadLine()` unblocked with EOF within
+  the same second - see the task's evidence log for the raw run.
+
+  Precise, honest characterization of what this guarantees (see also this
+  script's caller for the same claim in the Python-level docstring): this is
+  NOT an OS-level "kill this process when that other process dies" primitive
+  the way a Job Object is - it is a real pipe whose EOF the OS delivers
+  unconditionally on the writer's exit, observed and acted on by this
+  script's own code. If this script's watcher thread itself were somehow
+  stuck or dead, EOF would still arrive at the OS level but nothing here
+  would act on it. That residual risk is why `WindowsOverlay.show()` also
+  sweeps and removes any pre-existing orphaned overlay (the `-Detached`
+  command-line shape only the OLD, pre-fix code could have produced) before
+  launching a new one - see that function's docstring.
 #>
 param(
   [Parameter(Mandatory = $true)][int]$ScreenX,
@@ -26,25 +72,21 @@ param(
   [int]$BandHeight = 36,
   [Parameter(Mandatory = $true)][string]$PauseRect,
   [Parameter(Mandatory = $true)][string]$CancelRect,
-  [switch]$Detached
+  # A caller-supplied nonce, echoed back verbatim in the "ready" event -
+  # see `WindowsOverlay._wait_for_ready`'s docstring for why readiness is
+  # verified this way rather than by PID or by file timing: the caller
+  # (WSL2 Python) and this process (native Windows) do not share a PID
+  # space (`Popen.pid` names the LOCAL interop launcher, never the real
+  # Windows PID - verified on real hardware), and their clocks are not
+  # guaranteed to agree closely enough to use file-mtime freshness either
+  # (also verified on real hardware: a >60s drift was observed between
+  # the WSL2 clock and the mounted Windows temp directory's own mtime
+  # stamps). A token this script did not invent and could not have seen
+  # before this exact invocation is the only unambiguous signal.
+  [Parameter(Mandatory = $true)][string]$Token
 )
 $ErrorActionPreference = 'Stop'
 
-if (-not $Detached) {
-  # ---- Relaunch self, detached and hidden; hand back the child's PID. ----
-  $selfArgs = @(
-    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath,
-    '-ScreenX', $ScreenX, '-ScreenY', $ScreenY, '-ScreenWidth', $ScreenWidth,
-    '-BandHeight', $BandHeight, '-PauseRect', $PauseRect, '-CancelRect', $CancelRect,
-    '-Detached'
-  )
-  $psExe = (Get-Process -Id $PID).Path
-  $child = Start-Process -FilePath $psExe -ArgumentList $selfArgs -WindowStyle Hidden -PassThru
-  Write-Output "PID=$($child.Id)"
-  exit 0
-}
-
-# ---- Detached child: build and run the actual overlay. ----
 $OutputEncoding = New-Object System.Text.UTF8Encoding $false
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -65,7 +107,7 @@ function Parse-Rect([string]$s) {
 # `$pauseRect = Parse-Rect $PauseRect` looks like a fresh local but is
 # actually the SAME slot as the `[string]$PauseRect` parameter (variable
 # names are case-insensitive), so PowerShell silently coerces the
-# Hashtable back to a string ("System.Collections.Hashtable" via ToString)
+# Hashtable back to a string (\"System.Collections.Hashtable\" via ToString)
 # to satisfy that stale constraint - then the next consumer that wants a
 # real Hashtable fails with a confusing ParameterBindingArgumentTransformation
 # error. Distinct names sidestep the collision entirely.
@@ -101,6 +143,7 @@ $cancelClient = New-Object System.Drawing.Rectangle(
 Add-Type @"
 using System;
 using System.Drawing;
+using System.Threading;
 using System.Windows.Forms;
 
 public class OverlayBand : Form {
@@ -110,6 +153,7 @@ public class OverlayBand : Form {
     public Color CancelColor;
     public Color BandColor;
     public Action<string> OnButtonClick;
+    private Thread _stdinWatcher;
 
     public OverlayBand() {
         FormBorderStyle = FormBorderStyle.None;
@@ -149,6 +193,37 @@ public class OverlayBand : Form {
         if (PauseRect.Contains(e.Location)) OnButtonClick("pause");
         else if (CancelRect.Contains(e.Location)) OnButtonClick("cancel");
     }
+
+    // Blocks reading this process's OWN stdin on a background thread. The
+    // caller (overlay_windows.py's WindowsOverlay.show()) launches this
+    // whole process with stdin=PIPE and never closes or writes to it while
+    // the overlay should stay up - so a read here only ever unblocks with
+    // EOF, and only when the caller's end of that pipe closes (normal exit,
+    // SIGKILL, crash, or a closed terminal all close it the same way, at
+    // the OS level - see the module docstring above for the real-hardware
+    // proof this depends on). BeginInvoke marshals the shutdown onto the UI
+    // thread, which is the only thread allowed to touch Application/Form
+    // state; Environment.Exit is the fallback if that marshal itself fails
+    // (e.g. the form was never created/already disposed).
+    public void StartStdinWatcher() {
+        _stdinWatcher = new Thread(() => {
+            try {
+                while (Console.In.ReadLine() != null) { }
+            } catch {
+                // Any failure reading stdin is treated the same as EOF -
+                // there is no safe way to keep running with an unreadable
+                // liveness channel.
+            }
+            try {
+                this.BeginInvoke(new Action(() => Application.Exit()));
+            } catch {
+                Environment.Exit(0);
+            }
+        });
+        _stdinWatcher.IsBackground = true;
+        _stdinWatcher.Name = "cu-overlay-stdin-watcher";
+        _stdinWatcher.Start();
+    }
 }
 "@ -ReferencedAssemblies System.Windows.Forms, System.Drawing
 
@@ -175,7 +250,8 @@ $diag = @{
 Add-Content -LiteralPath $eventsFile -Value $diag -Encoding UTF8
 
 $band.Show()
-(@{ event = 'ready'; at = (Get-Date).ToString('o'); pid = $PID } | ConvertTo-Json -Compress) |
+$band.StartStdinWatcher()
+(@{ event = 'ready'; at = (Get-Date).ToString('o'); pid = $PID; token = $Token } | ConvertTo-Json -Compress) |
   Add-Content -LiteralPath $eventsFile -Encoding UTF8
 
 [System.Windows.Forms.Application]::Run()
