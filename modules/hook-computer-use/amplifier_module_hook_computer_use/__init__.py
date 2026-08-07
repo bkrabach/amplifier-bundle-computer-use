@@ -1056,17 +1056,130 @@ def _make_halt_notice_handler(coordinator: Any):
     return handler
 
 
+#: `warnings.filterwarnings` compiles `message` and matches it with `re.match`,
+#: which anchors at the *start* of the string only - and `.` does not cross a
+#: newline unless `re.DOTALL` is in effect. Pydantic's own aggregate warning
+#: ("Pydantic serializer warnings:\n  PydanticSerializationUnexpectedValue(...)")
+#: puts the token this filter keys on on its *second* line, so the previous
+#: pattern (`.*PydanticSerializationUnexpectedValue.*`, no DOTALL) never
+#: matched anything, ever - this filter has been dead since the day it was
+#: written, and every screenshot has been dumping a stack-trace-shaped
+#: `UserWarning` wall into ordinary interactive sessions. `(?s)` turns DOTALL
+#: on for the rest of the pattern so `.` crosses the newline.
+_PYDANTIC_SERIALIZER_WARNING_MESSAGE_PATTERN = (
+    r"(?s).*PydanticSerializationUnexpectedValue.*"
+)
+
+#: `warnings.filterwarnings` also accepts `category=`/`module=` to narrow a
+#: filter beyond its message text - worth doing here because `UserWarning`
+#: (pydantic's aggregate warning's actual category, confirmed by direct
+#: capture, not assumed) is the single most commonly reused built-in warning
+#: category in the ecosystem. A message-only ignore would also silently eat
+#: any *unrelated* warning - ours or a third party's - that happens to raise
+#: `UserWarning` with text that happens to contain this substring, for the
+#: rest of the process, since `warnings.filterwarnings` mutates a
+#: process-global filter list. `module` is matched (again via `re.match`)
+#: against the `__name__` of the module whose frame called `warnings.warn()`
+#: - confirmed by direct capture to be `pydantic.main` (the Python wrapper
+#: that calls `warn()`, not `pydantic_core`'s Rust frame) - so this filter's
+#: blast radius is exactly "pydantic's own serializer", never our own code
+#: or anyone else's.
+_PYDANTIC_SERIALIZER_WARNING_MODULE_PATTERN = r"^pydantic(\..*)?$"
+
+
+def _install_pydantic_serializer_warning_filter() -> None:
+    """Silence pydantic's own "serializer warnings" aggregate `UserWarning`.
+
+    Image blocks are written as plain dicts (see `_with_content`'s docstring)
+    so no `visibility: null` reaches the API - a proper `ImageBlock` model
+    would serialize that field and the Anthropic API rejects it inside a
+    `tool_result`. Pydantic notices the resulting field-type mismatch on every
+    `model_dump()` and warns; the serialised bytes are correct either way, so
+    this is a real - if cosmetic - noise problem, not a bug in the dicts.
+
+    Scoped narrowly (see the two pattern constants' docstrings) rather than a
+    bare message-only ignore, so the blast radius stays "pydantic's own
+    serializer warning", not "any UserWarning containing this substring".
+    """
+    warnings.filterwarnings(
+        "ignore",
+        message=_PYDANTIC_SERIALIZER_WARNING_MESSAGE_PATTERN,
+        category=UserWarning,
+        module=_PYDANTIC_SERIALIZER_WARNING_MODULE_PATTERN,
+    )
+
+
+def _pydantic_serializer_warning_is_suppressed() -> bool:
+    """Drive a real probe through the filter this module just installed and
+    report whether it was actually swallowed.
+
+    This exists because the filter this module has always installed
+    previously compiled and "succeeded" cleanly while silently doing nothing,
+    for its entire lifetime (see `_PYDANTIC_SERIALIZER_WARNING_MESSAGE_PATTERN`'s
+    docstring) - and nothing surfaced that. A filter this easy to silently
+    break must prove itself at mount, every mount, rather than being trusted
+    forever on the strength of having compiled. The probe reproduces the
+    exact raw-dict content shape (`_with_content`) that triggers pydantic's
+    real warning, run through `model_dump()`, so this checks the actual
+    installed filter against the actual warning shape - not a hand-picked
+    string that could pass for the wrong reason.
+
+    Cost: one small `Message` construction and one `model_dump()` call, once
+    per mount (not per request) - negligible next to the rest of mount-time
+    work in this module.
+    """
+    from amplifier_core.message_models import Message  # local: probe-only cost
+
+    probe = Message(role="user", content="x")
+    # Typed `Any`, matching `_with_content`'s own `content: Any` parameter -
+    # the raw-dict shape is the point of the probe (see this function's
+    # docstring); a precisely-typed list literal here would make pyright
+    # reject exactly the assignment this filter exists to tolerate.
+    probe_content: Any = [
+        {"type": "text", "text": "hook-computer-use mount-time probe"},
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "AAA",
+            },
+        },
+    ]
+    probe.content = probe_content
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _install_pydantic_serializer_warning_filter()
+        probe.model_dump()
+    return len(caught) == 0
+
+
 async def mount(
     coordinator: Any, config: dict[str, Any] | None = None
 ) -> dict[str, Any]:
     """Register the provider-request hook that enables native computer use."""
     cfg = config or {}
     max_inline = int(cfg.get("max_inline_screenshots", _DEFAULT_MAX_INLINE_IMAGES))
-    # Image blocks are written as plain dicts so no `visibility: null` reaches the API.
-    # Pydantic notices the field type mismatch and warns; the serialised bytes are correct.
-    warnings.filterwarnings(
-        "ignore", message=".*PydanticSerializationUnexpectedValue.*"
-    )
+    _install_pydantic_serializer_warning_filter()
+    if not _pydantic_serializer_warning_is_suppressed():
+        # Logged, not raised: an unsuppressed warning is cosmetic noise, not a
+        # functional break - the serialised image/tool-result bytes are
+        # correct either way (see `_install_pydantic_serializer_warning_filter`'s
+        # docstring), so mounting must not be blocked on it. But a silent
+        # filter that silently stops working is exactly the trap this
+        # replaces - this filter was dead for the module's entire lifetime
+        # with nothing in the logs to show it. ERROR, not DEBUG/INFO, so a
+        # future pydantic message-format change is impossible to miss.
+        logger.error(
+            "computer-use: pydantic serializer-warning suppression filter "
+            "did NOT suppress its own probe warning at mount - pydantic's "
+            "warning message format may have changed. Cosmetic only "
+            "(serialised image/tool-result bytes are unaffected), but every "
+            "screenshot will now log a 'Pydantic serializer warnings' "
+            "UserWarning. Update _PYDANTIC_SERIALIZER_WARNING_MESSAGE_PATTERN "
+            "/ _PYDANTIC_SERIALIZER_WARNING_MODULE_PATTERN in "
+            "amplifier_module_hook_computer_use to match the new shape."
+        )
     priority = int(cfg.get("priority", 50))
     # Explicit, always-logged unattended-write opt-in (see `_make_gate_handler`'s
     # docstring) - `False` unless a human sets this, never inferred from the
