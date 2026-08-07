@@ -37,7 +37,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -371,6 +371,27 @@ class ComputerTool:
         # not (yet) exist - see `presence.GUARD_MEASURED` - so this feature
         # never claims detection it cannot back with evidence.
         self._coexistence_guard: CoexistenceGuard | None = None
+        # -- band lifetime (docs/designs/band-lifetime.md, Alt A) -------------
+        # All three set together by `mount()`, right after
+        # `_coexistence_guard` - `None`/`None`/`None` whenever no guard was
+        # built for this backend (same population as before this fix: no
+        # coexistence layer at all means no held-input tracking and no
+        # band-lifetime tracking either). `_channel_key` identifies the
+        # PHYSICAL channel (`_channel_identity`); `_ledger` and `_band_state`
+        # are the shared, channel-scoped objects `_get_channel_ledger`/
+        # `_get_channel_band_state` hand out - the same objects every other
+        # `ComputerTool` mount() driving this same channel also holds, which
+        # is what closes F8 (band-lifetime.md \\u00a710).
+        self._ledger: HeldInputLedger | None = None
+        self._channel_key: str | None = None
+        self._band_state: _ChannelBandState | None = None
+        # Per-instance pending-coordinate box for a held mouse button,
+        # mirroring `RemoteAgent._mouse_pending` exactly (`remote_agent.py`) -
+        # `left_mouse_up` updates the box with its real coordinates and
+        # releases THROUGH the ledger so `backend.mouse_up` fires exactly
+        # once, whether triggered by the explicit up or by the ledger's own
+        # deadman/release_all.
+        self._mouse_pending: dict[str, dict[str, int | None]] = {}
         # The session-start disclosure channel `_ensure_announced` builds for
         # this backend (`_build_announcement`) on this session's FIRST real
         # action - an overlay object to keep alive for the tool's lifetime,
@@ -924,6 +945,56 @@ class ComputerTool:
             guard.after_event()
             guard.release_target()
 
+    # -- held-input ledger wiring for the LOCAL input path (band-lifetime.md
+    # -- finding #1: `HeldInputLedger.hold()` used to be called ONLY from
+    # -- `remote_agent.py` - a local `left_mouse_down` had zero enforcement:
+    # -- no deadman, no release on halt/pause/cancel/target-change) ---------
+    def _hold_mouse_button(self, button: str, backend: Backend) -> None:
+        """Register a just-pressed mouse button in the channel-scoped held-
+        input ledger. Mirrors `RemoteAgent._op_mouse_down`'s pattern exactly
+        (`remote_agent.py`): the release_fn reads its coordinates out of a
+        mutable pending box at the moment it actually fires, rather than
+        closing over this call's `(x, y)`, so a ledger-triggered release
+        (deadman, halt, pause, target-change - none of which have a real
+        `left_mouse_up` to supply fresh coordinates) still safely defaults
+        to releasing at the button's last-known position.
+
+        A no-op when this backend has no channel-scoped ledger (no
+        coexistence guard was built for it - \\u00a75.5's \"never claim a
+        guarantee you don't have\").
+        """
+        if self._ledger is None:
+            return
+        token = f"mouse:{button}"
+        pending: dict[str, int | None] = {"x": None, "y": None}
+        self._mouse_pending[token] = pending
+
+        def _release() -> None:
+            backend.mouse_up(pending["x"], pending["y"], button)
+            self._mouse_pending.pop(token, None)
+
+        self._ledger.hold("mouse", token, _release)
+
+    def _release_mouse_button(
+        self, button: str, backend: Backend, x: int | None, y: int | None
+    ) -> None:
+        """Counterpart to `_hold_mouse_button`. When a matching hold is
+        tracked, release THROUGH the ledger (after updating the pending box
+        with this call's REAL coordinates) so `backend.mouse_up` fires
+        EXACTLY ONCE - never once here and once more via the ledger's own
+        release_fn. Falls back to calling `backend.mouse_up` directly when
+        nothing is tracked (no ledger, or no matching down - e.g. `read_only`
+        was toggled mid-session) - identical fallback to
+        `RemoteAgent._op_mouse_up`.
+        """
+        token = f"mouse:{button}"
+        pending = self._mouse_pending.get(token)
+        if self._ledger is not None and pending is not None:
+            pending["x"], pending["y"] = x, y
+            self._ledger.release(token)
+        else:
+            backend.mouse_up(x, y, button)
+
     def _sync_remote_announcement_state(self, guard: CoexistenceGuard) -> None:
         """Pull the target-side overlay's Pause/Cancel state
         (docs/designs/coexistence.md \u00a78.1/\u00a79.1) into THIS session's guard
@@ -1077,6 +1148,119 @@ class ComputerTool:
                     )
                 raise
             self._announced = True
+
+    # -- band lifetime (docs/designs/band-lifetime.md, Alt A - \u00a711.1) --------
+    # Scopes the Linux/Windows disclosure band's lifetime to actual activity
+    # instead of the tool's process lifetime: raised before every execute(),
+    # lowered the instant the last in-flight execute() against this CHANNEL
+    # returns. No reaper thread, no trailing window `T` - the adversarial
+    # review's blocking finding was against that apparatus specifically, not
+    # against scoping the band to activity per se (see the design doc's
+    # revision history for the full review).
+    #
+    # `_ensure_announced` (above) is the CONSENT gate and is untouched by
+    # this: it fires once, asks a human if needed, and builds the handle
+    # this section re-raises/lowers. Nothing here can ask a human anything
+    # or clear a sticky refusal.
+    def _live_band_handle(self) -> Any | None:
+        """This session's announcement handle, narrowed to one that supports
+        live re-raise/lower (`show()`/`hide()`) - the Linux/Windows overlay.
+        `None` for macOS's one-shot dialog, a remote overlay handle (no local
+        object to call - \\u00a76.4's raise/lower cross the wire as a DIFFERENT,
+        not-yet-built control op, deliberately out of scope here, see the
+        design doc \\u00a76.4/\\u00a711), or no channel at all. Alt A's raise/lower
+        dance applies to none of those - they are unaffected, exactly as
+        before this fix.
+        """
+        handle = self._announcement
+        if handle is not None and hasattr(handle, "show") and hasattr(handle, "hide"):
+            return handle
+        return None
+
+    def _band_enter(self) -> tuple[Any, _ChannelBandState] | None:
+        """Call before doing any work for one `execute()` call (the WHOLE
+        call - a batch of N actions is one raise, matching \\u00a74.2's \"one
+        execute(), one raise, one lower\"). Returns the (handle, state) pair
+        `_band_exit` needs, or `None` when band-lifetime tracking does not
+        apply to this backend (see `_live_band_handle`) - in which case
+        `_band_exit(None)` is a no-op.
+
+        Raises `AnnouncementRefused` if a re-raise is needed and fails with a
+        human detected present (\\u00a77.6, via `_handle_channel_failure` -
+        reused verbatim, the exact policy the FIRST raise already applies).
+        """
+        handle = self._live_band_handle()
+        state = self._band_state
+        if handle is None or state is None:
+            return None
+        with state.lock:
+            state.depth += 1
+            try:
+                self._ensure_band_raised(handle)
+            except BaseException:
+                # Never leave `depth` incremented with no matching
+                # decrement - a failed raise must not leak a phantom
+                # in-flight action that later blocks every legitimate
+                # lower forever.
+                state.depth -= 1
+                raise
+        return handle, state
+
+    def _ensure_band_raised(self, handle: Any) -> None:
+        """Re-raise a channel that was already consented to. Never asks a
+        human anything (that already happened, in `_ensure_announced`) and
+        never clears a sticky refusal - only the FIRST raise can do either.
+        A no-op when the band is already up (`handle.shown`), which is the
+        overwhelmingly common case: one continuous episode raises once and
+        stays up for its whole duration, exactly like today's behavior."""
+        if getattr(handle, "shown", False):
+            return
+        guard = self._coexistence_guard
+        try:
+            handle.show()
+        except Exception as exc:  # noqa: BLE001 - \\u00a77.6 policy decides below
+            if guard is not None:
+                _handle_channel_failure(guard, self._backend.name, "band re-raise", exc)
+            else:
+                logger.error(
+                    "coexistence: band re-raise failed for backend %r and no "
+                    "coexistence guard exists to apply \\u00a77.6 policy - "
+                    "proceeding without reconfirming disclosure: %s",
+                    self._backend.name,
+                    exc,
+                )
+
+    def _band_exit(self, token: tuple[Any, _ChannelBandState] | None) -> None:
+        """Call in a `finally` around whatever `_band_enter` guarded, always
+        - even when `_band_enter` itself raised (see `execute()`), so a
+        raise failure still decrements the depth it incremented.
+
+        The band actually lowers only when BOTH: this was the last in-flight
+        execute() against the channel (`depth == 0`, re-checked under the
+        SAME lock right before calling `hide()` - without that check, a new
+        action could start between scheduling this call and acquiring the
+        lock, and lowering would drop the band out from under it, which the
+        hard \"no path may drop the band while an action is in flight\"
+        constraint forbids), AND the channel's held-input ledger has nothing
+        held (\\u00a74.2's second invariant clause: a button held past its own
+        execute() call means force is still being applied even with no
+        execute() in flight).
+        """
+        if token is None:
+            return
+        handle, state = token
+        with state.lock:
+            state.depth -= 1
+            depth_now = state.depth
+        if depth_now != 0:
+            return
+        ledger = self._ledger
+        if ledger is not None and ledger.held_tokens:
+            return
+        with state.lock:
+            if state.depth != 0:
+                return
+            handle.hide()
 
     # -- execution --------------------------------------------------------------
     def _run(self, action: str, params: dict[str, Any]) -> tuple[str, str | None]:
@@ -1241,6 +1425,7 @@ class ComputerTool:
                 coord=(x, y) if x is not None and y is not None else None
             ):
                 backend.mouse_down(x, y, "left")
+                self._hold_mouse_button("left", backend)
             return "left_mouse_down", None
 
         if action == "left_mouse_up":
@@ -1248,7 +1433,7 @@ class ComputerTool:
             with self._guard_write(
                 coord=(x, y) if x is not None and y is not None else None
             ):
-                backend.mouse_up(x, y, "left")
+                self._release_mouse_button("left", backend, x, y)
             return "left_mouse_up", None
 
         if action == "left_click_drag":
@@ -1403,6 +1588,28 @@ class ComputerTool:
                 success=False,
                 error={"message": str(exc), "type": "AnnouncementRefused"},
             )
+        # Band lifetime (docs/designs/band-lifetime.md, Alt A): one raise for
+        # the WHOLE call (a batch of N actions is one execute()), lowered in
+        # the `finally` below the instant this is the last in-flight
+        # execute() against the channel. A re-raise failure with a human
+        # detected present is the SAME refusal shape as the first raise.
+        try:
+            band_token = await asyncio.to_thread(self._band_enter)
+        except AnnouncementRefused as exc:
+            return ToolResult(
+                success=False,
+                error={"message": str(exc), "type": "AnnouncementRefused"},
+            )
+        try:
+            return await self._execute_calls(input)
+        finally:
+            await asyncio.to_thread(self._band_exit, band_token)
+
+    async def _execute_calls(self, input: dict[str, Any]) -> ToolResult:
+        """The dialect-read + per-action dispatch loop, unchanged from
+        before band-lifetime tracking existed - split out of `execute()`
+        only so that method's own `try/finally` around `_band_enter`/
+        `_band_exit` does not have to re-indent this whole body."""
         dialect, calls = read_call(input, self.image_space)
 
         last_summary = ""
@@ -1663,6 +1870,29 @@ class DesktopTool:
                 success=False,
                 error={"message": str(exc), "type": "AnnouncementRefused"},
             )
+        # Band lifetime (docs/designs/band-lifetime.md, Alt A): `desktop`
+        # shares `computer`'s ComputerTool instance (and therefore its
+        # channel), so this participates in the SAME depth counter - a
+        # `desktop` action keeps the band up exactly like a `computer`
+        # action would, and is what closes F9 (desktop actions bypassing
+        # the counter).
+        try:
+            band_token = await asyncio.to_thread(self._computer._band_enter)
+        except AnnouncementRefused as exc:
+            return ToolResult(
+                success=False,
+                error={"message": str(exc), "type": "AnnouncementRefused"},
+            )
+        try:
+            return await self._execute_action(input)
+        finally:
+            await asyncio.to_thread(self._computer._band_exit, band_token)
+
+    async def _execute_action(self, input: dict[str, Any]) -> ToolResult:
+        """The actual per-action dispatch, unchanged from before band-
+        lifetime tracking existed - split out of `execute()` only so that
+        method's own `try/finally` around `_band_enter`/`_band_exit` does
+        not have to re-indent this whole body."""
         action = str(input.get("action") or "").strip()
         if action not in DESKTOP_ACTIONS:
             return ToolResult(
@@ -1872,7 +2102,13 @@ def _build_coexistence_guard(
         )
         return None
     presence = PresenceMonitor(idle_source=idle_source, platform=platform_for_guard)
-    ledger = HeldInputLedger()
+    # Channel-scoped, not one-per-mount() (see `_get_channel_ledger` above) -
+    # this is finding #2 of the adversarial review of
+    # docs/designs/band-lifetime.md: `HeldInputLedger()` used to be built
+    # fresh here on every call, so a parent session's mount() and a
+    # delegated child's mount() sharing the same overlay each got their OWN,
+    # disconnected ledger.
+    ledger = _get_channel_ledger(_channel_identity(backend))
     target_source = getattr(backend, "current_target", None)
     guard = CoexistenceGuard(
         presence=presence,
@@ -2209,6 +2445,66 @@ def _channel_identity(backend: Backend) -> str:
         host = getattr(backend, "user_host", None)
         return f"remote:{host}" if host else f"remote:{backend.name}"
     return f"local:{backend.name}"
+
+
+#: Guards `_channel_ledgers`/`_channel_band_state` below - the same
+#: momentary-contention rationale as `_announcement_lock` above (dict
+#: read/write only, never held across a backend call).
+_channel_registry_lock = threading.Lock()
+
+#: One `HeldInputLedger` per PHYSICAL channel (docs/designs/band-lifetime.md,
+#: adversarial review finding #2), not one per `ComputerTool` mount(). Before
+#: this fix, `_build_coexistence_guard` built a fresh `HeldInputLedger()` on
+#: every call - so a parent session's mount() and a delegated child's mount()
+#: sharing the SAME overlay via `_announcement_decisions` each got their OWN,
+#: disconnected ledger. A hold registered by one was invisible to the other's
+#: `release_all`/halt path and invisible to the band-lowering decision below.
+#: Keyed exactly like `_announcement_decisions` (`_channel_identity`), for
+#: the same reason: these are properties of the physical machine, not of any
+#: one mount().
+_channel_ledgers: dict[str, HeldInputLedger] = {}
+
+
+def _get_channel_ledger(channel_key: str) -> HeldInputLedger:
+    """Get-or-create the one `HeldInputLedger` for `channel_key`, shared by
+    every `ComputerTool` mount() that drives the same physical channel."""
+    with _channel_registry_lock:
+        ledger = _channel_ledgers.get(channel_key)
+        if ledger is None:
+            ledger = HeldInputLedger()
+            _channel_ledgers[channel_key] = ledger
+        return ledger
+
+
+@dataclass
+class _ChannelBandState:
+    """Band-lifetime bookkeeping for one physical channel
+    (docs/designs/band-lifetime.md \\u00a75.1/\\u00a711.1 - Alt A shape: no
+    reaper thread, no trailing window `T`). `depth` is the number of
+    `execute()` calls currently in flight against this channel, summed
+    across EVERY `ComputerTool`/`DesktopTool` sharing it - this is what
+    closes finding F8: two tools sharing one overlay handle via
+    `_announcement_decisions` must not let one tool's idle depth lower a
+    band the other tool is actively driving under. `lock` serialises every
+    transition (increment+raise, decrement+maybe-lower) - see `_band_enter`/
+    `_band_exit` on `ComputerTool` for the actual state machine.
+    """
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    depth: int = 0
+
+
+_channel_band_state: dict[str, _ChannelBandState] = {}
+
+
+def _get_channel_band_state(channel_key: str) -> _ChannelBandState:
+    """Get-or-create the one `_ChannelBandState` for `channel_key`."""
+    with _channel_registry_lock:
+        state = _channel_band_state.get(channel_key)
+        if state is None:
+            state = _ChannelBandState()
+            _channel_band_state[channel_key] = state
+        return state
 
 
 def _build_announcement(
@@ -2662,6 +2958,16 @@ async def mount(
     # `_build_coexistence_guard`). `None` on every other backend, unchanged
     # from before this feature existed.
     computer._coexistence_guard = _build_coexistence_guard(backend, cfg)
+    # Band lifetime (docs/designs/band-lifetime.md): the channel-scoped
+    # ledger and depth-counter this session's held-input tracking and
+    # band-lowering decisions use - `None` whenever no guard was built
+    # (same population as before this feature existed: no coexistence
+    # layer at all). Computed from the SAME backend `_build_coexistence_guard`
+    # was just given, so `_channel_identity` returns the identical key.
+    if computer._coexistence_guard is not None:
+        computer._channel_key = _channel_identity(backend)
+        computer._ledger = _get_channel_ledger(computer._channel_key)
+        computer._band_state = _get_channel_band_state(computer._channel_key)
     # Session-start disclosure (docs/designs/coexistence.md §7) - the
     # Linux/Windows overlay or the macOS announce-and-acknowledge dialog,
     # whichever this backend supports - is deliberately NOT built here.

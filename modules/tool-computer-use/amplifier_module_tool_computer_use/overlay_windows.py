@@ -171,6 +171,17 @@ READY_POLL_INTERVAL_SECONDS = 0.1
 #: on the critical path for long.
 SWEEP_TIMEOUT_SECONDS = 15.0
 
+#: Bounded timeout for `hide()`'s `Stop-Process` call (docs/designs/
+#: band-lifetime.md, adversarial review finding #3: an unbounded lower()
+#: held inside a lock can wedge a caller forever). A `subprocess.run(...,
+#: timeout=...)` call already turns a hang into a `TimeoutExpired` at this
+#: ceiling rather than blocking indefinitely - this constant only names
+#: that existing bound so `hide()`'s own docstring/log message can refer to
+#: it, and gives future callers (e.g. `_band_exit`, which now calls `hide()`
+#: on the action path instead of from a reaper thread) an honest worst-case
+#: number to reason about.
+STOP_PROCESS_TIMEOUT_SECONDS = 15.0
+
 #: Same geometry constants as `overlay_linux.py` - a thin strip along the
 #: top edge with two right-aligned buttons. Kept as an independent literal
 #: rather than importing from `overlay_linux` (which has no Windows
@@ -597,6 +608,19 @@ class WindowsOverlay:
         "resource lifetime == process lifetime" guarantee U6 proved for
         X11, just invoked explicitly rather than falling out of a socket
         dying on its own.
+
+        Bounded, LOUD failure (docs/designs/band-lifetime.md, adversarial
+        review finding #3): `Stop-Process` is bounded by `STOP_PROCESS_TIMEOUT_SECONDS`
+        below (already true before this fix - `subprocess.run(..., timeout=...)`
+        raises `TimeoutExpired` rather than blocking forever), but a timeout
+        or any other failure here used to be logged at DEBUG and this method
+        still unconditionally marked `_shown = False` afterward - silently
+        claiming the band was torn down when it could not actually be
+        confirmed. Now: logged at ERROR (naming the exact consequence), and
+        `_shown`/`_pid`/`_proc` are left AS-IS on that path - the safe
+        direction (`fail toward "still up"`, matching \\u00a710 F6's own rule)
+        rather than a false "it's down" that could cause `show()` to leak a
+        SECOND overlay process on top of one that may still be running.
         """
         if not self._shown:
             return
@@ -622,13 +646,24 @@ class WindowsOverlay:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    timeout=15,
+                    timeout=STOP_PROCESS_TIMEOUT_SECONDS,
                     check=False,
                 )
-            except Exception:
-                logger.debug(
-                    "windows overlay: error stopping pid=%s", self._pid, exc_info=True
+            except Exception as exc:
+                logger.error(
+                    "windows coexistence overlay: Stop-Process for pid=%s did "
+                    "not complete within %.1fs (%s) - this overlay's on-screen "
+                    "state CANNOT be confirmed and may STILL BE VISIBLE. Not "
+                    "marking it hidden: the stdin pipe was already closed above "
+                    "(the overlay's own EOF watcher is a backstop), and the "
+                    "next show() will see shown=True and skip relaunching "
+                    "rather than leak a second overlay process on top of one "
+                    "that might still be running.",
+                    self._pid,
+                    STOP_PROCESS_TIMEOUT_SECONDS,
+                    exc,
                 )
+                return
         if self._proc is not None:
             try:
                 self._proc.wait(timeout=5)
